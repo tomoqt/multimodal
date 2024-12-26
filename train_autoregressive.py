@@ -258,7 +258,7 @@ def collate_fn(batch):
 # -------------------------------------------------------------------------
 def create_data_loaders(
     tokenizer,
-    batch_size=32,
+    batch_size=256,
     use_parquet=False,
     data_dir="data_extraction/multimodal_spectroscopic_dataset",
     binary_dir="training_binaries",

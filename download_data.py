@@ -1,4 +1,4 @@
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, HfApi
 from pathlib import Path
 import re
 from tqdm import tqdm
@@ -29,31 +29,33 @@ def download_dataset_files(
     local_dir.mkdir(parents=True, exist_ok=True)
     
     # Define the file patterns we're looking for
-    # Looking for files like: part-0000_rg0.pt
+    # Looking for files like: aligned_chunk_0000_rg0.pt
     binary_pattern = re.compile(r'^aligned_chunk_\d+_rg\d+\.pt$')
     
     try:
+        # Initialize the Hugging Face API client
+        api = HfApi()
+        
         # List all files in the repository
-        from huggingface_hub import list_files_info
-        files = list_files_info(repo_id=repo_id, repo_type="dataset", revision=revision, token=token)
+        files = api.list_repo_files(repo_id=repo_id, repo_type="dataset", revision=revision, token=token)
         
         # Filter and download binary files
-        binary_files = [f for f in files if binary_pattern.match(os.path.basename(f.rfilename))]
+        binary_files = [f for f in files if binary_pattern.match(os.path.basename(f))]
         
         print(f"\nFound {len(binary_files)} matching binary files")
-        for file_info in tqdm(binary_files, desc="Downloading binary files"):
+        for filename in tqdm(binary_files, desc="Downloading binary files"):
             try:
                 local_path = hf_hub_download(
                     repo_id=repo_id,
-                    filename=file_info.rfilename,
+                    filename=filename,
                     repo_type="dataset",
                     revision=revision,
                     token=token,
                     local_dir=local_dir
                 )
-                print(f"\nDownloaded: {file_info.rfilename} -> {local_path}")
+                print(f"\nDownloaded: {filename} -> {local_path}")
             except Exception as e:
-                print(f"\nError downloading {file_info.rfilename}: {str(e)}")
+                print(f"\nError downloading {filename}: {str(e)}")
                 
     except Exception as e:
         print(f"Error: {str(e)}")
@@ -70,4 +72,4 @@ if __name__ == "__main__":
         repo_id=repo_id,
         local_dir=local_dir,
         # token=token  # Uncomment if needed
-    ) 
+    )
