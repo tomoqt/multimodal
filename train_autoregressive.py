@@ -320,6 +320,10 @@ PAD_TOKEN_ID = tokenizer.pad_token_id
 BOS_TOKEN_ID = tokenizer.cls_token_id  # We'll treat [CLS] as BOS
 EOS_TOKEN_ID = tokenizer.sep_token_id  # We'll treat [SEP] as EOS
 
+# Before model initialization, add CUDA availability check
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
 model = MultiModalToSMILESModel(
     vocab_size=len(tokenizer),
     max_seq_length=max_seq_length,
@@ -328,7 +332,7 @@ model = MultiModalToSMILESModel(
     num_layers=num_layers,
     dropout=dropout,
     resample_size=resample_size
-).cuda()
+).to(device)  # Replace .cuda() with .to(device)
 
 train_loader, val_loader, test_loader = create_data_loaders(
     tokenizer=tokenizer,
@@ -385,7 +389,7 @@ def greedy_decode(model, nmr_data, ir_data, hsqc_data, max_len=128):
     model.eval()
     with torch.no_grad():
         # Start token
-        current_token = torch.tensor([[BOS_TOKEN_ID]], device='cuda')
+        current_token = torch.tensor([[BOS_TOKEN_ID]], device=device)
         
         # Encode
         memory = model.encoder(nmr_data, ir_data, hsqc_data)
@@ -412,11 +416,11 @@ def validate(model, val_loader, criterion, tokenizer):
     
     with torch.no_grad():
         for tgt_tokens, ir, h_nmr, c_nmr, hsqc in val_loader:
-            tgt_tokens = tgt_tokens.cuda()
-            if ir is not None: ir = ir.cuda()
-            if h_nmr is not None: h_nmr = h_nmr.cuda()
-            if c_nmr is not None: c_nmr = c_nmr.cuda()
-            if hsqc is not None: hsqc = hsqc.cuda()
+            tgt_tokens = tgt_tokens.to(device)
+            if ir is not None: ir = ir.to(device)
+            if h_nmr is not None: h_nmr = h_nmr.to(device)
+            if c_nmr is not None: c_nmr = c_nmr.to(device)
+            if hsqc is not None: hsqc = hsqc.to(device)
             
             T = tgt_tokens.shape[1]
             mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
@@ -521,11 +525,11 @@ for epoch in range(NUM_EPOCHS):
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
     for batch_idx, (tgt_tokens, ir, h_nmr, c_nmr, hsqc) in enumerate(pbar):
-        tgt_tokens = tgt_tokens.cuda()
-        if ir is not None:   ir = ir.cuda()
-        if h_nmr is not None: h_nmr = h_nmr.cuda()
-        if c_nmr is not None: c_nmr = c_nmr.cuda()
-        if hsqc is not None: hsqc = hsqc.cuda()
+        tgt_tokens = tgt_tokens.to(device)
+        if ir is not None:   ir = ir.to(device)
+        if h_nmr is not None: h_nmr = h_nmr.to(device)
+        if c_nmr is not None: c_nmr = c_nmr.to(device)
+        if hsqc is not None: hsqc = hsqc.to(device)
 
         T = tgt_tokens.shape[1]
         mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
@@ -603,10 +607,10 @@ all_targets = []
 
 with torch.no_grad():
     for tgt_tokens, ir, h_nmr, c_nmr, hsqc in test_loader:
-        if ir is not None: ir = ir.cuda()
-        if h_nmr is not None: h_nmr = h_nmr.cuda()
-        if c_nmr is not None: c_nmr = c_nmr.cuda()
-        if hsqc is not None: hsqc = hsqc.cuda()
+        if ir is not None: ir = ir.to(device)
+        if h_nmr is not None: h_nmr = h_nmr.to(device)
+        if c_nmr is not None: c_nmr = c_nmr.to(device)
+        if hsqc is not None: hsqc = hsqc.to(device)
         
         pred_tokens = greedy_decode(model, h_nmr, ir, hsqc)
         pred_smiles = tokenizer.decode(pred_tokens[0].tolist(), skip_special_tokens=True)
