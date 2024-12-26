@@ -1,11 +1,11 @@
 pandas
-numpy>=1.19.2
+nump
 matplotlib
 fastparquet
-pyarrow>=5.0.0
+pyarrow
 transformers
 scipy
-torch>=1.9.0
+torch
 wandb
 rdkit
 scikit-learn
