@@ -1,0 +1,14 @@
+pandas
+numpy>=1.19.2
+matplotlib
+fastparquet
+pyarrow>=5.0.0
+transformers
+scipy
+torch>=1.9.0
+wandb
+rdkit
+scikit-learn
+rdkit
+tqdm
+seaborn
