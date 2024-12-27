@@ -32,11 +32,16 @@ import pandas as pd
 import pyarrow.dataset as ds
 import matplotlib.pyplot as plt
 import seaborn as sns
+import yaml
+import argparse
 
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
 from models.multimodal_to_smiles import MultiModalToSMILESModel
 
+current_dir = os.path.dirname(os.path.realpath(__file__))
+vocab_path = os.path.join(current_dir, 'vocab.txt')
+tokenizer = SmilesTokenizer(vocab_file=vocab_path)
 
 # -------------------------------------------------------------------------
 # Warmup + Cosine Annealing With Restarts Scheduler
@@ -118,24 +123,35 @@ class SpectralSmilesDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_len = max_len
         
-        # Load shard paths - now looking for *_rg*.pt pattern
+        # Load shard paths
         self.shard_paths = sorted(self.data_dir.glob("*_rg*.pt"))
         if not self.shard_paths:
             raise FileNotFoundError(f"No shard files found in {data_dir}")
             
-        # Build index mapping: [(shard_path, row_idx), ...]
-        self.index_map = []
-        for shard_path in self.shard_paths:
-            shard_data = torch.load(shard_path)
-            for row_idx in shard_data.keys():
-                self.index_map.append((shard_path, row_idx))
+        # Try to load cached index
+        cache_path = self.data_dir / "index_cache.pt"
+        if cache_path.exists():
+            print("Loading cached index map...")
+            self.index_map = torch.load(cache_path)
+        else:
+            print("Building index map (first time only)...")
+            self.index_map = []
+            # Use tqdm to show progress
+            for shard_path in tqdm(self.shard_paths, desc="Loading shards"):
+                # Load just the keys, not the full data
+                shard_data = torch.load(shard_path, map_location='cpu')
+                self.index_map.extend((shard_path, row_idx) for row_idx in shard_data.keys())
+            # Cache for future runs
+            torch.save(self.index_map, cache_path)
+            print(f"Index map cached to {cache_path}")
 
     def __len__(self):
         return len(self.index_map)
 
     def __getitem__(self, idx):
         shard_path, row_idx = self.index_map[idx]
-        shard_data = torch.load(shard_path)
+        # Load shard data only when needed
+        shard_data = torch.load(shard_path, map_location='cpu')
         data = shard_data[row_idx]
 
         # Tokenize SMILES
@@ -301,20 +317,73 @@ def create_data_loaders(
 
 
 # -------------------------------------------------------------------------
-# Setup: Tokenizer, Model, Data Loaders
+# Setup: Config, Tokenizer, Model, Data Loaders
 # -------------------------------------------------------------------------
-current_dir = os.path.dirname(os.path.realpath(__file__))
-vocab_path = os.path.join(current_dir, 'vocab.txt')  # Adjust if needed
-tokenizer = SmilesTokenizer(vocab_file=vocab_path)
+def load_config(config_path=None):
+    """Load config from yaml file, falling back to defaults if not specified"""
+    default_config = {
+        'model': {
+            'max_seq_length': 128,
+            'embed_dim': 768,
+            'num_heads': 8,
+            'num_layers': 6,
+            'dropout': 0.1,
+            'resample_size': 1000
+        },
+        'training': {
+            'batch_size': 32,
+            'num_epochs': 1,
+            'learning_rate': 1.0e-4,
+            'min_learning_rate': 1.0e-6,
+            'validation_frequency': 500
+        },
+        'scheduler': {
+            'warmup_steps': 100,
+            'T0': 5,
+            'T_mult': 2
+        },
+        'data': {
+            'use_parquet': False,
+            'data_dir': "data_extraction/multimodal_spectroscopic_dataset",
+            'binary_dir': "training_binaries"
+        },
+        'wandb': {
+            'project': "smiles-generation",
+            'base_run_name': "smiles_gen"
+        }
+    }
+    
+    if config_path:
+        with open(config_path, 'r') as f:
+            custom_config = yaml.safe_load(f)
+            # Recursively update default config with custom values
+            def update_dict(d, u):
+                for k, v in u.items():
+                    if isinstance(v, dict):
+                        d[k] = update_dict(d.get(k, {}), v)
+                    else:
+                        d[k] = v
+                return d
+            update_dict(default_config, custom_config)
+    
+    return default_config
 
-# Key hyperparams
-max_seq_length = 128
-batch_size = 32
-embed_dim = 768
-num_heads = 8
-num_layers = 6
-dropout = 0.1
-resample_size = 1000
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train SMILES generation model')
+    parser.add_argument('--config', type=str, help='Path to config file')
+    return parser.parse_args()
+
+args = parse_args()
+config = load_config(args.config)
+
+# Use config values
+max_seq_length = config['model']['max_seq_length']
+batch_size = config['training']['batch_size']
+embed_dim = config['model']['embed_dim']
+num_heads = config['model']['num_heads']
+num_layers = config['model']['num_layers']
+dropout = config['model']['dropout']
+resample_size = config['model']['resample_size']
 
 PAD_TOKEN_ID = tokenizer.pad_token_id
 BOS_TOKEN_ID = tokenizer.cls_token_id  # We'll treat [CLS] as BOS
@@ -332,17 +401,57 @@ model = MultiModalToSMILESModel(
     num_layers=num_layers,
     dropout=dropout,
     resample_size=resample_size
-).to(device)  # Replace .cuda() with .to(device)
+).to(device)
 
 train_loader, val_loader, test_loader = create_data_loaders(
     tokenizer=tokenizer,
     batch_size=batch_size,
-    use_parquet=False,
-    data_dir="data_extraction/multimodal_spectroscopic_dataset",
-    binary_dir="training_binaries",
+    use_parquet=config['data']['use_parquet'],
+    data_dir=config['data']['data_dir'],
+    binary_dir=config['data']['binary_dir'],
     max_len=max_seq_length
 )
 
+# Update training setup
+warmup_steps = config['scheduler']['warmup_steps']
+run_name = (
+    f"{config['wandb']['base_run_name']}_"
+    f"enc_d{embed_dim}_"
+    f"enc_h{num_heads}_"
+    f"dec_l{num_layers}_"
+    f"bs{batch_size}_"
+    f"lr{config['training']['learning_rate']}_warm{warmup_steps}_"
+    f"{datetime.now().strftime('%m%d_%H%M')}"
+)
+
+wandb.init(
+    project=config['wandb']['project'],
+    name=run_name,
+    config=config  # Log the full config to wandb
+)
+
+criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
+optimizer = optim.AdamW(model.parameters(), lr=config['training']['learning_rate'])
+
+# Update scheduler
+scheduler = WarmupCosineLR(
+    optimizer,
+    warmup_steps=warmup_steps,
+    T_0=config['scheduler']['T0'] * len(train_loader),  # in steps
+    T_mult=config['scheduler']['T_mult'],
+    eta_min=config['training']['min_learning_rate']
+)
+
+NUM_EPOCHS = config['training']['num_epochs']
+validation_frequency = config['training']['validation_frequency']
+
+save_dir = Path('checkpoints') / datetime.now().strftime('%Y%m%d_%H%M%S')
+save_dir.mkdir(parents=True, exist_ok=True)
+
+best_val_loss = float('inf')
+epoch_loss = 0
+num_batches = 0
+global_step = 0
 
 # -------------------------------------------------------------------------
 # Helper Functions
@@ -454,65 +563,6 @@ def log_validation_results(val_metrics, global_step):
         "val_exact_match": val_metrics['val_exact_match']
     }, step=global_step)
 
-
-# -------------------------------------------------------------------------
-# Setup for training
-# -------------------------------------------------------------------------
-save_dir = Path('checkpoints') / datetime.now().strftime('%Y%m%d_%H%M%S')
-save_dir.mkdir(parents=True, exist_ok=True)
-
-best_val_loss = float('inf')
-epoch_loss = 0
-num_batches = 0
-
-warmup_steps = 100
-run_name = (
-    f"smiles_gen_"
-    f"enc_d768_"
-    f"enc_h4_"
-    f"dec_l6_"
-    f"bs32_"
-    f"lr1e-4_warm{warmup_steps}_"
-    f"{datetime.now().strftime('%m%d_%H%M')}"
-)
-
-wandb.init(
-    project="smiles-generation",
-    name=run_name,
-    config={
-        "architecture": "MultiModalToSMILES",
-        "encoder_embed_dim": 768,
-        "encoder_num_heads": 4,
-        "decoder_num_layers": 6,
-        "decoder_nhead": 8,
-        "decoder_dim_feedforward": 2048,
-        "dropout": 0,
-        "learning_rate": 1e-4,
-        "min_learning_rate": 1e-6,
-        "scheduler": "WarmupCosineRestarts",
-        "warmup_steps": warmup_steps,
-        "scheduler_T0": 5,
-        "scheduler_T_mult": 2,
-        "batch_size": 32,
-        "max_len": 128,
-    }
-)
-
-criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
-optimizer = optim.AdamW(model.parameters(), lr=1e-4)
-
-# Warmup + Cosine
-scheduler = WarmupCosineLR(
-    optimizer,
-    warmup_steps=warmup_steps,
-    T_0=5 * len(train_loader),  # in steps
-    T_mult=2,
-    eta_min=1e-6
-)
-
-NUM_EPOCHS = 1
-validation_frequency = 500  # validate every 500 steps
-global_step = 0
 
 # -------------------------------------------------------------------------
 # Training Loop
