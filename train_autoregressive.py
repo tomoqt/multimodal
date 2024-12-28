@@ -34,6 +34,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import yaml
 import argparse
+import time
 
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
@@ -103,54 +104,45 @@ class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
 class SpectralSmilesDataset(Dataset):
     """
     A PyTorch Dataset that reads sharded .pt files.
-    Each shard has multiple samples in format:
-    {
-        global_row_index: {
-            'smiles': str,
-            'spectra': {
-                'ir': Tensor or None,
-                'h_nmr': Tensor or None,
-                'c_nmr': Tensor or None,
-                'hsqc': Tensor or None
-            }
-        },
-        ...
-    }
+    Handles both preprocessed and raw data formats.
     """
-    def __init__(self, data_dir, tokenizer, max_len=128):
+    def __init__(self, data_dir, tokenizer, max_len=128, preprocessed=True):
+        print("\n[Dataset] Initializing SpectralSmilesDataset...")
         super().__init__()
         self.data_dir = Path(data_dir)
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.preprocessed = preprocessed
         
         # Load shard paths
-        self.shard_paths = sorted(self.data_dir.glob("*_rg*.pt"))
+        print("[Dataset] Looking for shard files...")
+        pattern = "*_processed.pt" if preprocessed else "*_rg*.pt"
+        self.shard_paths = sorted(self.data_dir.glob(pattern))
         if not self.shard_paths:
-            raise FileNotFoundError(f"No shard files found in {data_dir}")
+            raise FileNotFoundError(f"No shard files found in {data_dir} with pattern {pattern}")
+        print(f"[Dataset] Found {len(self.shard_paths)} shard files")
             
         # Try to load cached index
-        cache_path = self.data_dir / "index_cache.pt"
+        cache_name = "index_cache_processed.pt" if preprocessed else "index_cache.pt"
+        cache_path = self.data_dir / cache_name
         if cache_path.exists():
-            print("Loading cached index map...")
+            print("[Dataset] Loading cached index map...")
             self.index_map = torch.load(cache_path)
+            print(f"[Dataset] Loaded index map with {len(self.index_map)} entries")
         else:
-            print("Building index map (first time only)...")
+            print("[Dataset] Building new index map (this may take a while)...")
             self.index_map = []
-            # Use tqdm to show progress
             for shard_path in tqdm(self.shard_paths, desc="Loading shards"):
-                # Load just the keys, not the full data
                 shard_data = torch.load(shard_path, map_location='cpu')
                 self.index_map.extend((shard_path, row_idx) for row_idx in shard_data.keys())
-            # Cache for future runs
             torch.save(self.index_map, cache_path)
-            print(f"Index map cached to {cache_path}")
+            print(f"[Dataset] Created and cached index map with {len(self.index_map)} entries")
 
     def __len__(self):
         return len(self.index_map)
 
     def __getitem__(self, idx):
         shard_path, row_idx = self.index_map[idx]
-        # Load shard data only when needed
         shard_data = torch.load(shard_path, map_location='cpu')
         data = shard_data[row_idx]
 
@@ -163,12 +155,19 @@ class SpectralSmilesDataset(Dataset):
             truncation=True
         )
 
-        # Get spectral data from the new format
-        spectra = data['spectra']
-        ir = spectra.get('ir', None)
-        h_nmr = spectra.get('h_nmr', None)
-        c_nmr = spectra.get('c_nmr', None)
-        hsqc = spectra.get('hsqc', None)
+        if self.preprocessed:
+            # For preprocessed data, directly use the tensors
+            spectra = data['spectra']
+            ir = spectra.get('ir')
+            h_nmr = spectra.get('h_nmr')
+            c_nmr = spectra.get('c_nmr')
+            hsqc = spectra.get('hsqc')
+        else:
+            # For raw data, use the existing format
+            ir = data['spectra'].get('ir')
+            h_nmr = data['spectra'].get('h_nmr')
+            c_nmr = data['spectra'].get('c_nmr')
+            hsqc = data['spectra'].get('hsqc')
 
         return tokens, ir, h_nmr, c_nmr, hsqc
 
@@ -274,45 +273,73 @@ def collate_fn(batch):
 # -------------------------------------------------------------------------
 def create_data_loaders(
     tokenizer,
-    batch_size=256,
-    use_parquet=False,
-    data_dir="data_extraction/multimodal_spectroscopic_dataset",
-    binary_dir="training_binaries",
-    max_len=128,
+    config
 ):
     """
-    Create train/val/test DataLoaders. Default to using binary format.
+    Create train/val/test DataLoaders using parameters from config.
     """
-    if use_parquet:
-        dataset = ParquetSpectralDataset(data_dir, tokenizer, max_len)
+    print("\n[DataLoader] Creating data loaders...")
+    print(f"[DataLoader] Using {'Parquet' if config['data']['use_parquet'] else 'Binary'} dataset")
+    
+    if config['data']['use_parquet']:
+        dataset = ParquetSpectralDataset(
+            config['data']['data_dir'], 
+            tokenizer, 
+            config['model']['max_seq_length']
+        )
     else:
-        dataset = SpectralSmilesDataset(binary_dir, tokenizer, max_len)
+        dataset = SpectralSmilesDataset(
+            config['data']['binary_dir'], 
+            tokenizer, 
+            config['model']['max_seq_length'],
+            preprocessed=config['data'].get('preprocessed', False)
+        )
+    
+    print(f"[DataLoader] Total dataset size: {len(dataset)}")
     
     # Split indices
+    print("[DataLoader] Splitting dataset into train/val/test...")
     all_indices = list(range(len(dataset)))
-    train_val_indices, test_indices = train_test_split(all_indices, test_size=20, random_state=42)
-    train_indices, val_indices = train_test_split(train_val_indices, test_size=0.1, random_state=42)
+    train_val_indices, test_indices = train_test_split(
+        all_indices, 
+        test_size=config['data'].get('test_size', 20), 
+        random_state=42
+    )
+    train_indices, val_indices = train_test_split(
+        train_val_indices, 
+        test_size=config['data'].get('val_size', 0.1), 
+        random_state=42
+    )
     
-    # DataLoaders
+    print(f"[DataLoader] Split sizes - Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
+    
+    # Create loaders
+    print("[DataLoader] Creating train loader...")
     train_loader = DataLoader(
         torch.utils.data.Subset(dataset, train_indices),
-        batch_size=batch_size,
+        batch_size=config['training']['batch_size'],
         shuffle=True,
+        num_workers=4,
         collate_fn=collate_fn
     )
+    
+    print("[DataLoader] Creating validation loader...")
     val_loader = DataLoader(
         torch.utils.data.Subset(dataset, val_indices),
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn
-    )
-    test_loader = DataLoader(
-        torch.utils.data.Subset(dataset, test_indices),
-        batch_size=1,
+        batch_size=config['training']['batch_size'],
         shuffle=False,
         collate_fn=collate_fn
     )
     
+    print("[DataLoader] Creating test loader...")
+    test_loader = DataLoader(
+        torch.utils.data.Subset(dataset, test_indices),
+        batch_size=config['training'].get('test_batch_size', 1),
+        shuffle=False,
+        collate_fn=collate_fn
+    )
+    
+    print("[DataLoader] Data loaders created successfully")
     return train_loader, val_loader, test_loader
 
 
@@ -332,10 +359,13 @@ def load_config(config_path=None):
         },
         'training': {
             'batch_size': 32,
+            'test_batch_size': 1,
             'num_epochs': 1,
             'learning_rate': 1.0e-4,
             'min_learning_rate': 1.0e-6,
-            'validation_frequency': 500
+            'validation_frequency': 500,
+            'logging_frequency': 100,
+            'save_frequency': 1000
         },
         'scheduler': {
             'warmup_steps': 100,
@@ -345,11 +375,15 @@ def load_config(config_path=None):
         'data': {
             'use_parquet': False,
             'data_dir': "data_extraction/multimodal_spectroscopic_dataset",
-            'binary_dir': "training_binaries"
+            'binary_dir': "training_binaries",
+            'preprocessed': False,
+            'test_size': 20,
+            'val_size': 0.1
         },
         'wandb': {
             'project': "smiles-generation",
-            'base_run_name': "smiles_gen"
+            'base_run_name': "smiles_gen",
+            'log_examples': True
         }
     }
     
@@ -373,315 +407,385 @@ def parse_args():
     parser.add_argument('--config', type=str, help='Path to config file')
     return parser.parse_args()
 
-args = parse_args()
-config = load_config(args.config)
-
-# Use config values
-max_seq_length = config['model']['max_seq_length']
-batch_size = config['training']['batch_size']
-embed_dim = config['model']['embed_dim']
-num_heads = config['model']['num_heads']
-num_layers = config['model']['num_layers']
-dropout = config['model']['dropout']
-resample_size = config['model']['resample_size']
-
-PAD_TOKEN_ID = tokenizer.pad_token_id
-BOS_TOKEN_ID = tokenizer.cls_token_id  # We'll treat [CLS] as BOS
-EOS_TOKEN_ID = tokenizer.sep_token_id  # We'll treat [SEP] as EOS
-
-# Before model initialization, add CUDA availability check
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-
-model = MultiModalToSMILESModel(
-    vocab_size=len(tokenizer),
-    max_seq_length=max_seq_length,
-    embed_dim=embed_dim,
-    num_heads=num_heads,
-    num_layers=num_layers,
-    dropout=dropout,
-    resample_size=resample_size
-).to(device)
-
-train_loader, val_loader, test_loader = create_data_loaders(
-    tokenizer=tokenizer,
-    batch_size=batch_size,
-    use_parquet=config['data']['use_parquet'],
-    data_dir=config['data']['data_dir'],
-    binary_dir=config['data']['binary_dir'],
-    max_len=max_seq_length
-)
-
-# Update training setup
-warmup_steps = config['scheduler']['warmup_steps']
-run_name = (
-    f"{config['wandb']['base_run_name']}_"
-    f"enc_d{embed_dim}_"
-    f"enc_h{num_heads}_"
-    f"dec_l{num_layers}_"
-    f"bs{batch_size}_"
-    f"lr{config['training']['learning_rate']}_warm{warmup_steps}_"
-    f"{datetime.now().strftime('%m%d_%H%M')}"
-)
-
-wandb.init(
-    project=config['wandb']['project'],
-    name=run_name,
-    config=config  # Log the full config to wandb
-)
-
-criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
-optimizer = optim.AdamW(model.parameters(), lr=config['training']['learning_rate'])
-
-# Update scheduler
-scheduler = WarmupCosineLR(
-    optimizer,
-    warmup_steps=warmup_steps,
-    T_0=config['scheduler']['T0'] * len(train_loader),  # in steps
-    T_mult=config['scheduler']['T_mult'],
-    eta_min=config['training']['min_learning_rate']
-)
-
-NUM_EPOCHS = config['training']['num_epochs']
-validation_frequency = config['training']['validation_frequency']
-
-save_dir = Path('checkpoints') / datetime.now().strftime('%Y%m%d_%H%M%S')
-save_dir.mkdir(parents=True, exist_ok=True)
-
-best_val_loss = float('inf')
-epoch_loss = 0
-num_batches = 0
-global_step = 0
-
-# -------------------------------------------------------------------------
-# Helper Functions
-# -------------------------------------------------------------------------
-def evaluate_predictions(predictions, targets):
-    """
-    Evaluate model predictions vs. targets:
-    - Exact match
-    - Valid SMILES
-    - Average Tanimoto (Morgan fingerprint)
-    """
-    from rdkit import DataStructs
-    from rdkit.Chem import AllChem
+# Add this main function to contain the training code
+def main():
+    print("\n[Main] Starting training script...")
+    args = parse_args()
     
-    exact_matches = 0
-    valid_smiles = 0
-    tanimoto_scores = []
+    print("[Main] Loading configuration...")
+    config = load_config(args.config)
+    print(f"[Main] Loaded config with {len(config)} sections")
+
+    print("\n[Main] Setting up model parameters...")
+    max_seq_length = config['model']['max_seq_length']
+    batch_size = config['training']['batch_size']
+    embed_dim = config['model']['embed_dim']
+    num_heads = config['model']['num_heads']
+    num_layers = config['model']['num_layers']
+    dropout = config['model']['dropout']
+    resample_size = config['model']['resample_size']
+
+    PAD_TOKEN_ID = tokenizer.pad_token_id
+    BOS_TOKEN_ID = tokenizer.cls_token_id
+    EOS_TOKEN_ID = tokenizer.sep_token_id
+
+    print("\n[Main] Setting up device...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        print(f"[Main] Found {torch.cuda.device_count()} CUDA devices:")
+        for i in range(torch.cuda.device_count()):
+            print(f"  - {torch.cuda.get_device_name(i)}")
+    else:
+        print("[Main] No CUDA devices found, using CPU")
+    print(f"[Main] Using device: {device}")
+
+    print("\n[Main] Initializing model...")
+    model = MultiModalToSMILESModel(
+        vocab_size=len(tokenizer),
+        max_seq_length=max_seq_length,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        dropout=dropout,
+        resample_size=resample_size
+    ).to(device)
+    print("[Main] Model initialized successfully")
+
+    print("\n[Main] Creating data loaders...")
+    train_loader, val_loader, test_loader = create_data_loaders(
+        tokenizer=tokenizer,
+        config=config
+    )
+
+    print("\n[Main] Initializing wandb...")
+    run_name = (
+        f"{config['wandb']['base_run_name']}_"
+        f"enc_d{embed_dim}_"
+        f"enc_h{num_heads}_"
+        f"dec_l{num_layers}_"
+        f"bs{batch_size}_"
+        f"lr{config['training']['learning_rate']}_warm{config['scheduler']['warmup_steps']}_"
+        f"{datetime.now().strftime('%m%d_%H%M')}"
+    )
+
+    wandb.init(
+        project=config['wandb']['project'],
+        name=run_name,
+        config=config
+    )
+    print("[Main] wandb initialized successfully")
+
+    print("\n[Main] Setting up training components...")
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
+    optimizer = optim.AdamW(model.parameters(), lr=config['training']['learning_rate'])
+    scheduler = WarmupCosineLR(
+        optimizer,
+        warmup_steps=config['scheduler']['warmup_steps'],
+        T_0=config['scheduler']['T0'] * len(train_loader),
+        T_mult=config['scheduler']['T_mult'],
+        eta_min=config['training']['min_learning_rate']
+    )
+
+    print("\n[Main] Creating checkpoint directory...")
+    save_dir = Path('checkpoints') / datetime.now().strftime('%Y%m%d_%H%M%S')
+    save_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Main] Checkpoint directory created at {save_dir}")
+
+    print("\n[Main] Starting training loop...")
+    NUM_EPOCHS = config['training']['num_epochs']
+    validation_frequency = config['training']['validation_frequency']
+    verbose = True  # Add this flag
     
-    for pred, target in zip(predictions, targets):
-        if pred == target:
-            exact_matches += 1
-        
-        mol_pred = Chem.MolFromSmiles(pred)
-        mol_target = Chem.MolFromSmiles(target)
-        
-        if mol_pred is not None:
-            valid_smiles += 1
-            if mol_target is not None:
-                fp_pred = AllChem.GetMorganFingerprintAsBitVect(mol_pred, 2)
-                fp_target = AllChem.GetMorganFingerprintAsBitVect(mol_target, 2)
-                tanimoto_scores.append(DataStructs.TanimotoSimilarity(fp_pred, fp_target))
-    
-    return {
-        'exact_match': exact_matches / len(predictions),
-        'valid_smiles': valid_smiles / len(predictions),
-        'avg_tanimoto': sum(tanimoto_scores) / len(tanimoto_scores) if tanimoto_scores else 0.0
-    }
+    # Add timing stats
+    batch_times = []
+    data_loading_times = []
+    forward_times = []
+    backward_times = []
 
-
-def greedy_decode(model, nmr_data, ir_data, hsqc_data, max_len=128):
-    """
-    Simple greedy decoding for SMILES generation.
-    """
-    model.eval()
-    with torch.no_grad():
-        # Start token
-        current_token = torch.tensor([[BOS_TOKEN_ID]], device=device)
-        
-        # Encode
-        memory = model.encoder(nmr_data, ir_data, hsqc_data)
-        
-        generated_tokens = [BOS_TOKEN_ID]
-        for _ in range(max_len):
-            logits = model.decoder(current_token, memory)
-            next_token = logits[:, -1:].argmax(dim=-1)
-            generated_tokens.append(next_token.item())
-            current_token = torch.cat([current_token, next_token], dim=1)
-            
-            if next_token.item() == EOS_TOKEN_ID:
-                break
-                
-        return torch.tensor([generated_tokens])
-
-
-def validate(model, val_loader, criterion, tokenizer):
-    model.eval()
-    total_loss = 0
+    best_val_loss = float('inf')
+    epoch_loss = 0
     num_batches = 0
-    exact_matches = 0
-    total_sequences = 0
-    
-    with torch.no_grad():
-        for tgt_tokens, ir, h_nmr, c_nmr, hsqc in val_loader:
+    global_step = 0
+
+    # -------------------------------------------------------------------------
+    # Helper Functions
+    # -------------------------------------------------------------------------
+    def evaluate_predictions(predictions, targets):
+        """
+        Evaluate model predictions vs. targets:
+        - Exact match
+        - Valid SMILES
+        - Average Tanimoto (Morgan fingerprint)
+        """
+        from rdkit import DataStructs
+        from rdkit.Chem import AllChem
+        
+        exact_matches = 0
+        valid_smiles = 0
+        tanimoto_scores = []
+        
+        for pred, target in zip(predictions, targets):
+            if pred == target:
+                exact_matches += 1
+            
+            mol_pred = Chem.MolFromSmiles(pred)
+            mol_target = Chem.MolFromSmiles(target)
+            
+            if mol_pred is not None:
+                valid_smiles += 1
+                if mol_target is not None:
+                    fp_pred = AllChem.GetMorganFingerprintAsBitVect(mol_pred, 2)
+                    fp_target = AllChem.GetMorganFingerprintAsBitVect(mol_target, 2)
+                    tanimoto_scores.append(DataStructs.TanimotoSimilarity(fp_pred, fp_target))
+        
+        return {
+            'exact_match': exact_matches / len(predictions),
+            'valid_smiles': valid_smiles / len(predictions),
+            'avg_tanimoto': sum(tanimoto_scores) / len(tanimoto_scores) if tanimoto_scores else 0.0
+        }
+
+
+    def greedy_decode(model, nmr_data, ir_data, hsqc_data, max_len=128):
+        """
+        Simple greedy decoding for SMILES generation.
+        """
+        model.eval()
+        with torch.no_grad():
+            # Start token
+            current_token = torch.tensor([[BOS_TOKEN_ID]], device=device)
+            
+            # Encode
+            memory = model.encoder(nmr_data, ir_data, hsqc_data)
+            
+            generated_tokens = [BOS_TOKEN_ID]
+            for _ in range(max_len):
+                logits = model.decoder(current_token, memory)
+                next_token = logits[:, -1:].argmax(dim=-1)
+                generated_tokens.append(next_token.item())
+                current_token = torch.cat([current_token, next_token], dim=1)
+                
+                if next_token.item() == EOS_TOKEN_ID:
+                    break
+                
+            return torch.tensor([generated_tokens])
+
+
+    def validate(model, val_loader, criterion, tokenizer):
+        model.eval()
+        total_loss = 0
+        num_batches = 0
+        exact_matches = 0
+        total_sequences = 0
+        
+        with torch.no_grad():
+            for tgt_tokens, ir, h_nmr, c_nmr, hsqc in val_loader:
+                tgt_tokens = tgt_tokens.to(device)
+                if ir is not None: ir = ir.to(device)
+                if h_nmr is not None: h_nmr = h_nmr.to(device)
+                if c_nmr is not None: c_nmr = c_nmr.to(device)
+                if hsqc is not None: hsqc = hsqc.to(device)
+                
+                T = tgt_tokens.shape[1]
+                mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
+                
+                logits = model(h_nmr, ir, hsqc, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
+                loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
+                
+                # Greedy decode for comparison
+                pred_tokens = greedy_decode(model, h_nmr, ir, hsqc)
+                
+                # Compare predictions
+                for pred, target in zip(pred_tokens, tgt_tokens):
+                    pred_smiles = tokenizer.decode(pred.tolist(), skip_special_tokens=True)
+                    target_smiles = tokenizer.decode(target.tolist(), skip_special_tokens=True)
+                    if pred_smiles == target_smiles:
+                        exact_matches += 1
+                
+                total_loss += loss.item()
+                num_batches += 1
+                total_sequences += tgt_tokens.size(0)
+        
+        return {
+            'val_loss': total_loss / num_batches,
+            'val_exact_match': exact_matches / total_sequences
+        }
+
+
+    def log_validation_results(val_metrics, global_step):
+        wandb.log({
+            "val_loss": val_metrics['val_loss'],
+            "val_exact_match": val_metrics['val_exact_match']
+        }, step=global_step)
+
+
+    # -------------------------------------------------------------------------
+    # Training Loop
+    # -------------------------------------------------------------------------
+    model.train()
+
+    for epoch in range(NUM_EPOCHS):
+        epoch_loss = 0
+        num_batches = 0
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        for batch_idx, batch_start_time in enumerate(pbar):
+            if verbose:
+                data_load_start = time.time()
+            
+            # Get the batch data
             tgt_tokens = tgt_tokens.to(device)
             if ir is not None: ir = ir.to(device)
             if h_nmr is not None: h_nmr = h_nmr.to(device)
             if c_nmr is not None: c_nmr = c_nmr.to(device)
             if hsqc is not None: hsqc = hsqc.to(device)
-            
+
+            if verbose:
+                data_load_time = time.time() - data_load_start
+                data_loading_times.append(data_load_time)
+                forward_start = time.time()
+
+            # Forward pass
             T = tgt_tokens.shape[1]
             mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
-            
             logits = model(h_nmr, ir, hsqc, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
             loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
-            
-            # Greedy decode for comparison
-            pred_tokens = greedy_decode(model, h_nmr, ir, hsqc)
-            
-            # Compare predictions
-            for pred, target in zip(pred_tokens, tgt_tokens):
-                pred_smiles = tokenizer.decode(pred.tolist(), skip_special_tokens=True)
-                target_smiles = tokenizer.decode(target.tolist(), skip_special_tokens=True)
-                if pred_smiles == target_smiles:
-                    exact_matches += 1
-            
-            total_loss += loss.item()
+
+            if verbose:
+                forward_time = time.time() - forward_start
+                forward_times.append(forward_time)
+                backward_start = time.time()
+
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            if verbose:
+                backward_time = time.time() - backward_start
+                backward_times.append(backward_time)
+                batch_time = time.time() - batch_start_time
+                batch_times.append(batch_time)
+
+                if batch_idx % 10 == 0:  # Print timing stats every 10 batches
+                    print(f"\n[Timing Stats] Batch {batch_idx}")
+                    print(f"  Data loading: {np.mean(data_loading_times[-10:]):.3f}s")
+                    print(f"  Forward pass: {np.mean(forward_times[-10:]):.3f}s")
+                    print(f"  Backward pass: {np.mean(backward_times[-10:]):.3f}s")
+                    print(f"  Total batch time: {np.mean(batch_times[-10:]):.3f}s")
+
+            current_lr = scheduler.get_lr()[0]
+            epoch_loss += loss.item()
             num_batches += 1
-            total_sequences += tgt_tokens.size(0)
-    
-    return {
-        'val_loss': total_loss / num_batches,
-        'val_exact_match': exact_matches / total_sequences
-    }
+            global_step += 1
 
+            # Update progress bar with timing info if verbose
+            if verbose:
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'lr': f"{current_lr:.2e}",
+                    'batch_time': f"{batch_time:.3f}s",
+                    'data_time': f"{data_load_time:.3f}s"
+                })
+            else:
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'lr': f"{current_lr:.2e}"
+                })
 
-def log_validation_results(val_metrics, global_step):
-    wandb.log({
-        "val_loss": val_metrics['val_loss'],
-        "val_exact_match": val_metrics['val_exact_match']
-    }, step=global_step)
+            wandb.log({
+                "batch_loss": loss.item(),
+                "learning_rate": current_lr,
+                "epoch": epoch + 1,
+                "global_step": global_step,
+            }, step=global_step)
 
+            if batch_idx % config['training']['logging_frequency'] == 0:
+                model.eval()
+                with torch.no_grad():
+                    # Safely get first item of each spectral data, handling None cases
+                    h_nmr_batch = h_nmr[0:1] if h_nmr is not None else None
+                    ir_batch = ir[0:1] if ir is not None else None
+                    hsqc_batch = hsqc[0:1] if hsqc is not None else None
+                    
+                    pred_tokens = greedy_decode(model,
+                                              h_nmr_batch,
+                                              ir_batch,
+                                              hsqc_batch)
+                    pred_smiles = tokenizer.decode(pred_tokens[0].tolist(), skip_special_tokens=True)
+                    target_smiles = tokenizer.decode(tgt_tokens[0].tolist(), skip_special_tokens=True)
+                    
+                    wandb.log({
+                        "example_prediction": wandb.Table(
+                            columns=["Target SMILES", "Predicted SMILES"],
+                            data=[[target_smiles, pred_smiles]]
+                        )
+                    }, step=global_step)
+                model.train()
 
-# -------------------------------------------------------------------------
-# Training Loop
-# -------------------------------------------------------------------------
-model.train()
-
-for epoch in range(NUM_EPOCHS):
-    epoch_loss = 0
-    num_batches = 0
-    
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-    for batch_idx, (tgt_tokens, ir, h_nmr, c_nmr, hsqc) in enumerate(pbar):
-        tgt_tokens = tgt_tokens.to(device)
-        if ir is not None:   ir = ir.to(device)
-        if h_nmr is not None: h_nmr = h_nmr.to(device)
-        if c_nmr is not None: c_nmr = c_nmr.to(device)
-        if hsqc is not None: hsqc = hsqc.to(device)
-
-        T = tgt_tokens.shape[1]
-        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
-
-        logits = model(h_nmr, ir, hsqc, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
-        loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-
-        current_lr = scheduler.get_lr()[0]
-        epoch_loss += loss.item()
-        num_batches += 1
-        global_step += 1
-
-        wandb.log({
-            "batch_loss": loss.item(),
-            "learning_rate": current_lr,
-            "epoch": epoch + 1,
-            "global_step": global_step,
-        }, step=global_step)
-
-        if batch_idx % 100 == 0:
-            model.eval()
-            with torch.no_grad():
-                # Safely get first item of each spectral data, handling None cases
-                h_nmr_batch = h_nmr[0:1] if h_nmr is not None else None
-                ir_batch = ir[0:1] if ir is not None else None
-                hsqc_batch = hsqc[0:1] if hsqc is not None else None
+            # Periodic validation
+            if global_step % validation_frequency == 0:
+                val_metrics = validate(model, val_loader, criterion, tokenizer)
+                log_validation_results(val_metrics, global_step)
+                pbar.set_postfix({
+                    'train_loss': f"{loss.item():.4f}",
+                    'val_loss': f"{val_metrics['val_loss']:.4f}",
+                    'val_exact': f"{val_metrics['val_exact_match']:.2%}"
+                })
                 
-                pred_tokens = greedy_decode(model,
-                                          h_nmr_batch,
-                                          ir_batch,
-                                          hsqc_batch)
-                pred_smiles = tokenizer.decode(pred_tokens[0].tolist(), skip_special_tokens=True)
-                target_smiles = tokenizer.decode(tgt_tokens[0].tolist(), skip_special_tokens=True)
-                
-                wandb.log({
-                    "example_prediction": wandb.Table(
-                        columns=["Target SMILES", "Predicted SMILES"],
-                        data=[[target_smiles, pred_smiles]]
-                    )
-                }, step=global_step)
-            model.train()
+                if val_metrics['val_loss'] < best_val_loss:
+                    best_val_loss = val_metrics['val_loss']
+                    torch.save({
+                        'epoch': epoch,
+                        'global_step': global_step,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'val_metrics': val_metrics,
+                    }, save_dir / 'best_model.pt')
+                model.train()
 
-        # Periodic validation
-        if global_step % validation_frequency == 0:
-            val_metrics = validate(model, val_loader, criterion, tokenizer)
-            log_validation_results(val_metrics, global_step)
-            pbar.set_postfix({
-                'train_loss': f"{loss.item():.4f}",
-                'val_loss': f"{val_metrics['val_loss']:.4f}",
-                'val_exact': f"{val_metrics['val_exact_match']:.2%}"
-            })
+    # -------------------------------------------------------------------------
+    # Final Evaluation on Test Set
+    # -------------------------------------------------------------------------
+    model.eval()
+    all_predictions = []
+    all_targets = []
+
+    with torch.no_grad():
+        for tgt_tokens, ir, h_nmr, c_nmr, hsqc in test_loader:
+            if ir is not None: ir = ir.to(device)
+            if h_nmr is not None: h_nmr = h_nmr.to(device)
+            if c_nmr is not None: c_nmr = c_nmr.to(device)
+            if hsqc is not None: hsqc = hsqc.to(device)
             
-            if val_metrics['val_loss'] < best_val_loss:
-                best_val_loss = val_metrics['val_loss']
-                torch.save({
-                    'epoch': epoch,
-                    'global_step': global_step,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_metrics': val_metrics,
-                }, save_dir / 'best_model.pt')
-            model.train()
+            pred_tokens = greedy_decode(model, h_nmr, ir, hsqc)
+            pred_smiles = tokenizer.decode(pred_tokens[0].tolist(), skip_special_tokens=True)
+            target_smiles = tokenizer.decode(tgt_tokens[0].tolist(), skip_special_tokens=True)
+            
+            all_predictions.append(pred_smiles)
+            all_targets.append(target_smiles)
 
-# -------------------------------------------------------------------------
-# Final Evaluation on Test Set
-# -------------------------------------------------------------------------
-model.eval()
-all_predictions = []
-all_targets = []
+    results = evaluate_predictions(all_predictions, all_targets)
+    wandb.log({
+        "test_exact_match": results['exact_match'],
+        "test_valid_smiles": results['valid_smiles'],
+        "test_avg_tanimoto": results['avg_tanimoto']
+    })
 
-with torch.no_grad():
-    for tgt_tokens, ir, h_nmr, c_nmr, hsqc in test_loader:
-        if ir is not None: ir = ir.to(device)
-        if h_nmr is not None: h_nmr = h_nmr.to(device)
-        if c_nmr is not None: c_nmr = c_nmr.to(device)
-        if hsqc is not None: hsqc = hsqc.to(device)
-        
-        pred_tokens = greedy_decode(model, h_nmr, ir, hsqc)
-        pred_smiles = tokenizer.decode(pred_tokens[0].tolist(), skip_special_tokens=True)
-        target_smiles = tokenizer.decode(tgt_tokens[0].tolist(), skip_special_tokens=True)
-        
-        all_predictions.append(pred_smiles)
-        all_targets.append(target_smiles)
+    with open(save_dir / 'test_results.json', 'w') as f:
+        json.dump(results, f, indent=2)
 
-results = evaluate_predictions(all_predictions, all_targets)
-wandb.log({
-    "test_exact_match": results['exact_match'],
-    "test_valid_smiles": results['valid_smiles'],
-    "test_avg_tanimoto": results['avg_tanimoto']
-})
+    print("\nTest Results:")
+    print(f"Exact Match: {results['exact_match']:.2%}")
+    print(f"Valid SMILES: {results['valid_smiles']:.2%}")
+    print(f"Avg Tanimoto: {results['avg_tanimoto']:.3f}")
 
-with open(save_dir / 'test_results.json', 'w') as f:
-    json.dump(results, f, indent=2)
+    wandb.finish()
 
-print("\nTest Results:")
-print(f"Exact Match: {results['exact_match']:.2%}")
-print(f"Valid SMILES: {results['valid_smiles']:.2%}")
-print(f"Avg Tanimoto: {results['avg_tanimoto']:.3f}")
-
-wandb.finish()
+# Add this guard at the bottom of the file
+if __name__ == '__main__':
+    # Optional: Add freeze_support() if you plan to create executables
+    # from multiprocessing import freeze_support
+    # freeze_support()
+    
+    main()

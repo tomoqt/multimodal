@@ -4,11 +4,12 @@ import torch.nn.functional as F
 from .rope import apply_rotary_pos_emb
 
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, use_rope=False, rope_freqs=None):
+    def __init__(self, d_model, memory_dim, nhead, dim_feedforward=2048, dropout=0.1, use_rope=False, rope_freqs=None):
         super().__init__()
         assert d_model % nhead == 0, "d_model must be divisible by nhead"
         
         self.d_model = d_model
+        self.memory_dim = memory_dim
         self.nhead = nhead
         self.head_dim = d_model // nhead
         self.use_rope = use_rope
@@ -19,10 +20,10 @@ class DecoderLayer(nn.Module):
         self.k1 = nn.Linear(d_model, d_model)
         self.v1 = nn.Linear(d_model, d_model)
         
-        # Cross attention
+        # Cross attention - note k2 and v2 use memory_dim
         self.q2 = nn.Linear(d_model, d_model)
-        self.k2 = nn.Linear(d_model, d_model)
-        self.v2 = nn.Linear(d_model, d_model)
+        self.k2 = nn.Linear(memory_dim, d_model)
+        self.v2 = nn.Linear(memory_dim, d_model)
         
         # Output projections
         self.out1 = nn.Linear(d_model, d_model)
@@ -106,32 +107,37 @@ class SMILESDecoder(nn.Module):
         self,
         vocab_size,
         max_seq_length=512,
+        memory_dim=768,
         embed_dim=768,
         num_heads=8,
         num_layers=6,
         dropout=0.1,
-        dim_feedforward=2048
+        dim_feedforward=2048,
+        verbose=True
     ):
         super().__init__()
         
         # Store configuration
         self.embed_dim = embed_dim
+        self.memory_dim = memory_dim
+        self.verbose = verbose
         
         # Embeddings
         self.embed = nn.Embedding(vocab_size, embed_dim)
         self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_length, embed_dim))
         
-        # Add input projection for memory
-        self.memory_proj = nn.Linear(embed_dim, embed_dim)
+        # Add input projection for memory if dimensions don't match
+        self.memory_proj = nn.Linear(memory_dim, memory_dim)
         
-        # Create decoder layers
+        # Create decoder layers with updated memory dimension
         self.layers = nn.ModuleList([
             DecoderLayer(
                 d_model=embed_dim,
+                memory_dim=memory_dim,  # Pass memory dimension
                 nhead=num_heads,
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
-                use_rope=False  # Simplified: using standard positional embeddings
+                use_rope=False
             ) for _ in range(num_layers)
         ])
         
@@ -139,11 +145,23 @@ class SMILESDecoder(nn.Module):
         self.out = nn.Linear(embed_dim, vocab_size)
         
     def forward(self, tgt, memory, tgt_mask=None):
+        if self.verbose:
+            print(f"\nDecoder Input Shapes:")
+            print(f"Target sequence: {tgt.shape}")
+            print(f"Memory: {memory.shape}")
+            if tgt_mask is not None:
+                print(f"Target mask: {tgt_mask.shape}")
+        
         x = self.embed(tgt)
+        if self.verbose:
+            print(f"After embedding: {x.shape}")
+            
         x = x + self.pos_embed[:, :x.size(1)]
         
         # Project memory to correct dimensions
         memory = self.memory_proj(memory)
+        if self.verbose:
+            print(f"After memory projection: {memory.shape}")
         
         # Ensure memory has sequence dimension
         if memory.dim() == 2:
@@ -158,5 +176,8 @@ class SMILESDecoder(nn.Module):
             
         for layer in self.layers:
             x = layer(x, memory, tgt_mask)
+            
+        if self.verbose:
+            print(f"Final output shape: {x.shape}")
             
         return self.out(x)

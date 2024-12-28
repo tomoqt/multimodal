@@ -94,8 +94,9 @@ class SpectralPreprocessor:
         return x_nmr, x_ir, x_hsqc
 
 class MultimodalSpectralEncoder(nn.Module):
-    def __init__(self, embed_dim=768, num_heads=4, dropout=0.1, resample_size=1000):
+    def __init__(self, embed_dim=768, num_heads=8, dropout=0.1, resample_size=1000, use_concat=True, verbose=True):
         super().__init__()
+        self.verbose = verbose
         self.preprocessor = SpectralPreprocessor(resample_size=resample_size)
         
         # Base ConvNeXt config
@@ -133,13 +134,25 @@ class MultimodalSpectralEncoder(nn.Module):
         
         # Add final layer norm
         self.final_norm = nn.LayerNorm(embed_dim)
+        
+        self.use_concat = use_concat
 
     def forward(self, nmr_data, ir_data, hsqc_data):
+        if self.verbose:
+            print("\nEncoder Processing:")
+            print("Processing input data...")
+            
         # Get the device of the model
         device = next(self.parameters()).device
         
         # Preprocess the input data
         x_nmr, x_ir, x_hsqc = self.preprocessor(nmr_data, ir_data, hsqc_data)
+        
+        if self.verbose:
+            print(f"Preprocessed shapes:")
+            print(f"NMR: {x_nmr.shape}")
+            print(f"IR: {x_ir.shape}")
+            print(f"HSQC: {x_hsqc.shape}")
         
         # Ensure inputs are on the correct device
         x_nmr = x_nmr.to(device)
@@ -150,6 +163,12 @@ class MultimodalSpectralEncoder(nn.Module):
         emb_nmr = self.nmr_backbone(x_nmr)
         emb_ir = self.ir_backbone(x_ir)
         emb_hsqc = self.hsqc_backbone(x_hsqc)
+        
+        if self.verbose:
+            print(f"\nBackbone outputs:")
+            print(f"NMR embedding: {emb_nmr.shape}")
+            print(f"IR embedding: {emb_ir.shape}")
+            print(f"HSQC embedding: {emb_hsqc.shape}")
         
         # Ensure embeddings have sequence dimension if they don't already
         if emb_nmr.dim() == 2:
@@ -168,4 +187,27 @@ class MultimodalSpectralEncoder(nn.Module):
         if fused.dim() == 3:
             fused = fused.mean(dim=1)
             
-        return fused
+        if self.use_concat:
+            # Concatenate available embeddings
+            embeddings = []
+            if emb_nmr is not None:
+                embeddings.append(emb_nmr)
+            if emb_ir is not None:
+                embeddings.append(emb_ir)
+            if emb_hsqc is not None:
+                embeddings.append(emb_hsqc)
+                
+            if not embeddings:
+                raise ValueError("No spectral data provided")
+                
+            # Concatenate along feature dimension
+            result = torch.cat(embeddings, dim=-1)
+            if self.verbose:
+                print(f"\nFinal concatenated output: {result.shape}")
+            return result
+        else:
+            # Use existing higher-order attention
+            result = fused
+            if self.verbose:
+                print(f"\nFinal fused output: {result.shape}")
+            return result

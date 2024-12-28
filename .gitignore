@@ -82,3 +82,4 @@ data_extraction/
 checkpoints/
 old_source/
 /wandb/
+/preprocessed_binaries/
