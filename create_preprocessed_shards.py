@@ -5,87 +5,41 @@ import pyarrow.parquet as pq
 import torch
 from pathlib import Path
 from tqdm import tqdm
-from models.preprocessing import GlobalWindowResampler, GlobalWindowResampler2D, Normalizer
-
-class SpectralPreprocessor:
-    def __init__(self, resample_size=1000):
-        self.nmr_processor = GlobalWindowResampler(target_size=resample_size, window=[0, 12])
-        self.ir_processor = GlobalWindowResampler(target_size=resample_size, window=[400, 4000])
-        self.hsqc_processor = GlobalWindowResampler2D(
-            target_size=(resample_size, resample_size),
-            window_h=[0, 12],
-            window_c=[0, 200],
-            method='linear'
-        )
-        self.normalizer = Normalizer()
-        self.resample_size = resample_size
-
-    def process_nmr(self, intensities, domain):
-        arr = self.nmr_processor(intensities, domain)
-        return self.normalizer(arr)
-
-    def process_ir(self, intensities, domain):
-        arr = self.ir_processor(intensities, domain)
-        return self.normalizer(arr)
-
-    def process_hsqc(self, intensities, domain_h, domain_c):
-        arr = self.hsqc_processor(intensities, domain_h, domain_c)
-        return self.normalizer(arr)
+from models.spectral_encoder import SpectralPreprocessor
 
 def convert_row_to_tensor(row, meta, preprocessor, device='cpu'):
     """Convert raw row data to preprocessed tensors."""
     smiles_str = row['smiles']
     
     # Helper function for 1D spectra
-    def process_1d_spectrum(data, domain, mode='ir'):
+    def process_1d_spectrum(data, domain, spectrum_type):
         if data is None:
             return None
         try:
             data = np.asarray(data, dtype=np.float32)
             # Create evenly spaced domain if not provided
             if domain is None:
-                if mode == 'ir':
+                if spectrum_type == 'ir':
                     domain = np.linspace(400, 4000, len(data))
-                else:  # nmr
+                elif spectrum_type == 'h_nmr':
                     domain = np.linspace(0, 12, len(data))
+                else:  # c_nmr
+                    domain = np.linspace(0, 200, len(data))
             domain = np.asarray(domain, dtype=np.float32)
             
-            if mode == 'ir':
-                arr = preprocessor.process_ir(data, domain)
-            else:
-                arr = preprocessor.process_nmr(data, domain)
-            return torch.tensor(arr, dtype=torch.float, device=device)
-        except Exception as e:
-            print(f"Warning: Failed to process {mode} spectrum: {e}")
-            return None
-
-    # Helper function for 2D HSQC
-    def process_hsqc_spectrum(data):
-        if data is None:
-            return None
-        try:
-            # Assuming data is a 2D array or can be converted to one
-            data = np.asarray(data, dtype=np.float32)
-            if data.ndim != 2:
-                print(f"Warning: HSQC data has unexpected shape: {data.shape}")
-                return None
-                
-            # Create default domains if needed
-            domain_h = np.linspace(0, 12, data.shape[0])
-            domain_c = np.linspace(0, 200, data.shape[1])
+            # Return as tuple of (data, domain) to match encoder expectations
+            return (torch.tensor(data, dtype=torch.float, device=device),
+                   torch.tensor(domain, dtype=torch.float, device=device))
             
-            arr = preprocessor.process_hsqc(data, domain_h, domain_c)
-            return torch.tensor(arr, dtype=torch.float, device=device)
         except Exception as e:
-            print(f"Warning: Failed to process HSQC spectrum: {e}")
+            print(f"Warning: Failed to process {spectrum_type} spectrum: {e}")
             return None
 
     # Process each spectrum type
     data_dict = {
-        'ir': process_1d_spectrum(row.get('ir_spectra'), None, mode='ir'),
-        'h_nmr': process_1d_spectrum(row.get('h_nmr_spectra'), None, mode='nmr'),
-        'c_nmr': process_1d_spectrum(row.get('c_nmr_spectra'), None, mode='nmr'),
-        'hsqc': process_hsqc_spectrum(row.get('hsqc_nmr_spectra'))
+        'ir': process_1d_spectrum(row.get('ir_spectra'), None, 'ir'),
+        'h_nmr': process_1d_spectrum(row.get('h_nmr_spectra'), None, 'h_nmr'),
+        'c_nmr': process_1d_spectrum(row.get('c_nmr_spectra'), None, 'c_nmr')
     }
 
     return smiles_str, data_dict
@@ -103,8 +57,30 @@ def process_parquet_in_row_groups(
     with open(meta_path, 'r') as f:
         meta = json.load(f)
 
-    # Initialize preprocessor
-    preprocessor = SpectralPreprocessor(resample_size=resample_size)
+    # Get domain ranges from metadata
+    ir_range = [
+        min(meta["ir_spectra"]["dimensions"]),
+        max(meta["ir_spectra"]["dimensions"])
+    ]
+    h_nmr_range = [
+        min(meta["h_nmr_spectra"]["dimensions"]),
+        max(meta["h_nmr_spectra"]["dimensions"])
+    ]
+    c_nmr_range = [
+        min(meta["c_nmr_spectra"]["dimensions"]),
+        max(meta["c_nmr_spectra"]["dimensions"])
+    ]
+
+    # Initialize preprocessor with domain ranges
+    preprocessor = SpectralPreprocessor(
+        resample_size=resample_size,
+        process_nmr=True,
+        process_ir=True,
+        process_c_nmr=True,
+        nmr_window=h_nmr_range,
+        ir_window=ir_range,
+        c_nmr_window=c_nmr_range
+    )
 
     parquet_file = pq.ParquetFile(parquet_path)
     num_row_groups = parquet_file.num_row_groups
@@ -123,11 +99,14 @@ def process_parquet_in_row_groups(
             row = df.iloc[i]
             smiles_str, data_dict = convert_row_to_tensor(row, meta, preprocessor, device=device)
             
-            # Store processed data
+            # Store processed data - handle (data, domain) tuples properly
             global_row_index = total_rows + i
             shard_data[global_row_index] = {
                 'smiles': smiles_str,
-                'spectra': {k: v.cpu() for k, v in data_dict.items() if v is not None}
+                'spectra': {
+                    k: (v[0].cpu(), v[1].cpu()) if v is not None else None 
+                    for k, v in data_dict.items()
+                }
             }
 
         # Save shard

@@ -121,6 +121,7 @@ class SMILESDecoder(nn.Module):
         self.embed_dim = embed_dim
         self.memory_dim = memory_dim
         self.verbose = verbose
+        self.max_seq_length = max_seq_length
         
         # Embeddings
         self.embed = nn.Embedding(vocab_size, embed_dim)
@@ -133,7 +134,7 @@ class SMILESDecoder(nn.Module):
         self.layers = nn.ModuleList([
             DecoderLayer(
                 d_model=embed_dim,
-                memory_dim=memory_dim,  # Pass memory dimension
+                memory_dim=memory_dim,
                 nhead=num_heads,
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
@@ -152,10 +153,15 @@ class SMILESDecoder(nn.Module):
             if tgt_mask is not None:
                 print(f"Target mask: {tgt_mask.shape}")
         
+        # Check sequence length
+        if tgt.size(1) > self.max_seq_length:
+            raise ValueError(f"Input sequence length {tgt.size(1)} exceeds maximum length {self.max_seq_length}")
+        
         x = self.embed(tgt)
         if self.verbose:
             print(f"After embedding: {x.shape}")
             
+        # Add positional embeddings
         x = x + self.pos_embed[:, :x.size(1)]
         
         # Project memory to correct dimensions

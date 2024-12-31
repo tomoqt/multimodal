@@ -10,7 +10,7 @@ model:
 
 # Training Parameters
 training:
-  batch_size: 1264
+  batch_size: 3
   test_batch_size: 1
   num_epochs: 1
   learning_rate: 1.0e-4
@@ -27,11 +27,12 @@ scheduler:
 
 # Data
 data:
-  use_parquet: false
+  use_parquet: False
   data_dir: "data_extraction/multimodal_spectroscopic_dataset"
-  binary_dir: "training_binaries"
+  binary_dir: "preprocessed_binaries"
   test_size: 20
   val_size: 0.01
+  preprocessed: False
 
 # Logging
 wandb:

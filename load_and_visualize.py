@@ -24,11 +24,50 @@ def load_data():
     
     print(f"\nTotal number of spectra in dataset: {total_count}")
     
-    # Load just one parquet file with memory efficiency improvements for visualization
+    # Calculate statistics using sampling
+    sample_size = 10000  # Adjust this number based on your memory constraints
+    missing_stats = {'IR': 0, '1H NMR': 0, '13C NMR': 0}
+    sampled_count = 0
+    
+    for file in parquet_files:
+        # Get number of row groups in this file
+        pf = pd.read_parquet(file, columns=['smiles'])
+        n_rows = len(pf)
+        
+        # Calculate how many rows to sample from this file
+        file_sample_size = int((n_rows / total_count) * sample_size)
+        if file_sample_size == 0:
+            continue
+            
+        # Randomly sample row indices
+        sample_indices = np.random.choice(n_rows, file_sample_size, replace=False)
+        
+        # Read sampled rows
+        df_chunk = pd.read_parquet(
+            file,
+            columns=['smiles', 'molecular_formula', 'ir_spectra', 'h_nmr_spectra', 'c_nmr_spectra'],
+            engine='fastparquet'
+        ).iloc[sample_indices]
+        
+        # Update statistics
+        missing_stats['IR'] += (df_chunk['ir_spectra'].isna() | df_chunk['ir_spectra'].apply(lambda x: len(x) == 0)).sum()
+        missing_stats['1H NMR'] += (df_chunk['h_nmr_spectra'].isna() | df_chunk['h_nmr_spectra'].apply(lambda x: len(x) == 0)).sum()
+        missing_stats['13C NMR'] += (df_chunk['c_nmr_spectra'].isna() | df_chunk['c_nmr_spectra'].apply(lambda x: len(x) == 0)).sum()
+        sampled_count += len(df_chunk)
+    
+    print("\nMissing Spectra Statistics (Based on Random Sampling):")
+    print("-" * 40)
+    print(f"Sample size: {sampled_count:,} molecules ({(sampled_count/total_count)*100:.1f}% of total)")
+    for spectrum_type, missing_count in missing_stats.items():
+        percentage = (missing_count / sampled_count) * 100
+        print(f"{spectrum_type}: {missing_count:,} missing ({percentage:.2f}%)")
+    print(f"\nTotal molecules: {total_count:,}")
+    
+    # Load just one file for visualization
     df = pd.read_parquet(
         parquet_files[0],
         columns=['smiles', 'molecular_formula', 'ir_spectra', 'h_nmr_spectra', 'c_nmr_spectra', 'hsqc_nmr_spectrum'],
-        engine='fastparquet'  # Usually more memory efficient
+        engine='fastparquet'
     )
     
     # Load metadata
@@ -127,6 +166,21 @@ def main():
         sample_idx = np.random.randint(0, len(df))
         sample = df.iloc[sample_idx]
         
+        # Print HSQC information
+        hsqc_spectrum = sample["hsqc_nmr_spectrum"]
+        if hsqc_spectrum is not None:
+            hsqc_array = np.array(hsqc_spectrum)
+            print("\nHSQC Spectrum Information:")
+            print(f"Shape: {hsqc_array.shape}")
+            print("\nFirst few values of HSQC spectrum:")
+            print(hsqc_array.flatten()[:10])  # Print first 10 values
+            
+            # Print min and max values
+            print(f"\nMin value: {hsqc_array.min()}")
+            print(f"Max value: {hsqc_array.max()}")
+        else:
+            print("\nHSQC spectrum is None")
+            
         # Free up memory
         del df
         

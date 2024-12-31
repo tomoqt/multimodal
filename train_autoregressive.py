@@ -35,6 +35,7 @@ import seaborn as sns
 import yaml
 import argparse
 import time
+import pyarrow.parquet as pq
 
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
@@ -148,28 +149,24 @@ class SpectralSmilesDataset(Dataset):
 
         # Tokenize SMILES
         smiles = data['smiles']
+        start_time = time.perf_counter()
         tokens = self.tokenizer.encode(
             smiles,
             add_special_tokens=True,
             max_length=self.max_len,
             truncation=True
         )
+        encode_time = time.perf_counter() - start_time
+        if hasattr(self, 'verbose') and self.verbose:
+            print(f"Tokenization took {encode_time:.4f} seconds")
 
-        if self.preprocessed:
-            # For preprocessed data, directly use the tensors
-            spectra = data['spectra']
-            ir = spectra.get('ir')
-            h_nmr = spectra.get('h_nmr')
-            c_nmr = spectra.get('c_nmr')
-            hsqc = spectra.get('hsqc')
-        else:
-            # For raw data, use the existing format
-            ir = data['spectra'].get('ir')
-            h_nmr = data['spectra'].get('h_nmr')
-            c_nmr = data['spectra'].get('c_nmr')
-            hsqc = data['spectra'].get('hsqc')
+        # Get spectral data - each should be a tuple of (data, domain)
+        spectra = data['spectra']
+        ir = spectra.get('ir')  # Should be (data, domain) tuple
+        h_nmr = spectra.get('h_nmr')  # Should be (data, domain) tuple
+        c_nmr = spectra.get('c_nmr')  # Should be (data, domain) tuple
 
-        return tokens, ir, h_nmr, c_nmr, hsqc
+        return tokens, ir, h_nmr, c_nmr
 
 
 # -------------------------------------------------------------------------
@@ -177,8 +174,8 @@ class SpectralSmilesDataset(Dataset):
 # -------------------------------------------------------------------------
 class ParquetSpectralDataset(Dataset):
     """
-    A PyTorch Dataset that reads Parquet files in one go (no row-group chunking).
-    Loads everything into a single pandas DataFrame, then samples row-by-row.
+    A PyTorch Dataset that reads multiple Parquet files using row groups.
+    Maintains an index mapping to efficiently load data from specific row groups.
     """
     def __init__(self, data_dir, tokenizer, max_len=128):
         super().__init__()
@@ -193,20 +190,67 @@ class ParquetSpectralDataset(Dataset):
         with open(meta_path) as f:
             self.meta_data = json.load(f)
 
-        # Load entire Parquet dataset to a DataFrame
-        self.dataset = ds.dataset(str(self.data_dir), format="parquet")
-        full_table = self.dataset.to_table(
-            columns=['smiles', 'ir_spectra', 'h_nmr_spectra', 
-                     'c_nmr_spectra', 'hsqc_nmr_spectrum']
-        )
-        self.df = full_table.to_pandas()
+        # Store domain information from metadata
+        self.ir_domain = torch.tensor(self.meta_data["ir_spectra"]["dimensions"], dtype=torch.float32)
+        self.h_nmr_domain = torch.tensor(self.meta_data["h_nmr_spectra"]["dimensions"], dtype=torch.float32)
+        self.c_nmr_domain = torch.tensor(self.meta_data["c_nmr_spectra"]["dimensions"], dtype=torch.float32)
+
+        # Find all parquet files
+        print("[Dataset] Looking for parquet files...")
+        self.parquet_files = sorted(self.data_dir.glob("*.parquet"))
+        if not self.parquet_files:
+            raise FileNotFoundError(f"No parquet files found in {data_dir}")
+        print(f"[Dataset] Found {len(self.parquet_files)} parquet files")
+
+        # Create index mapping for row groups
+        print("[Dataset] Building index mapping...")
+        self.index_map = []
+        
+        for file_idx, pq_file in enumerate(tqdm(self.parquet_files, desc="Indexing parquet files")):
+            try:
+                pf = pq.ParquetFile(pq_file)
+                for rg_idx in range(pf.num_row_groups):
+                    # Get row count for this row group
+                    row_count = pf.read_row_group(rg_idx, columns=['smiles']).num_rows
+                    # Add entries for each row in this row group
+                    self.index_map.extend(
+                        (file_idx, rg_idx, row_idx) 
+                        for row_idx in range(row_count)
+                    )
+            except Exception as e:
+                print(f"Warning: Error reading file {pq_file}: {str(e)}")
+                continue
+        
+        if not self.index_map:
+            raise ValueError("No valid data found in parquet files")
+        
+        print(f"[Dataset] Created index map with {len(self.index_map)} entries")
+
+        # Cache for the currently loaded row group
+        self._current_file_idx = None
+        self._current_rg_idx = None
+        self._current_rg_data = None
 
     def __len__(self):
-        return len(self.df)
+        return len(self.index_map)
 
     def __getitem__(self, idx):
-        row_data = self.df.iloc[idx]
+        file_idx, rg_idx, row_idx = self.index_map[idx]
+        
+        # Load the row group if it's not already loaded
+        if self._current_file_idx != file_idx or self._current_rg_idx != rg_idx:
+            pf = pq.ParquetFile(self.parquet_files[file_idx])
+            self._current_rg_data = pf.read_row_group(
+                rg_idx,
+                columns=['smiles', 'ir_spectra', 'h_nmr_spectra', 
+                        'c_nmr_spectra']
+            ).to_pandas()
+            self._current_file_idx = file_idx
+            self._current_rg_idx = rg_idx
 
+        row_data = self._current_rg_data.iloc[row_idx]
+
+        # Tokenize SMILES
         smiles = row_data['smiles']
         tokens = self.tokenizer.encode(
             smiles,
@@ -215,27 +259,59 @@ class ParquetSpectralDataset(Dataset):
             truncation=True
         )
 
-        def to_tensor(x):
+        def to_tensor(x, spectrum_type):
+            """Convert spectrum to tensor with correct domain information"""
             if x is None:
                 return None
-            return torch.tensor(x, dtype=torch.float32)
+            
+            try:
+                # Handle 1D spectra normally
+                tensor = torch.tensor(x, dtype=torch.float32)
+                if tensor.dim() == 1:
+                    if spectrum_type == 'ir':
+                        return (tensor, self.ir_domain)
+                    elif spectrum_type == 'h_nmr':
+                        return (tensor, self.h_nmr_domain)
+                    elif spectrum_type == 'c_nmr':
+                        return (tensor, self.c_nmr_domain)
+                return tensor
+                
+            except Exception as e:
+                print(f"Warning: Error converting {spectrum_type} data to tensor: {e}")
+                return None
 
-        ir_spectra = to_tensor(row_data['ir_spectra'])
-        h_nmr_spectra = to_tensor(row_data['h_nmr_spectra'])
-        c_nmr_spectra = to_tensor(row_data['c_nmr_spectra'])
-        hsqc_spectra = to_tensor(row_data['hsqc_nmr_spectrum'])
+        # Convert spectra to tuples of (data, domain)
+        ir_spectra = to_tensor(row_data['ir_spectra'], 'ir')
+        h_nmr_spectra = to_tensor(row_data['h_nmr_spectra'], 'h_nmr')
+        c_nmr_spectra = to_tensor(row_data['c_nmr_spectra'], 'c_nmr')
 
-        return tokens, ir_spectra, h_nmr_spectra, c_nmr_spectra, hsqc_spectra
+        return tokens, ir_spectra, h_nmr_spectra, c_nmr_spectra
 
 
 # -------------------------------------------------------------------------
-# Collate Function
+# Collate Function - Moved outside to be picklable
 # -------------------------------------------------------------------------
 def collate_fn(batch):
     """
-    Custom collate: pad variable-length SMILES tokens, stack spectral data.
+    Custom collate: pad tokens, preserve spectral data tuples.
     """
-    all_tokens, all_ir, all_h_nmr, all_c_nmr, all_hsqc = zip(*batch)
+    # Unzip the batch into separate lists
+    all_tokens, all_ir, all_h_nmr, all_c_nmr = zip(*batch)
+    
+    # Helper function to stack spectral data tuples
+    def maybe_stack_with_domain(items):
+        if items[0] is not None:
+            # Stack data tensors along batch dimension
+            data = torch.stack([item[0] for item in items], dim=0)
+            # Use first domain tensor (they're all the same)
+            domain = items[0][1]
+            return (data, domain)
+        return None
+
+    # Stack spectral data preserving tuple structure
+    ir_batch = maybe_stack_with_domain(all_ir) if all_ir[0] is not None else None
+    h_nmr_batch = maybe_stack_with_domain(all_h_nmr) if all_h_nmr[0] is not None else None
+    c_nmr_batch = maybe_stack_with_domain(all_c_nmr) if all_c_nmr[0] is not None else None
 
     # Pad tokens
     max_len = max(len(t) for t in all_tokens)
@@ -244,37 +320,15 @@ def collate_fn(batch):
         pad_amount = max_len - len(seq)
         seq_tensor = torch.tensor(seq, dtype=torch.long)
         if pad_amount > 0:
-            pad_tensor = torch.full(
-                (pad_amount,), 
-                tokenizer.pad_token_id, 
-                dtype=torch.long
-            )
+            pad_tensor = torch.full((pad_amount,), tokenizer.pad_token_id, dtype=torch.long)
             seq_tensor = torch.cat([seq_tensor, pad_tensor], dim=0)
         padded_tokens.append(seq_tensor)
-
     token_batch = torch.stack(padded_tokens, dim=0)
 
-    # Stack spectral data (if not None)
-    def maybe_stack(tensors):
-        if tensors[0] is not None:
-            return torch.stack(tensors, dim=0)
-        return None
-
-    ir_batch = maybe_stack(all_ir)
-    h_batch = maybe_stack(all_h_nmr)
-    c_batch = maybe_stack(all_c_nmr)
-    hsqc_batch = maybe_stack(all_hsqc)
-
-    return token_batch, ir_batch, h_batch, c_batch, hsqc_batch
+    return token_batch, ir_batch, h_nmr_batch, c_nmr_batch
 
 
-# -------------------------------------------------------------------------
-# Create Data Loaders
-# -------------------------------------------------------------------------
-def create_data_loaders(
-    tokenizer,
-    config
-):
+def create_data_loaders(tokenizer, config):
     """
     Create train/val/test DataLoaders using parameters from config.
     """
@@ -313,13 +367,13 @@ def create_data_loaders(
     
     print(f"[DataLoader] Split sizes - Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
     
-    # Create loaders
+    # Create loaders with simple collate function
     print("[DataLoader] Creating train loader...")
     train_loader = DataLoader(
         torch.utils.data.Subset(dataset, train_indices),
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=4,
+        num_workers=0,
         collate_fn=collate_fn
     )
     
@@ -407,6 +461,30 @@ def parse_args():
     parser.add_argument('--config', type=str, help='Path to config file')
     return parser.parse_args()
 
+def get_domain_ranges(meta_data):
+    """Extract domain ranges from metadata"""
+    ir_range = [
+        min(meta_data["ir_spectra"]["dimensions"]),
+        max(meta_data["ir_spectra"]["dimensions"])
+    ]
+    h_nmr_range = [
+        min(meta_data["h_nmr_spectra"]["dimensions"]),
+        max(meta_data["h_nmr_spectra"]["dimensions"])
+    ]
+    c_nmr_range = [
+        min(meta_data["c_nmr_spectra"]["dimensions"]),
+        max(meta_data["c_nmr_spectra"]["dimensions"])
+    ]
+    hsqc_h_range = [
+        min(meta_data["hsqc_nmr_spectrum"]["dimensions"]["h"]),
+        max(meta_data["hsqc_nmr_spectrum"]["dimensions"]["h"])
+    ]
+    hsqc_c_range = [
+        min(meta_data["hsqc_nmr_spectrum"]["dimensions"]["c"]),
+        max(meta_data["hsqc_nmr_spectrum"]["dimensions"]["c"])
+    ]
+    return ir_range, h_nmr_range, c_nmr_range, hsqc_h_range, hsqc_c_range
+
 # Add this main function to contain the training code
 def main():
     print("\n[Main] Starting training script...")
@@ -440,6 +518,16 @@ def main():
     print(f"[Main] Using device: {device}")
 
     print("\n[Main] Initializing model...")
+    
+    # Get domain ranges from dataset's metadata
+    if config['data']['use_parquet']:
+        meta_path = Path(config['data']['data_dir']) / "meta_data/meta_data_dict.json"
+        with open(meta_path) as f:
+            meta_data = json.load(f)
+        domain_ranges = get_domain_ranges(meta_data)
+    else:
+        domain_ranges = None  # Use defaults for binary dataset
+    
     model = MultiModalToSMILESModel(
         vocab_size=len(tokenizer),
         max_seq_length=max_seq_length,
@@ -447,7 +535,9 @@ def main():
         num_heads=num_heads,
         num_layers=num_layers,
         dropout=dropout,
-        resample_size=resample_size
+        resample_size=resample_size,
+        domain_ranges=domain_ranges,
+        verbose=False
     ).to(device)
     print("[Main] Model initialized successfully")
 
@@ -494,7 +584,7 @@ def main():
     print("\n[Main] Starting training loop...")
     NUM_EPOCHS = config['training']['num_epochs']
     validation_frequency = config['training']['validation_frequency']
-    verbose = True  # Add this flag
+    verbose = False
     
     # Add timing stats
     batch_times = []
@@ -545,7 +635,7 @@ def main():
         }
 
 
-    def greedy_decode(model, nmr_data, ir_data, hsqc_data, max_len=128):
+    def greedy_decode(model, nmr_data, ir_data, c_nmr_data, max_len=128):
         """
         Simple greedy decoding for SMILES generation.
         """
@@ -554,10 +644,42 @@ def main():
             # Start token
             current_token = torch.tensor([[BOS_TOKEN_ID]], device=device)
             
+            # Handle spectral data tuples properly
+            # For single batch inference, we need to add batch dimension if not present
+            if nmr_data is not None:
+                if isinstance(nmr_data, tuple):
+                    # If it's already a tuple of (data, domain), keep as is
+                    pass
+                else:
+                    # Add batch dimension if needed
+                    if nmr_data.dim() == 1:
+                        nmr_data = nmr_data.unsqueeze(0)
+                    # Create domain tensor if needed (should be provided by dataset)
+                    raise ValueError("NMR data must be provided as (data, domain) tuple")
+                    
+            if ir_data is not None:
+                if isinstance(ir_data, tuple):
+                    pass
+                else:
+                    if ir_data.dim() == 1:
+                        ir_data = ir_data.unsqueeze(0)
+                    raise ValueError("IR data must be provided as (data, domain) tuple")
+                    
+            if c_nmr_data is not None:
+                if isinstance(c_nmr_data, tuple):
+                    pass
+                else:
+                    if c_nmr_data.dim() == 1:
+                        c_nmr_data = c_nmr_data.unsqueeze(0)
+                    raise ValueError("C-NMR data must be provided as (data, domain) tuple")
+            
             # Encode
-            memory = model.encoder(nmr_data, ir_data, hsqc_data)
+            memory = model.encoder(nmr_data, ir_data, c_nmr_data)
             
             generated_tokens = [BOS_TOKEN_ID]
+            # Use the decoder's max_seq_length as the limit
+            max_len = min(max_len, model.decoder.max_seq_length)
+            
             for _ in range(max_len):
                 logits = model.decoder(current_token, memory)
                 next_token = logits[:, -1:].argmax(dim=-1)
@@ -578,21 +700,36 @@ def main():
         total_sequences = 0
         
         with torch.no_grad():
-            for tgt_tokens, ir, h_nmr, c_nmr, hsqc in val_loader:
+            for tgt_tokens, ir, h_nmr, c_nmr in val_loader:
                 tgt_tokens = tgt_tokens.to(device)
-                if ir is not None: ir = ir.to(device)
-                if h_nmr is not None: h_nmr = h_nmr.to(device)
-                if c_nmr is not None: c_nmr = c_nmr.to(device)
-                if hsqc is not None: hsqc = hsqc.to(device)
+                
+                # Handle spectral data tuples
+                if ir is not None:
+                    if isinstance(ir, tuple):
+                        ir = (ir[0].to(device), ir[1].to(device))
+                    else:
+                        ir = ir.to(device)
+                        
+                if h_nmr is not None:
+                    if isinstance(h_nmr, tuple):
+                        h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device))
+                    else:
+                        h_nmr = h_nmr.to(device)
+                        
+                if c_nmr is not None:
+                    if isinstance(c_nmr, tuple):
+                        c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device))
+                    else:
+                        c_nmr = c_nmr.to(device)
                 
                 T = tgt_tokens.shape[1]
                 mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
                 
-                logits = model(h_nmr, ir, hsqc, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
+                logits = model(h_nmr, ir, c_nmr, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
                 loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
                 
                 # Greedy decode for comparison
-                pred_tokens = greedy_decode(model, h_nmr, ir, hsqc)
+                pred_tokens = greedy_decode(model, h_nmr, ir, c_nmr)
                 
                 # Compare predictions
                 for pred, target in zip(pred_tokens, tgt_tokens):
@@ -618,6 +755,48 @@ def main():
         }, step=global_step)
 
 
+    def evaluate_on_test(model, test_loader, tokenizer, device):
+        model.eval()
+        all_predictions = []
+        all_targets = []
+
+        with torch.no_grad():
+            for tgt_tokens, ir, h_nmr, c_nmr in test_loader:
+                # Move target tokens to device
+                tgt_tokens = tgt_tokens.to(device)
+                
+                # Handle spectral data tuples properly
+                if ir is not None:
+                    if isinstance(ir, tuple):
+                        ir = (ir[0].to(device), ir[1].to(device))
+                    else:
+                        ir = ir.to(device)
+                        
+                if h_nmr is not None:
+                    if isinstance(h_nmr, tuple):
+                        h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device))
+                    else:
+                        h_nmr = h_nmr.to(device)
+                        
+                if c_nmr is not None:
+                    if isinstance(c_nmr, tuple):
+                        c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device))
+                    else:
+                        c_nmr = c_nmr.to(device)
+                
+                # Use greedy decode with proper tensor handling
+                pred_tokens = greedy_decode(model, h_nmr, ir, c_nmr)
+                
+                # Decode predictions and targets
+                pred_smiles = tokenizer.decode(pred_tokens[0].tolist(), skip_special_tokens=True)
+                target_smiles = tokenizer.decode(tgt_tokens[0].tolist(), skip_special_tokens=True)
+                
+                all_predictions.append(pred_smiles)
+                all_targets.append(target_smiles)
+
+        return all_predictions, all_targets
+
+
     # -------------------------------------------------------------------------
     # Training Loop
     # -------------------------------------------------------------------------
@@ -628,16 +807,40 @@ def main():
         num_batches = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        for batch_idx, batch_start_time in enumerate(pbar):
+        for batch_idx, batch in enumerate(pbar):
+            batch_start_time = time.time()
+            
             if verbose:
                 data_load_start = time.time()
             
+            # Unpack the batch data correctly
+            tgt_tokens, ir, h_nmr, c_nmr = batch
+            
             # Get the batch data
             tgt_tokens = tgt_tokens.to(device)
-            if ir is not None: ir = ir.to(device)
-            if h_nmr is not None: h_nmr = h_nmr.to(device)
-            if c_nmr is not None: c_nmr = c_nmr.to(device)
-            if hsqc is not None: hsqc = hsqc.to(device)
+
+            # Handle spectral data tuples
+            if ir is not None:
+                if isinstance(ir, tuple):
+                    # For 1D spectra: (data, domain)
+                    ir = (ir[0].to(device), ir[1].to(device))
+                else:
+                    ir = ir.to(device)
+
+            if h_nmr is not None:
+                print('h_nmr',h_nmr)
+                if isinstance(h_nmr, tuple):
+                    h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device))
+                else:
+                    h_nmr = h_nmr.to(device)
+
+            if c_nmr is not None:
+                print('c_nmr',c_nmr)
+
+                if isinstance(c_nmr, tuple):
+                    c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device))
+                else:
+                    c_nmr = c_nmr.to(device)
 
             if verbose:
                 data_load_time = time.time() - data_load_start
@@ -646,8 +849,25 @@ def main():
 
             # Forward pass
             T = tgt_tokens.shape[1]
+            # Print shapes of spectral tensors
+            print("\nSpectral tensor shapes:")
+            if h_nmr is not None:
+                if isinstance(h_nmr, tuple):
+                    print(f"H-NMR data: {h_nmr[0].shape}")
+                else:
+                    print(f"H-NMR: {h_nmr.shape}")
+            if ir is not None:
+                if isinstance(ir, tuple):
+                    print(f"IR data: {ir[0].shape}")
+                else:
+                    print(f"IR: {ir.shape}")
+            if c_nmr is not None:
+                if isinstance(c_nmr, tuple):
+                    print(f"C-NMR data: {c_nmr[0].shape}")
+                else:
+                    print(f"C-NMR: {c_nmr.shape}")
             mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
-            logits = model(h_nmr, ir, hsqc, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
+            logits = model(h_nmr, ir, c_nmr, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
             loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
 
             if verbose:
@@ -703,15 +923,15 @@ def main():
             if batch_idx % config['training']['logging_frequency'] == 0:
                 model.eval()
                 with torch.no_grad():
-                    # Safely get first item of each spectral data, handling None cases
-                    h_nmr_batch = h_nmr[0:1] if h_nmr is not None else None
-                    ir_batch = ir[0:1] if ir is not None else None
-                    hsqc_batch = hsqc[0:1] if hsqc is not None else None
+                    # Take first item but maintain tuple structure
+                    h_nmr_batch = (h_nmr[0][0:1], h_nmr[1]) if h_nmr is not None else None
+                    ir_batch = (ir[0][0:1], ir[1]) if ir is not None else None
+                    c_nmr_batch = (c_nmr[0][0:1], c_nmr[1]) if c_nmr is not None else None
                     
                     pred_tokens = greedy_decode(model,
-                                              h_nmr_batch,
-                                              ir_batch,
-                                              hsqc_batch)
+                                                  h_nmr_batch,
+                                                  ir_batch,
+                                                  c_nmr_batch)
                     pred_smiles = tokenizer.decode(pred_tokens[0].tolist(), skip_special_tokens=True)
                     target_smiles = tokenizer.decode(tgt_tokens[0].tolist(), skip_special_tokens=True)
                     
@@ -747,23 +967,8 @@ def main():
     # -------------------------------------------------------------------------
     # Final Evaluation on Test Set
     # -------------------------------------------------------------------------
-    model.eval()
-    all_predictions = []
-    all_targets = []
-
-    with torch.no_grad():
-        for tgt_tokens, ir, h_nmr, c_nmr, hsqc in test_loader:
-            if ir is not None: ir = ir.to(device)
-            if h_nmr is not None: h_nmr = h_nmr.to(device)
-            if c_nmr is not None: c_nmr = c_nmr.to(device)
-            if hsqc is not None: hsqc = hsqc.to(device)
-            
-            pred_tokens = greedy_decode(model, h_nmr, ir, hsqc)
-            pred_smiles = tokenizer.decode(pred_tokens[0].tolist(), skip_special_tokens=True)
-            target_smiles = tokenizer.decode(tgt_tokens[0].tolist(), skip_special_tokens=True)
-            
-            all_predictions.append(pred_smiles)
-            all_targets.append(target_smiles)
+    print("\nRunning final evaluation on test set...")
+    all_predictions, all_targets = evaluate_on_test(model, test_loader, tokenizer, device)
 
     results = evaluate_predictions(all_predictions, all_targets)
     wandb.log({
