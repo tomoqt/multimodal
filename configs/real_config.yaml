@@ -1,6 +1,7 @@
 # Model Architecture
 model:
-  max_seq_length: 128
+  use_concat: true
+  max_seq_length: 80
   embed_dim: 1024
   num_heads: 8
   num_layers: 6
@@ -9,25 +10,32 @@ model:
 
 # Training Parameters
 training:
-  batch_size: 256
+  batch_size: 48
+  test_batch_size: 1
   num_epochs: 1
   learning_rate: 1.0e-4
-  min_learning_rate: 1.0e-6
-  validation_frequency: 500
+  min_learning_rate: 1.0e-5
+  validation_frequency: 50
+  logging_frequency: 10
+  save_frequency: 1000
 
 # Scheduler
 scheduler:
   warmup_steps: 100
-  T0: 5  # in epochs
+  T0: 5
   T_mult: 2
 
 # Data
 data:
-  use_parquet: false
+  use_parquet: False
   data_dir: "data_extraction/multimodal_spectroscopic_dataset"
-  binary_dir: "training_binaries"
+  binary_dir: "preprocessed_binaries"
+  test_size: 1
+  val_size: 0.001
+  preprocessed: True
 
 # Logging
 wandb:
   project: "smiles-generation"
-  base_run_name: "smiles_gen" 
+  base_run_name: "smiles_gen"
+  log_examples: true 

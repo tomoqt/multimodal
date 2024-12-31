@@ -100,73 +100,146 @@ class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
 
 
 # -------------------------------------------------------------------------
-# Dataset / DataLoader for .pt Binaries
+# Dataset / DataLoader for Memory-Mapped Binary Files
 # -------------------------------------------------------------------------
 class SpectralSmilesDataset(Dataset):
     """
-    A PyTorch Dataset that reads sharded .pt files.
-    Handles both preprocessed and raw data formats.
+    A PyTorch Dataset that reads from memory-mapped binary files:
+      - spectra_data.bin  (float32 arrays for IR/H-NMR/C-NMR + domains)
+      - smiles_data.bin   (raw UTF-8 bytes for SMILES)
+      - spectra_index.npy (offsets/lengths for each row)
     """
-    def __init__(self, data_dir, tokenizer, max_len=128, preprocessed=True):
-        print("\n[Dataset] Initializing SpectralSmilesDataset...")
+    def __init__(self, data_dir, tokenizer, max_len=128):
+        """
+        data_dir: directory containing:
+          - spectra_data.bin
+          - smiles_data.bin
+          - spectra_index.npy
+        tokenizer: SmilesTokenizer instance
+        max_len: maximum SMILES token length
+        """
         super().__init__()
         self.data_dir = Path(data_dir)
         self.tokenizer = tokenizer
         self.max_len = max_len
-        self.preprocessed = preprocessed
-        
-        # Load shard paths
-        print("[Dataset] Looking for shard files...")
-        pattern = "*_processed.pt" if preprocessed else "*_rg*.pt"
-        self.shard_paths = sorted(self.data_dir.glob(pattern))
-        if not self.shard_paths:
-            raise FileNotFoundError(f"No shard files found in {data_dir} with pattern {pattern}")
-        print(f"[Dataset] Found {len(self.shard_paths)} shard files")
-            
-        # Try to load cached index
-        cache_name = "index_cache_processed.pt" if preprocessed else "index_cache.pt"
-        cache_path = self.data_dir / cache_name
-        if cache_path.exists():
-            print("[Dataset] Loading cached index map...")
-            self.index_map = torch.load(cache_path)
-            print(f"[Dataset] Loaded index map with {len(self.index_map)} entries")
-        else:
-            print("[Dataset] Building new index map (this may take a while)...")
-            self.index_map = []
-            for shard_path in tqdm(self.shard_paths, desc="Loading shards"):
-                shard_data = torch.load(shard_path, map_location='cpu')
-                self.index_map.extend((shard_path, row_idx) for row_idx in shard_data.keys())
-            torch.save(self.index_map, cache_path)
-            print(f"[Dataset] Created and cached index map with {len(self.index_map)} entries")
+
+        # Load index, which is shape [num_rows, 14] for IR/H-NMR/C-NMR + domains + SMILES
+        index_path = self.data_dir / "spectra_index.npy"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Index file not found at {index_path}")
+        self.index = np.load(index_path)  # shape: (num_rows, 14)
+
+        # Memory-map the big float32 spectra file
+        spectra_bin_path = self.data_dir / "spectra_data.bin"
+        if not spectra_bin_path.exists():
+            raise FileNotFoundError(f"Spectra data file not found at {spectra_bin_path}")
+        self.spectra_mmap = np.memmap(spectra_bin_path, dtype=np.float32, mode='r')
+
+        # Memory-map the SMILES file (raw bytes)
+        smiles_bin_path = self.data_dir / "smiles_data.bin"
+        if not smiles_bin_path.exists():
+            raise FileNotFoundError(f"SMILES data file not found at {smiles_bin_path}")
+        self.smiles_mmap = np.memmap(smiles_bin_path, dtype=np.uint8, mode='r')
+
+        print(f"[Dataset] MemoryMappedSpectralDataset initialized:")
+        print(f"          Index shape = {self.index.shape}")
+        print(f"          Found {len(self.index)} samples total.")
 
     def __len__(self):
-        return len(self.index_map)
+        return len(self.index)
 
     def __getitem__(self, idx):
-        shard_path, row_idx = self.index_map[idx]
-        shard_data = torch.load(shard_path, map_location='cpu')
-        data = shard_data[row_idx]
+        """
+        Each row in self.index has 14 columns:
+          0: IR_data_off,    1: IR_data_len,
+          2: IR_dom_off,     3: IR_dom_len,
+          4: HNMR_data_off,  5: HNMR_data_len,
+          6: HNMR_dom_off,   7: HNMR_dom_len,
+          8: CNMR_data_off,  9: CNMR_data_len,
+         10: CNMR_dom_off,  11: CNMR_dom_len,
+         12: SMILES_off,    13: SMILES_len
+        """
+        (
+            ir_data_off, ir_data_len,
+            ir_dom_off,  ir_dom_len,
+            hnm_data_off, hnm_data_len,
+            hnm_dom_off,  hnm_dom_len,
+            cnm_data_off, cnm_data_len,
+            cnm_dom_off,  cnm_dom_len,
+            smiles_off,   smiles_len
+        ) = self.index[idx]
 
+        # -------------------------
+        # Retrieve IR data + domain
+        # -------------------------
+        if ir_data_off == -1 or ir_data_len == 0:
+            ir_tuple = None
+        else:
+            # Float32 slice from the memory-mapped array
+            ir_data = self.spectra_mmap[ir_data_off : ir_data_off + ir_data_len]
+            # Domain
+            if ir_dom_off == -1 or ir_dom_len == 0:
+                ir_dom = None
+            else:
+                ir_dom = self.spectra_mmap[ir_dom_off : ir_dom_off + ir_dom_len]
+            # Convert to torch tensors
+            ir_data_t = torch.from_numpy(ir_data.copy()) if ir_data_len > 0 else None
+            ir_dom_t  = torch.from_numpy(ir_dom.copy())  if ir_dom is not None else None
+            ir_tuple  = (ir_data_t, ir_dom_t)
+
+        # -------------------------
+        # Retrieve H-NMR data + domain
+        # -------------------------
+        if hnm_data_off == -1 or hnm_data_len == 0:
+            h_nmr_tuple = None
+        else:
+            h_nmr_data = self.spectra_mmap[hnm_data_off : hnm_data_off + hnm_data_len]
+            if hnm_dom_off == -1 or hnm_dom_len == 0:
+                h_nmr_dom = None
+            else:
+                h_nmr_dom = self.spectra_mmap[hnm_dom_off : hnm_dom_off + hnm_dom_len]
+            h_nmr_tuple = (
+                torch.from_numpy(h_nmr_data.copy()),
+                torch.from_numpy(h_nmr_dom.copy()) if h_nmr_dom is not None else None
+            )
+
+        # -------------------------
+        # Retrieve C-NMR data + domain
+        # -------------------------
+        if cnm_data_off == -1 or cnm_data_len == 0:
+            c_nmr_tuple = None
+        else:
+            c_nmr_data = self.spectra_mmap[cnm_data_off : cnm_data_off + cnm_data_len]
+            if cnm_dom_off == -1 or cnm_dom_len == 0:
+                c_nmr_dom = None
+            else:
+                c_nmr_dom = self.spectra_mmap[cnm_dom_off : cnm_dom_off + cnm_dom_len]
+            c_nmr_tuple = (
+                torch.from_numpy(c_nmr_data.copy()),
+                torch.from_numpy(c_nmr_dom.copy()) if c_nmr_dom is not None else None
+            )
+
+        # -------------------------
+        # Retrieve SMILES string
+        # -------------------------
+        if smiles_off == -1 or smiles_len == 0:
+            smiles_str = ""
+        else:
+            smiles_bytes = self.smiles_mmap[smiles_off : smiles_off + smiles_len]
+            smiles_str = smiles_bytes.tobytes().decode('utf-8')
+
+        # -------------------------
         # Tokenize SMILES
-        smiles = data['smiles']
-        start_time = time.perf_counter()
+        # -------------------------
         tokens = self.tokenizer.encode(
-            smiles,
+            smiles_str,
             add_special_tokens=True,
             max_length=self.max_len,
             truncation=True
         )
-        encode_time = time.perf_counter() - start_time
-        if hasattr(self, 'verbose') and self.verbose:
-            print(f"Tokenization took {encode_time:.4f} seconds")
+        tokens = torch.tensor(tokens, dtype=torch.long)
 
-        # Get spectral data - each should be a tuple of (data, domain)
-        spectra = data['spectra']
-        ir = spectra.get('ir')  # Should be (data, domain) tuple
-        h_nmr = spectra.get('h_nmr')  # Should be (data, domain) tuple
-        c_nmr = spectra.get('c_nmr')  # Should be (data, domain) tuple
-
-        return tokens, ir, h_nmr, c_nmr
+        return tokens, ir_tuple, h_nmr_tuple, c_nmr_tuple
 
 
 # -------------------------------------------------------------------------
@@ -174,8 +247,7 @@ class SpectralSmilesDataset(Dataset):
 # -------------------------------------------------------------------------
 class ParquetSpectralDataset(Dataset):
     """
-    A PyTorch Dataset that reads multiple Parquet files using row groups.
-    Maintains an index mapping to efficiently load data from specific row groups.
+    A PyTorch Dataset that reads Parquet files using pandas.
     """
     def __init__(self, data_dir, tokenizer, max_len=128):
         super().__init__()
@@ -183,75 +255,47 @@ class ParquetSpectralDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_len = max_len
         
-        # Load metadata if needed
+        # Load metadata
         meta_path = self.data_dir / "meta_data/meta_data_dict.json"
         if not meta_path.exists():
             raise FileNotFoundError(f"Metadata file not found at {meta_path}")
         with open(meta_path) as f:
             self.meta_data = json.load(f)
 
-        # Store domain information from metadata
+        # Store domain information
         self.ir_domain = torch.tensor(self.meta_data["ir_spectra"]["dimensions"], dtype=torch.float32)
         self.h_nmr_domain = torch.tensor(self.meta_data["h_nmr_spectra"]["dimensions"], dtype=torch.float32)
         self.c_nmr_domain = torch.tensor(self.meta_data["c_nmr_spectra"]["dimensions"], dtype=torch.float32)
 
-        # Find all parquet files
+        # Find and load all parquet files
         print("[Dataset] Looking for parquet files...")
         self.parquet_files = sorted(self.data_dir.glob("*.parquet"))
         if not self.parquet_files:
             raise FileNotFoundError(f"No parquet files found in {data_dir}")
         print(f"[Dataset] Found {len(self.parquet_files)} parquet files")
 
-        # Create index mapping for row groups
-        print("[Dataset] Building index mapping...")
-        self.index_map = []
+        # Load all data into memory
+        print("[Dataset] Loading parquet files...")
+        dfs = []
+        for file in tqdm(self.parquet_files, desc="Loading parquet files"):
+            df = pd.read_parquet(
+                file,
+                columns=['smiles', 'ir_spectra', 'h_nmr_spectra', 'c_nmr_spectra'],
+                engine='pyarrow'
+            )
+            dfs.append(df)
         
-        for file_idx, pq_file in enumerate(tqdm(self.parquet_files, desc="Indexing parquet files")):
-            try:
-                pf = pq.ParquetFile(pq_file)
-                for rg_idx in range(pf.num_row_groups):
-                    # Get row count for this row group
-                    row_count = pf.read_row_group(rg_idx, columns=['smiles']).num_rows
-                    # Add entries for each row in this row group
-                    self.index_map.extend(
-                        (file_idx, rg_idx, row_idx) 
-                        for row_idx in range(row_count)
-                    )
-            except Exception as e:
-                print(f"Warning: Error reading file {pq_file}: {str(e)}")
-                continue
-        
-        if not self.index_map:
-            raise ValueError("No valid data found in parquet files")
-        
-        print(f"[Dataset] Created index map with {len(self.index_map)} entries")
-
-        # Cache for the currently loaded row group
-        self._current_file_idx = None
-        self._current_rg_idx = None
-        self._current_rg_data = None
+        self.data = pd.concat(dfs, ignore_index=True)
+        print(f"[Dataset] Loaded {len(self.data)} total rows")
 
     def __len__(self):
-        return len(self.index_map)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        file_idx, rg_idx, row_idx = self.index_map[idx]
-        
-        # Load the row group if it's not already loaded
-        if self._current_file_idx != file_idx or self._current_rg_idx != rg_idx:
-            pf = pq.ParquetFile(self.parquet_files[file_idx])
-            self._current_rg_data = pf.read_row_group(
-                rg_idx,
-                columns=['smiles', 'ir_spectra', 'h_nmr_spectra', 
-                        'c_nmr_spectra']
-            ).to_pandas()
-            self._current_file_idx = file_idx
-            self._current_rg_idx = rg_idx
-
-        row_data = self._current_rg_data.iloc[row_idx]
+        row = self.data.iloc[idx]
 
         # Tokenize SMILES
-        smiles = row_data['smiles']
+        smiles = row['smiles']
         tokens = self.tokenizer.encode(
             smiles,
             add_special_tokens=True,
@@ -260,12 +304,9 @@ class ParquetSpectralDataset(Dataset):
         )
 
         def to_tensor(x, spectrum_type):
-            """Convert spectrum to tensor with correct domain information"""
             if x is None:
                 return None
-            
             try:
-                # Handle 1D spectra normally
                 tensor = torch.tensor(x, dtype=torch.float32)
                 if tensor.dim() == 1:
                     if spectrum_type == 'ir':
@@ -275,15 +316,14 @@ class ParquetSpectralDataset(Dataset):
                     elif spectrum_type == 'c_nmr':
                         return (tensor, self.c_nmr_domain)
                 return tensor
-                
             except Exception as e:
                 print(f"Warning: Error converting {spectrum_type} data to tensor: {e}")
                 return None
 
         # Convert spectra to tuples of (data, domain)
-        ir_spectra = to_tensor(row_data['ir_spectra'], 'ir')
-        h_nmr_spectra = to_tensor(row_data['h_nmr_spectra'], 'h_nmr')
-        c_nmr_spectra = to_tensor(row_data['c_nmr_spectra'], 'c_nmr')
+        ir_spectra = to_tensor(row['ir_spectra'], 'ir')
+        h_nmr_spectra = to_tensor(row['h_nmr_spectra'], 'h_nmr')
+        c_nmr_spectra = to_tensor(row['c_nmr_spectra'], 'c_nmr')
 
         return tokens, ir_spectra, h_nmr_spectra, c_nmr_spectra
 
@@ -329,24 +369,20 @@ def collate_fn(batch):
 
 
 def create_data_loaders(tokenizer, config):
-    """
-    Create train/val/test DataLoaders using parameters from config.
-    """
     print("\n[DataLoader] Creating data loaders...")
-    print(f"[DataLoader] Using {'Parquet' if config['data']['use_parquet'] else 'Binary'} dataset")
-    
     if config['data']['use_parquet']:
+        # If using Parquet, keep the old approach
         dataset = ParquetSpectralDataset(
-            config['data']['data_dir'], 
-            tokenizer, 
-            config['model']['max_seq_length']
+            data_dir=config['data']['data_dir'],
+            tokenizer=tokenizer,
+            max_len=config['model']['max_seq_length']
         )
     else:
+        # Use the new memory-mapped dataset
         dataset = SpectralSmilesDataset(
-            config['data']['binary_dir'], 
-            tokenizer, 
-            config['model']['max_seq_length'],
-            preprocessed=config['data'].get('preprocessed', False)
+            data_dir=config['data']['binary_dir'],
+            tokenizer=tokenizer,
+            max_len=config['model']['max_seq_length']
         )
     
     print(f"[DataLoader] Total dataset size: {len(dataset)}")
@@ -419,7 +455,8 @@ def load_config(config_path=None):
             'min_learning_rate': 1.0e-6,
             'validation_frequency': 500,
             'logging_frequency': 100,
-            'save_frequency': 1000
+            'save_frequency': 1000,
+            'generate_during_training': False
         },
         'scheduler': {
             'warmup_steps': 100,
@@ -641,11 +678,19 @@ def main():
         """
         model.eval()
         with torch.no_grad():
-            # Start token
-            current_token = torch.tensor([[BOS_TOKEN_ID]], device=device)
+            # Get batch size from input data
+            batch_size = 1  # Default
+            if nmr_data is not None:
+                batch_size = nmr_data[0].size(0) if isinstance(nmr_data, tuple) else nmr_data.size(0)
+            elif ir_data is not None:
+                batch_size = ir_data[0].size(0) if isinstance(ir_data, tuple) else ir_data.size(0)
+            elif c_nmr_data is not None:
+                batch_size = c_nmr_data[0].size(0) if isinstance(c_nmr_data, tuple) else c_nmr_data.size(0)
+
+            # Start tokens for each sequence in the batch
+            current_token = torch.tensor([[BOS_TOKEN_ID]] * batch_size, device=device)
             
             # Handle spectral data tuples properly
-            # For single batch inference, we need to add batch dimension if not present
             if nmr_data is not None:
                 if isinstance(nmr_data, tuple):
                     # If it's already a tuple of (data, domain), keep as is
@@ -676,20 +721,43 @@ def main():
             # Encode
             memory = model.encoder(nmr_data, ir_data, c_nmr_data)
             
-            generated_tokens = [BOS_TOKEN_ID]
+            # Initialize storage for generated tokens
+            generated_sequences = [[] for _ in range(batch_size)]
+            for seq in generated_sequences:
+                seq.append(BOS_TOKEN_ID)
+            
             # Use the decoder's max_seq_length as the limit
             max_len = min(max_len, model.decoder.max_seq_length)
+            
+            finished_sequences = [False] * batch_size
             
             for _ in range(max_len):
                 logits = model.decoder(current_token, memory)
                 next_token = logits[:, -1:].argmax(dim=-1)
-                generated_tokens.append(next_token.item())
-                current_token = torch.cat([current_token, next_token], dim=1)
                 
-                if next_token.item() == EOS_TOKEN_ID:
+                # Update each sequence
+                for i in range(batch_size):
+                    if not finished_sequences[i]:
+                        token = next_token[i].item()
+                        generated_sequences[i].append(token)
+                        if token == EOS_TOKEN_ID:
+                            finished_sequences[i] = True
+                
+                # Stop if all sequences are finished
+                if all(finished_sequences):
                     break
                 
-            return torch.tensor([generated_tokens])
+                current_token = torch.cat([current_token, next_token], dim=1)
+            
+            # Convert to tensor
+            max_seq_len = max(len(seq) for seq in generated_sequences)
+            padded_sequences = []
+            for seq in generated_sequences:
+                # Pad sequence to max length
+                padded_seq = seq + [PAD_TOKEN_ID] * (max_seq_len - len(seq))
+                padded_sequences.append(padded_seq)
+            
+            return torch.tensor(padded_sequences, device=device)
 
 
     def validate(model, val_loader, criterion, tokenizer):
@@ -698,6 +766,9 @@ def main():
         num_batches = 0
         exact_matches = 0
         total_sequences = 0
+        
+        # Store one example for qualitative assessment
+        example_shown = True
         
         with torch.no_grad():
             for tgt_tokens, ir, h_nmr, c_nmr in val_loader:
@@ -722,21 +793,41 @@ def main():
                     else:
                         c_nmr = c_nmr.to(device)
                 
+                # Regular forward pass with teacher forcing
                 T = tgt_tokens.shape[1]
                 mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
                 
                 logits = model(h_nmr, ir, c_nmr, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
                 loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
                 
-                # Greedy decode for comparison
-                pred_tokens = greedy_decode(model, h_nmr, ir, c_nmr)
+                # Get predictions from logits
+                pred_tokens = logits.argmax(dim=-1)  # Shape: [batch_size, seq_len]
                 
-                # Compare predictions
-                for pred, target in zip(pred_tokens, tgt_tokens):
+                # Compare predictions from teacher forcing
+                for pred, target in zip(pred_tokens, tgt_tokens[:, 1:]):  # Skip BOS token in target
                     pred_smiles = tokenizer.decode(pred.tolist(), skip_special_tokens=True)
                     target_smiles = tokenizer.decode(target.tolist(), skip_special_tokens=True)
                     if pred_smiles == target_smiles:
                         exact_matches += 1
+                
+                # Do one greedy decode for qualitative assessment
+                if not example_shown:
+                    example_shown = True
+                    with torch.no_grad():
+                        # Take just the first example from the batch
+                        example_pred = greedy_decode(
+                            model,
+                            (h_nmr[0][:1], h_nmr[1]) if h_nmr is not None else None,
+                            (ir[0][:1], ir[1]) if ir is not None else None,
+                            (c_nmr[0][:1], c_nmr[1]) if c_nmr is not None else None
+                        )
+                        example_target = tgt_tokens[0]
+                        
+                        pred_smiles = tokenizer.decode(example_pred[0].tolist(), skip_special_tokens=True)
+                        target_smiles = tokenizer.decode(example_target.tolist(), skip_special_tokens=True)
+                        print("\nExample Generation:")
+                        print(f"Target SMILES: {target_smiles}")
+                        print(f"Generated SMILES: {pred_smiles}")
                 
                 total_loss += loss.item()
                 num_batches += 1
@@ -803,15 +894,16 @@ def main():
     model.train()
 
     for epoch in range(NUM_EPOCHS):
+        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
         epoch_loss = 0
         num_batches = 0
         
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        for batch_idx, batch in enumerate(pbar):
+        # Calculate total batches for percentage tracking
+        total_batches = len(train_loader)
+        log_interval = max(1, total_batches // 20)  # Log ~20 times per epoch
+        
+        for batch in train_loader:
             batch_start_time = time.time()
-            
-            if verbose:
-                data_load_start = time.time()
             
             # Unpack the batch data correctly
             tgt_tokens, ir, h_nmr, c_nmr = batch
@@ -822,58 +914,27 @@ def main():
             # Handle spectral data tuples
             if ir is not None:
                 if isinstance(ir, tuple):
-                    # For 1D spectra: (data, domain)
                     ir = (ir[0].to(device), ir[1].to(device))
                 else:
                     ir = ir.to(device)
 
             if h_nmr is not None:
-                print('h_nmr',h_nmr)
                 if isinstance(h_nmr, tuple):
                     h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device))
                 else:
                     h_nmr = h_nmr.to(device)
 
             if c_nmr is not None:
-                print('c_nmr',c_nmr)
-
                 if isinstance(c_nmr, tuple):
                     c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device))
                 else:
                     c_nmr = c_nmr.to(device)
 
-            if verbose:
-                data_load_time = time.time() - data_load_start
-                data_loading_times.append(data_load_time)
-                forward_start = time.time()
-
             # Forward pass
             T = tgt_tokens.shape[1]
-            # Print shapes of spectral tensors
-            print("\nSpectral tensor shapes:")
-            if h_nmr is not None:
-                if isinstance(h_nmr, tuple):
-                    print(f"H-NMR data: {h_nmr[0].shape}")
-                else:
-                    print(f"H-NMR: {h_nmr.shape}")
-            if ir is not None:
-                if isinstance(ir, tuple):
-                    print(f"IR data: {ir[0].shape}")
-                else:
-                    print(f"IR: {ir.shape}")
-            if c_nmr is not None:
-                if isinstance(c_nmr, tuple):
-                    print(f"C-NMR data: {c_nmr[0].shape}")
-                else:
-                    print(f"C-NMR: {c_nmr.shape}")
             mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
             logits = model(h_nmr, ir, c_nmr, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
             loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
-
-            if verbose:
-                forward_time = time.time() - forward_start
-                forward_times.append(forward_time)
-                backward_start = time.time()
 
             # Backward pass
             optimizer.zero_grad()
@@ -881,38 +942,19 @@ def main():
             optimizer.step()
             scheduler.step()
 
-            if verbose:
-                backward_time = time.time() - backward_start
-                backward_times.append(backward_time)
-                batch_time = time.time() - batch_start_time
-                batch_times.append(batch_time)
-
-                if batch_idx % 10 == 0:  # Print timing stats every 10 batches
-                    print(f"\n[Timing Stats] Batch {batch_idx}")
-                    print(f"  Data loading: {np.mean(data_loading_times[-10:]):.3f}s")
-                    print(f"  Forward pass: {np.mean(forward_times[-10:]):.3f}s")
-                    print(f"  Backward pass: {np.mean(backward_times[-10:]):.3f}s")
-                    print(f"  Total batch time: {np.mean(batch_times[-10:]):.3f}s")
-
             current_lr = scheduler.get_lr()[0]
             epoch_loss += loss.item()
             num_batches += 1
             global_step += 1
+            
+            # Simple progress logging
+            if num_batches % log_interval == 0:
+                avg_loss = epoch_loss / num_batches
+                progress = (num_batches / total_batches) * 100
+                print(f"Progress: {progress:3.0f}% | Batch {num_batches}/{total_batches} | "
+                      f"Loss: {avg_loss:.4f} | LR: {current_lr:.2e}")
 
-            # Update progress bar with timing info if verbose
-            if verbose:
-                pbar.set_postfix({
-                    'loss': f"{loss.item():.4f}",
-                    'lr': f"{current_lr:.2e}",
-                    'batch_time': f"{batch_time:.3f}s",
-                    'data_time': f"{data_load_time:.3f}s"
-                })
-            else:
-                pbar.set_postfix({
-                    'loss': f"{loss.item():.4f}",
-                    'lr': f"{current_lr:.2e}"
-                })
-
+            # Log to wandb
             wandb.log({
                 "batch_loss": loss.item(),
                 "learning_rate": current_lr,
@@ -920,41 +962,17 @@ def main():
                 "global_step": global_step,
             }, step=global_step)
 
-            if batch_idx % config['training']['logging_frequency'] == 0:
-                model.eval()
-                with torch.no_grad():
-                    # Take first item but maintain tuple structure
-                    h_nmr_batch = (h_nmr[0][0:1], h_nmr[1]) if h_nmr is not None else None
-                    ir_batch = (ir[0][0:1], ir[1]) if ir is not None else None
-                    c_nmr_batch = (c_nmr[0][0:1], c_nmr[1]) if c_nmr is not None else None
-                    
-                    pred_tokens = greedy_decode(model,
-                                                  h_nmr_batch,
-                                                  ir_batch,
-                                                  c_nmr_batch)
-                    pred_smiles = tokenizer.decode(pred_tokens[0].tolist(), skip_special_tokens=True)
-                    target_smiles = tokenizer.decode(tgt_tokens[0].tolist(), skip_special_tokens=True)
-                    
-                    wandb.log({
-                        "example_prediction": wandb.Table(
-                            columns=["Target SMILES", "Predicted SMILES"],
-                            data=[[target_smiles, pred_smiles]]
-                        )
-                    }, step=global_step)
-                model.train()
-
             # Periodic validation
             if global_step % validation_frequency == 0:
+                print("\nRunning validation...")
                 val_metrics = validate(model, val_loader, criterion, tokenizer)
                 log_validation_results(val_metrics, global_step)
-                pbar.set_postfix({
-                    'train_loss': f"{loss.item():.4f}",
-                    'val_loss': f"{val_metrics['val_loss']:.4f}",
-                    'val_exact': f"{val_metrics['val_exact_match']:.2%}"
-                })
+                print(f"Validation - Loss: {val_metrics['val_loss']:.4f} | "
+                      f"Exact Match: {val_metrics['val_exact_match']:.2%}")
                 
                 if val_metrics['val_loss'] < best_val_loss:
                     best_val_loss = val_metrics['val_loss']
+                    print(f"New best validation loss: {best_val_loss:.4f}")
                     torch.save({
                         'epoch': epoch,
                         'global_step': global_step,
@@ -963,6 +981,10 @@ def main():
                         'val_metrics': val_metrics,
                     }, save_dir / 'best_model.pt')
                 model.train()
+
+        # End of epoch logging
+        avg_epoch_loss = epoch_loss / num_batches
+        print(f"\nEpoch {epoch+1} completed | Average Loss: {avg_epoch_loss:.4f}")
 
     # -------------------------------------------------------------------------
     # Final Evaluation on Test Set

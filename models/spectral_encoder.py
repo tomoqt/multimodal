@@ -7,7 +7,7 @@ from .preprocessing import GlobalWindowResampler, GlobalWindowResampler2D, Norma
 from .higher_order_crossattention import HigherOrderMultiInputCrossAttention
 
 class SpectralPreprocessor:
-    def __init__(self, resample_size=1000, process_nmr=False, process_ir=False, process_c_nmr=False,
+    def __init__(self, resample_size=1000, process_nmr=True, process_ir=True, process_c_nmr=True,
                  nmr_window=None, ir_window=None, c_nmr_window=None):
         self.process_nmr = process_nmr
         self.process_ir = process_ir
