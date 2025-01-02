@@ -1,6 +1,6 @@
 # Model Architecture
 model:
-  use_concat: true
+  use_concat: True
   max_seq_length: 80
   embed_dim: 1024
   num_heads: 8
@@ -10,7 +10,7 @@ model:
 
 # Training Parameters
 training:
-  batch_size: 48
+  batch_size: 16
   test_batch_size: 1
   num_epochs: 1
   learning_rate: 1.0e-4
@@ -18,6 +18,13 @@ training:
   validation_frequency: 50
   logging_frequency: 10
   save_frequency: 1000
+  muon_lr: 0.02
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
+  adamw_betas: [0.9, 0.999]
+  adamw_eps: 1.0e-8
+  weight_decay: 0.01
 
 # Scheduler
 scheduler:
@@ -30,7 +37,7 @@ data:
   use_parquet: False
   data_dir: "data_extraction/multimodal_spectroscopic_dataset"
   binary_dir: "preprocessed_binaries"
-  test_size: 1
+  test_size: 20
   val_size: 0.001
   preprocessed: True
 

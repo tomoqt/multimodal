@@ -36,6 +36,8 @@ import yaml
 import argparse
 import time
 import pyarrow.parquet as pq
+from models.enhanced_decoder import EnhancedDecoder
+from models.muon_optimizer import Muon
 
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
@@ -522,6 +524,86 @@ def get_domain_ranges(meta_data):
     ]
     return ir_range, h_nmr_range, c_nmr_range, hsqc_h_range, hsqc_c_range
 
+# Move these function definitions to the top level, before main()
+def setup_optimizers(model, config, train_loader):
+    """Setup Muon for matrix params and AdamW for others"""
+    # Separate parameters
+    matrix_params = []
+    other_params = []
+    
+    for name, param in model.named_parameters():
+        if param.ndim == 2:  # Linear weights
+            matrix_params.append(param)
+        else:  # Embeddings, biases, layer norms, etc.
+            other_params.append(param)
+    
+    # Create optimizers
+    muon_opt = Muon(
+        matrix_params,
+        lr=config['training'].get('muon_lr', 0.02),
+        momentum=config['training'].get('muon_momentum', 0.95),
+        nesterov=config['training'].get('muon_nesterov', True),
+        ns_steps=config['training'].get('muon_ns_steps', 5)
+    )
+    
+    adamw_opt = torch.optim.AdamW(
+        other_params,
+        lr=config['training']['learning_rate'],
+        betas=config['training'].get('adamw_betas', (0.9, 0.999)),
+        eps=config['training'].get('adamw_eps', 1e-8),
+        weight_decay=config['training'].get('weight_decay', 0.01)
+    )
+    
+    # Create scheduler for AdamW optimizer
+    scheduler = WarmupCosineLR(
+        adamw_opt,
+        warmup_steps=config['scheduler']['warmup_steps'],
+        T_0=config['scheduler']['T0'] * len(train_loader),
+        T_mult=config['scheduler']['T_mult'],
+        eta_min=config['training']['min_learning_rate']
+    )
+    
+    return muon_opt, adamw_opt, scheduler
+
+def train_step(model, batch, muon_opt, adamw_opt, criterion, device):
+    """Single training step with both optimizers"""
+    tgt_tokens, ir, h_nmr, c_nmr = batch
+    tgt_tokens = tgt_tokens.to(device)
+    
+    # Handle spectral data tuples
+    if ir is not None:
+        if isinstance(ir, tuple):
+            ir = (ir[0].to(device), ir[1].to(device))
+        else:
+            ir = ir.to(device)
+        
+    if h_nmr is not None:
+        if isinstance(h_nmr, tuple):
+            h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device))
+        else:
+            h_nmr = h_nmr.to(device)
+        
+    if c_nmr is not None:
+        if isinstance(c_nmr, tuple):
+            c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device))
+        else:
+            c_nmr = c_nmr.to(device)
+
+    # Forward pass
+    T = tgt_tokens.shape[1]
+    mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
+    logits = model(h_nmr, ir, c_nmr, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
+    loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
+
+    # Backward pass with both optimizers
+    muon_opt.zero_grad()
+    adamw_opt.zero_grad()
+    loss.backward()
+    muon_opt.step()
+    adamw_opt.step()
+    
+    return loss.item()
+
 # Add this main function to contain the training code
 def main():
     print("\n[Main] Starting training script...")
@@ -603,16 +685,11 @@ def main():
     )
     print("[Main] wandb initialized successfully")
 
-    print("\n[Main] Setting up training components...")
+    print("\n[Main] Setting up optimizers and scheduler...")
+    muon_opt, adamw_opt, scheduler = setup_optimizers(model, config, train_loader)
+
+    # Also define criterion here
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
-    optimizer = optim.AdamW(model.parameters(), lr=config['training']['learning_rate'])
-    scheduler = WarmupCosineLR(
-        optimizer,
-        warmup_steps=config['scheduler']['warmup_steps'],
-        T_0=config['scheduler']['T0'] * len(train_loader),
-        T_mult=config['scheduler']['T_mult'],
-        eta_min=config['training']['min_learning_rate']
-    )
 
     print("\n[Main] Creating checkpoint directory...")
     save_dir = Path('checkpoints') / datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -936,45 +1013,14 @@ def main():
         for batch in train_loader:
             batch_start_time = time.time()
             
-            # Unpack the batch data correctly
-            tgt_tokens, ir, h_nmr, c_nmr = batch
+            # Use train_step function
+            loss = train_step(model, batch, muon_opt, adamw_opt, criterion, device)
             
-            # Get the batch data
-            tgt_tokens = tgt_tokens.to(device)
-
-            # Handle spectral data tuples
-            if ir is not None:
-                if isinstance(ir, tuple):
-                    ir = (ir[0].to(device), ir[1].to(device))
-                else:
-                    ir = ir.to(device)
-
-            if h_nmr is not None:
-                if isinstance(h_nmr, tuple):
-                    h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device))
-                else:
-                    h_nmr = h_nmr.to(device)
-
-            if c_nmr is not None:
-                if isinstance(c_nmr, tuple):
-                    c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device))
-                else:
-                    c_nmr = c_nmr.to(device)
-
-            # Forward pass
-            T = tgt_tokens.shape[1]
-            mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
-            logits = model(h_nmr, ir, c_nmr, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
-            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
-
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # Step the scheduler
             scheduler.step()
-
-            current_lr = scheduler.get_lr()[0]
-            epoch_loss += loss.item()
+            
+            current_lr = scheduler.get_lr()[0]  # Get AdamW learning rate
+            epoch_loss += loss
             num_batches += 1
             global_step += 1
             
@@ -987,7 +1033,7 @@ def main():
 
             # Log to wandb
             wandb.log({
-                "batch_loss": loss.item(),
+                "batch_loss": loss,
                 "learning_rate": current_lr,
                 "epoch": epoch + 1,
                 "global_step": global_step,

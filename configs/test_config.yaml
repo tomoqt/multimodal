@@ -1,6 +1,6 @@
 # Model Architecture
 model:
-  use_concat: true
+  use_concat: True
   max_seq_length: 16
   embed_dim: 32
   num_heads: 2

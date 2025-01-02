@@ -122,9 +122,9 @@ class MultimodalSpectralEncoder(nn.Module):
         
         self.preprocessor = SpectralPreprocessor(
             resample_size=resample_size,
-            process_nmr=True,
-            process_ir=True,
-            process_c_nmr=True,
+            process_nmr=False,
+            process_ir=False,
+            process_c_nmr=False,
             nmr_window=h_nmr_range,
             ir_window=ir_range,
             c_nmr_window=c_nmr_range
@@ -151,20 +151,22 @@ class MultimodalSpectralEncoder(nn.Module):
         self.ir_backbone = self.ir_backbone.to(device)
         self.c_nmr_backbone = self.c_nmr_backbone.to(device)
         
-        # Add higher-order cross attention
-        cross_attn_config = type('Config', (), {
-            'n_head': num_heads,
-            'n_embd': embed_dim,
-            'order': 3,  # We still have 3 modalities: H-NMR, IR, C-NMR
-            'dropout': dropout,
-            'bias': True
-        })
-        self.cross_attention = HigherOrderMultiInputCrossAttention(cross_attn_config)
-        
-        # Add final layer norm
-        self.final_norm = nn.LayerNorm(embed_dim)
-        
         self.use_concat = use_concat
+        
+        # Only create cross attention components if not using concatenation
+        if not use_concat:
+            # Add higher-order cross attention
+            cross_attn_config = type('Config', (), {
+                'n_head': num_heads,
+                'n_embd': embed_dim,
+                'order': 3,  # We still have 3 modalities: H-NMR, IR, C-NMR
+                'dropout': dropout,
+                'bias': True
+            })
+            self.cross_attention = HigherOrderMultiInputCrossAttention(cross_attn_config)
+            
+            # Add final layer norm
+            self.final_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, nmr_data, ir_data, c_nmr_data):
         if self.verbose:
@@ -183,11 +185,6 @@ class MultimodalSpectralEncoder(nn.Module):
             print(f"IR: {x_ir.shape}")
             print(f"C-NMR: {x_c_nmr.shape}")
         
-        # Ensure inputs are on the correct device
-        x_nmr = x_nmr.to(device)
-        x_ir = x_ir.to(device)
-        x_c_nmr = x_c_nmr.to(device)
-        
         # Pass through backbones
         emb_nmr = self.nmr_backbone(x_nmr)
         emb_ir = self.ir_backbone(x_ir)
@@ -198,22 +195,6 @@ class MultimodalSpectralEncoder(nn.Module):
             print(f"NMR embedding: {emb_nmr.shape}")
             print(f"IR embedding: {emb_ir.shape}")
             print(f"C-NMR embedding: {emb_c_nmr.shape}")
-        
-        # Ensure embeddings have sequence dimension if they don't already
-        if emb_nmr.dim() == 2:
-            emb_nmr = emb_nmr.unsqueeze(1)
-            emb_ir = emb_ir.unsqueeze(1)
-            emb_c_nmr = emb_c_nmr.unsqueeze(1)
-            
-        # Apply higher-order cross attention
-        fused = self.cross_attention(emb_nmr, emb_ir, emb_c_nmr)
-        
-        # Apply final normalization
-        fused = self.final_norm(fused)
-        
-        # Average over sequence dimension if present
-        if fused.dim() == 3:
-            fused = fused.mean(dim=1)
             
         if self.use_concat:
             # Concatenate embeddings
@@ -222,8 +203,16 @@ class MultimodalSpectralEncoder(nn.Module):
                 print(f"\nFinal concatenated output: {result.shape}")
             return result
         else:
-            # Use existing higher-order attention
-            result = fused
+            # Apply higher-order cross attention
+            fused = self.cross_attention(emb_nmr, emb_ir, emb_c_nmr)
+            
+            # Apply final normalization
+            fused = self.final_norm(fused)
+            
+            # Average over sequence dimension if present
+            if fused.dim() == 3:
+                fused = fused.mean(dim=1)
+                
             if self.verbose:
-                print(f"\nFinal fused output: {result.shape}")
-            return result
+                print(f"\nFinal fused output: {fused.shape}")
+            return fused
