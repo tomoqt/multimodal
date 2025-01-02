@@ -1054,7 +1054,10 @@ def main():
                         'epoch': epoch,
                         'global_step': global_step,
                         'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
+                        'optimizer_state_dict': {
+                            'muon': muon_opt.state_dict(),
+                            'adamw': adamw_opt.state_dict()
+                        },
                         'val_metrics': val_metrics,
                     }, save_dir / 'best_model.pt')
                 model.train()
