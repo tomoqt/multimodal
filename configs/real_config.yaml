@@ -2,15 +2,15 @@
 model:
   use_concat: True
   max_seq_length: 80
-  embed_dim: 1024
+  embed_dim: 2048
   num_heads: 8
-  num_layers: 6
+  num_layers: 12
   dropout: 0.1
   resample_size: 1000
 
 # Training Parameters
 training:
-  batch_size: 32
+  batch_size: 128
   test_batch_size: 1
   num_epochs: 1
   learning_rate: 1.0e-4
