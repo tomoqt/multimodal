@@ -18,7 +18,7 @@ training:
   validation_frequency: 50
   logging_frequency: 10
   save_frequency: 1000
-  muon_lr: 0.005
+  muon_lr: 0.001
   muon_momentum: 0.95
   muon_nesterov: true
   muon_ns_steps: 5
