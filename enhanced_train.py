@@ -599,6 +599,10 @@ def train_step(model, batch, muon_opt, adamw_opt, criterion, device):
     muon_opt.zero_grad()
     adamw_opt.zero_grad()
     loss.backward()
+    
+    # Add gradient clipping
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    
     muon_opt.step()
     adamw_opt.step()
     

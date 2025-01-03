@@ -83,3 +83,5 @@ checkpoints/
 old_source/
 /wandb/
 /preprocessed_binaries/
+best_model.pt
+*.pem
