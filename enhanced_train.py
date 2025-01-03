@@ -1054,7 +1054,10 @@ def main():
                 if val_metrics['val_loss'] < best_val_loss:
                     best_val_loss = val_metrics['val_loss']
                     print(f"New best validation loss: {best_val_loss:.4f}")
-                    torch.save({
+                    
+                    # Save checkpoint locally
+                    checkpoint_path = save_dir / 'best_model.pt'
+                    checkpoint = {
                         'epoch': epoch,
                         'global_step': global_step,
                         'model_state_dict': model.state_dict(),
@@ -1063,7 +1066,19 @@ def main():
                             'adamw': adamw_opt.state_dict()
                         },
                         'val_metrics': val_metrics,
-                    }, save_dir / 'best_model.pt')
+                    }
+                    torch.save(checkpoint, checkpoint_path)
+                    
+                    # Save checkpoint to wandb
+                    artifact = wandb.Artifact(
+                        name=f"model-{wandb.run.id}", 
+                        type="model",
+                        description=f"Model checkpoint at step {global_step} with val_loss: {best_val_loss:.4f}"
+                    )
+                    artifact.add_file(str(checkpoint_path))
+                    wandb.log_artifact(artifact)
+                    print(f"Saved best model checkpoint to wandb (val_loss: {best_val_loss:.4f})")
+                    
                 model.train()
 
         # End of epoch logging
