@@ -23,6 +23,7 @@ def zeropower_via_newtonschulz5(G, steps):
 
     if G.size(0) > G.size(1):
         X = X.T
+    X = (G.T.type_as(X) @ X).float().trace().bfloat16() * X  # Adaptive scaling
     return X
 
 class Muon(Optimizer):
