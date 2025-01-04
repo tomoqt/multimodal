@@ -117,11 +117,27 @@ class ConvNeXt1D(nn.Module):
         x = x.mean(-1)
         return self.norm(x)
 
-    def forward(self, x):
-        if x.dim() == 2:
-            x = x.unsqueeze(1)
-        x = self.forward_features(x)
-        x = self.head(x)
+    def forward(self, x, keep_sequence=False):
+        x = self.downsample_layers[0](x)
+        x = self.stages[0](x)
+        
+        for i in range(1, len(self.stages)):
+            x = self.downsample_layers[i](x)
+            x = self.stages[i](x)
+        
+        if keep_sequence:
+            # Apply normalization while keeping sequence dimension
+            x = x.transpose(1, 2)  # [B, C, L] -> [B, L, C]
+            x = self.norm(x)       # Apply norm to the channel dimension
+            
+            if self.regression:
+                x = self.head(x)   # Apply regression head to each sequence position
+        else:
+            # Original global pooling behavior
+            x = self.norm(x.mean([-1]))
+            if self.regression:
+                x = self.head(x)
+        
         return x
 
 def convnext_tiny_1d(num_classes=1000, regression=False, regression_dim=2):

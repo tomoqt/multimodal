@@ -110,6 +110,15 @@ class MultimodalSpectralEncoder(nn.Module):
     def __init__(self, embed_dim=768, num_heads=8, dropout=0.1, resample_size=1000, 
                  use_concat=True, verbose=True, domain_ranges=None):
         super().__init__()
+        
+        # Add assertion check for embedding dimension
+        if use_concat and embed_dim % 3 != 0:
+            raise ValueError(
+                f"When using concatenation (use_concat=True), embed_dim ({embed_dim}) "
+                f"must be divisible by 3 (number of modalities) to ensure equal "
+                f"dimension distribution across modalities."
+            )
+            
         self.verbose = verbose
         
         # Unpack domain ranges if provided
@@ -122,23 +131,36 @@ class MultimodalSpectralEncoder(nn.Module):
         
         self.preprocessor = SpectralPreprocessor(
             resample_size=resample_size,
-            process_nmr=False,
-            process_ir=False,
-            process_c_nmr=False,
+            process_nmr=True,
+            process_ir=True,
+            process_c_nmr=True,
             nmr_window=h_nmr_range,
             ir_window=ir_range,
             c_nmr_window=c_nmr_range
         )
         
-        # Base ConvNeXt config
+        # Calculate individual backbone output dimensions
+        n_modalities = 3
+        backbone_dim = embed_dim // n_modalities
+        
+        # Calculate the final sequence length after all downsampling
+        # resample_size -> /4 (stem) -> /2 -> /2 -> /2 (three downsampling layers)
+        final_seq_len = resample_size // 32
+        
+        # Base ConvNeXt config with reduced final dimension
         base_config = {
             'depths': [3, 3, 6, 3],
-            'dims': [64, 128, 256, embed_dim],
+            'dims': [64, 128, 256, backbone_dim],  # Final dim is embed_dim//3 per modality
             'drop_path_rate': 0.1,
             'layer_scale_init_value': 1e-6,
             'regression': True,
-            'regression_dim': embed_dim
+            'regression_dim': backbone_dim  # Each backbone outputs embed_dim//3
         }
+        
+        if verbose:
+            print(f"Input sequence length: {resample_size}")
+            print(f"Final sequence length: {final_seq_len}")
+            print(f"Backbone output dimension: {backbone_dim}")
         
         # Create 1D backbones for all spectra
         self.nmr_backbone = ConvNeXt1D(in_chans=1, **base_config)
@@ -185,10 +207,40 @@ class MultimodalSpectralEncoder(nn.Module):
             print(f"IR: {x_ir.shape}")
             print(f"C-NMR: {x_c_nmr.shape}")
         
+        # Reshape inputs to [batch, channels, sequence]
+        if isinstance(x_nmr, tuple):
+            x_nmr = x_nmr[0]
+        if isinstance(x_ir, tuple):
+            x_ir = x_ir[0]
+        if isinstance(x_c_nmr, tuple):
+            x_c_nmr = x_c_nmr[0]
+        
+        # Add channel dimension and transpose if needed
+        if x_nmr.dim() == 2:
+            x_nmr = x_nmr.unsqueeze(1)  # [batch, 1, sequence]
+        elif x_nmr.dim() == 3 and x_nmr.size(1) > x_nmr.size(2):  # if [batch, sequence, 1]
+            x_nmr = x_nmr.transpose(1, 2)  # [batch, 1, sequence]
+        
+        if x_ir.dim() == 2:
+            x_ir = x_ir.unsqueeze(1)
+        elif x_ir.dim() == 3 and x_ir.size(1) > x_ir.size(2):
+            x_ir = x_ir.transpose(1, 2)
+        
+        if x_c_nmr.dim() == 2:
+            x_c_nmr = x_c_nmr.unsqueeze(1)
+        elif x_c_nmr.dim() == 3 and x_c_nmr.size(1) > x_c_nmr.size(2):
+            x_c_nmr = x_c_nmr.transpose(1, 2)
+        
+        if self.verbose:
+            print(f"Reshaped input shapes:")
+            print(f"NMR: {x_nmr.shape}")
+            print(f"IR: {x_ir.shape}")
+            print(f"C-NMR: {x_c_nmr.shape}")
+        
         # Pass through backbones
-        emb_nmr = self.nmr_backbone(x_nmr)
-        emb_ir = self.ir_backbone(x_ir)
-        emb_c_nmr = self.c_nmr_backbone(x_c_nmr)
+        emb_nmr = self.nmr_backbone(x_nmr, keep_sequence=True)    # [B, seq_len, embed_dim//3]
+        emb_ir = self.ir_backbone(x_ir, keep_sequence=True)       # [B, seq_len, embed_dim//3]
+        emb_c_nmr = self.c_nmr_backbone(x_c_nmr, keep_sequence=True)  # [B, seq_len, embed_dim//3]
         
         if self.verbose:
             print(f"\nBackbone outputs:")
@@ -197,8 +249,12 @@ class MultimodalSpectralEncoder(nn.Module):
             print(f"C-NMR embedding: {emb_c_nmr.shape}")
             
         if self.use_concat:
-            # Concatenate embeddings
-            result = torch.cat([emb_nmr, emb_ir, emb_c_nmr], dim=-1)
+            # All sequences should have same length after backbone processing
+            assert emb_nmr.size(1) == emb_ir.size(1) == emb_c_nmr.size(1), "Sequence lengths must match"
+            
+            # Concatenate along embedding dimension
+            result = torch.cat([emb_nmr, emb_ir, emb_c_nmr], dim=-1)  # [B, seq_len, embed_dim]
+            
             if self.verbose:
                 print(f"\nFinal concatenated output: {result.shape}")
             return result
@@ -209,10 +265,6 @@ class MultimodalSpectralEncoder(nn.Module):
             # Apply final normalization
             fused = self.final_norm(fused)
             
-            # Average over sequence dimension if present
-            if fused.dim() == 3:
-                fused = fused.mean(dim=1)
-                
             if self.verbose:
                 print(f"\nFinal fused output: {fused.shape}")
             return fused

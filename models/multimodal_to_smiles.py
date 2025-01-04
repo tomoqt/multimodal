@@ -30,12 +30,12 @@ class MultiModalToSMILESModel(nn.Module):
             dropout=dropout,
             resample_size=resample_size,
             use_concat=use_concat,
-            verbose=False,
+            verbose=True,
             domain_ranges=domain_ranges
         )
         
         # Calculate decoder input dimension
-        decoder_dim = embed_dim * 3 if use_concat else embed_dim
+        decoder_dim = embed_dim * 1 if use_concat else embed_dim
         
         # SMILES decoder with verbose off
         self.decoder = SMILESDecoder(
