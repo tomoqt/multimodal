@@ -23,6 +23,7 @@ from datetime import datetime
 from sklearn.model_selection import train_test_split
 import json
 from rdkit import Chem
+from rdkit.Chem import rdFMCS
 from pathlib import Path
 import numpy as np
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
@@ -36,6 +37,7 @@ import yaml
 import argparse
 import time
 import pyarrow.parquet as pq
+from pprint import pprint
 
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
@@ -646,9 +648,6 @@ def main():
         from rdkit import DataStructs, Chem
         from rdkit.Chem import AllChem
         
-        exact_matches = 0
-        valid_smiles = 0
-        tanimoto_scores = []
         detailed_results = []
         
         for i, (pred, target) in enumerate(zip(predictions, targets)):
@@ -656,8 +655,11 @@ def main():
                 'prediction': pred,
                 'target': target,
                 'valid': False,
+                'valid_target': False,
                 'exact_match': False,
-                'tanimoto': 0.0
+                'tanimoto': 0.0,
+                '#mcs/#target': 0.0,
+                'ecfp6_iou': 0.0
             }
             
             # Remove spaces before creating molecules
@@ -667,47 +669,63 @@ def main():
             # Convert to RDKit molecules
             mol_pred = Chem.MolFromSmiles(pred_no_spaces)
             mol_target = Chem.MolFromSmiles(target_no_spaces)
-            
-            if mol_pred is not None:
-                valid_smiles += 1
-                result['valid'] = True
-                
-                if mol_target is not None:
-                    # Get canonical SMILES
-                    canon_pred = Chem.MolToSmiles(mol_pred, canonical=True)
-                    canon_target = Chem.MolToSmiles(mol_target, canonical=True)
-                    
-                    if canon_pred == canon_target:
-                        exact_matches += 1
-                    
-                    # Calculate Tanimoto similarity
-                    fp_pred = AllChem.GetMorganFingerprintAsBitVect(mol_pred, 2)
-                    fp_target = AllChem.GetMorganFingerprintAsBitVect(mol_target, 2)
-                    tanimoto = DataStructs.TanimotoSimilarity(fp_pred, fp_target)
-                    tanimoto_scores.append(tanimoto)
-                    result['tanimoto'] = tanimoto
-                    
-                    if verbose and i < 5:  # Print first 5 examples
-                        print(f"\nCanonical SMILES comparison:")
-                        print(f"Target (canonical):     {canon_target}")
-                        print(f"Prediction (canonical): {canon_pred}")
+
+            result['valid'] = mol_pred is not None
+            result['valid_target'] = mol_target is not None
+
+            if result['valid'] and result['valid_target']:
+                # Get canonical SMILES
+                canon_pred = Chem.MolToSmiles(mol_pred, canonical=True)
+                canon_target = Chem.MolToSmiles(mol_target, canonical=True)
+                result['exact_match'] = canon_pred == canon_target
+
+                # Standard Tanimoto similarity
+                fp_pred = AllChem.GetMorganFingerprintAsBitVect(mol_pred, 2)
+                fp_target = AllChem.GetMorganFingerprintAsBitVect(mol_target, 2)
+                tanimoto = DataStructs.TanimotoSimilarity(fp_pred, fp_target)
+                result['tanimoto'] = tanimoto
+
+                # ECFP6 IoU: ~ substructures predicted / substructures present :: ECFP6 has radius=3
+                fp3_pred = AllChem.GetMorganFingerprintAsBitVect(mol_pred, radius=3, nBits=1024)
+                fp3_traget = AllChem.GetMorganFingerprintAsBitVect(mol_target, radius=3, nBits=1024)
+                intersection = sum((fp3_pred & fp3_traget))  # Count of common bits
+                union = sum((fp3_pred | fp3_traget))  # Count of total unique bits
+                result['ecfp6_iou'] = intersection / union
+
+                # MCS: largest common substructure: calc num_atoms(mcs) / num_atoms(target)
+                mcs_result = Chem.rdFMCS.FindMCS([mol_pred, mol_target])
+                mcs_mol = Chem.MolFromSmarts(mcs_result.smartsString)
+                mcs_num_atoms = mcs_mol.GetNumAtoms()
+                target_num_atoms = mol_target.GetNumAtoms()
+                result['#mcs/#target'] = mcs_num_atoms / target_num_atoms
+
+                if verbose and i < 5:  # Print first 5 examples
+                    print(f"\nCanonical SMILES comparison:")
+                    print(f"Target (canonical):     {canon_target}")
+                    print(f"Prediction (canonical): {canon_pred}")
             
             detailed_results.append(result)
             
             # Print some examples if verbose
             if verbose and i < 5:
                 print(f"\nExample {i+1}:")
-                print(f"Target:     {target}")
-                print(f"Prediction: {pred}")
-                print(f"Valid: {result['valid']}")
-                print(f"Exact Match: {result['exact_match']}")
-                print(f"Tanimoto: {result['tanimoto']:.3f}")
+                pprint(result)
         
+        # aggregate batch-wise metrics
         metrics = {
-            'exact_match': exact_matches / len(predictions),
-            'valid_smiles': valid_smiles / len(predictions),
-            'avg_tanimoto': sum(tanimoto_scores) / len(tanimoto_scores) if tanimoto_scores else 0.0
+            'valid_smiles': np.mean([r['valid'] for r in detailed_results]),
+            'exact_match': np.mean([r['exact_match'] for r in detailed_results]),
         }
+        chem_results = list(filter(lambda x: x['valid'] and x['valid_target'], detailed_results))
+        metrics['avg_tanimoto'] = 0.0
+        metrics['avg_exact_match'] = 0.0
+        metrics['avg_ecfp6_iou'] = 0.0
+        metrics['avg_#mcs/#target'] = 0.0
+        if chem_results:
+            metrics['avg_tanimoto'] = np.mean([r['tanimoto'] for r in chem_results])
+            metrics['avg_exact_match'] = np.mean([r['exact_match'] for r in chem_results])
+            metrics['avg_ecfp6_iou'] = np.mean([r['ecfp6_iou'] for r in chem_results])
+            metrics['avg_#mcs/#target'] = np.mean([r['exact_#mcs/#target'] for r in chem_results])
         
         return metrics, detailed_results
 
