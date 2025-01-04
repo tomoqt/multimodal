@@ -713,7 +713,7 @@ def main():
         
         # aggregate batch-wise metrics
         metrics = {
-            'valid_smiles': sum(r['valid'] for r in detailed_results) / len(predictions),
+            'valid_smiles': np.mean([r['valid'] for r in detailed_results]),
             'exact_match': sum(r['exact_match'] for r in detailed_results) / len(predictions),
         }
         chem_results = list(filter(lambda x: x['valid'] and x['valid_target'], detailed_results))
