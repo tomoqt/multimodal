@@ -1,5 +1,5 @@
 pandas
-nump
+numpy
 matplotlib
 fastparquet
 pyarrow
