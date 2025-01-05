@@ -854,9 +854,6 @@ def main():
         model.eval()
         total_loss = 0
         num_batches = 0
-        exact_matches = 0
-        total_sequences = 0
-        matching_pairs = []  # Add this to track matching SMILES pairs
         detailed_results = []
         
         with torch.no_grad():
@@ -893,28 +890,27 @@ def main():
                 # Get predictions from logits and compare with targets
                 pred_tokens = logits.argmax(dim=-1)  # Shape: [batch_size, seq_len]
                 
-                # transfer pred and targets to cpu for decoding
+                # NOTE: if we decode with skip_special_tokens=True,
+                #   we add extra tokens after mol is finished w [SEP]
                 first_mol = lambda x: x.replace(" ", "").lstrip("[CLS]").split("[SEP]")[0]
+                # transfer pred and targets to cpu for decoding
                 pred_cpu = pred_tokens.detach().cpu()
                 preds_decoded = [first_mol(tokenizer.decode(pred.tolist())) for pred in pred_cpu]
                 targets_decoded = [first_mol(tokenizer.decode(target.tolist())) for target in target_cpu]
 
                 details = evaluate_predictions(preds_decoded, targets_decoded)
                 detailed_results += details
-                exact_matches += sum(d["exact_match"] for d in details)
-                matching_pairs += [
-                    {"predicted": d["prediction"], "target": d["target"]} for d in details if d["exact_match"]
-                ]
-                
+
                 total_loss += loss.item()
                 num_batches += 1
-                total_sequences += tgt_tokens.size(0)
 
         detailed_metrics = aggregate_metrics(detailed_results)
-        
+        matching_pairs = [
+            {"predicted": d["prediction"], "target": d["target"]} for d in details if d["exact_match"]
+        ]
+
         return {
             'val_loss': total_loss / num_batches,
-            'val_exact_match': exact_matches / total_sequences,
             # Store only a couple matches to avoid excessive logging
             'matching_pairs': np.random.choice(matching_pairs, size=min(len(matching_pairs), 10)).tolist(),
             **detailed_metrics
@@ -1036,17 +1032,14 @@ def main():
             epoch_loss += loss.item()
             num_batches += 1
             global_step += 1
-            
-            # Simple progress logging
-            if num_batches % log_interval == 0:
-                avg_loss = epoch_loss / num_batches
-                train_log = f"Train Loss: {avg_loss.item():.4f} | LR: {current_lr:.2e}"
+
+            # Log to wandb
+            if global_step % logging_frequency:
+                train_log = f"Train Loss: {loss.item():.4f} | LR: {current_lr:.2e}"
                 if global_step > validation_frequency:
                     train_log += f" | Val Loss: {val_metrics['val_loss']:.4f}"
                 pbar.set_description(train_log)
 
-            # Log to wandb
-            if global_step % logging_frequency:
                 wandb.log({
                     "batch_loss": loss.item(),
                     "learning_rate": current_lr,
