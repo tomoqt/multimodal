@@ -1072,11 +1072,7 @@ def main():
                         type="model",
                         description=f"Model checkpoint at step {global_step} with val_loss: {best_val_loss:.4f}"
                     )
-                    # Save checkpoint to temporary file
-                    tmp_path = f"model_checkpoint_{global_step}.pt"
-                    torch.save(checkpoint, tmp_path)
-                    artifact.add_file(tmp_path)
-                    os.remove(tmp_path)  # Clean up temporary file
+
                     wandb.log_artifact(artifact, aliases=["latest", f"step_{global_step}"])
                     print(f"Saved checkpoint to wandb (val_loss: {best_val_loss:.4f})")
                 model.train()
