@@ -825,6 +825,7 @@ def main():
         num_batches = 0
         exact_matches = 0
         total_sequences = 0
+        matching_pairs = []  # Add this to track matching SMILES pairs
         
         with torch.no_grad():
             for tgt_tokens, ir, h_nmr, c_nmr in val_loader:
@@ -876,6 +877,10 @@ def main():
                         canon_target = Chem.MolToSmiles(mol_target, canonical=True)
                         if canon_pred == canon_target:
                             exact_matches += 1
+                            matching_pairs.append({
+                                'predicted': canon_pred,
+                                'target': canon_target
+                            })
                 
                 total_loss += loss.item()
                 num_batches += 1
@@ -883,14 +888,19 @@ def main():
         
         return {
             'val_loss': total_loss / num_batches,
-            'val_exact_match': exact_matches / total_sequences
+            'val_exact_match': exact_matches / total_sequences,
+            'matching_pairs': matching_pairs[:10]  # Store only first 10 matches to avoid excessive logging
         }
 
 
     def log_validation_results(val_metrics, global_step):
         wandb.log({
             "val_loss": val_metrics['val_loss'],
-            "val_exact_match": val_metrics['val_exact_match']
+            "val_exact_match": val_metrics['val_exact_match'],
+            "val_matching_examples": wandb.Table(
+                columns=["Predicted SMILES", "Target SMILES"],
+                data=[[pair['predicted'], pair['target']] for pair in val_metrics['matching_pairs']]
+            )
         }, step=global_step)
 
 
