@@ -915,14 +915,19 @@ def main():
 
 
     def log_validation_results(val_metrics, global_step):
-        wandb.log({
+        """Log validation metrics and matching SMILES pairs to wandb"""
+        # Basic metrics
+        log_dict = {
             "val_loss": val_metrics['val_loss'],
             "val_exact_match": val_metrics['val_exact_match'],
-            "val_matching_examples": wandb.Table(
-                columns=["Predicted SMILES", "Target SMILES"],
-                data=[[pair['predicted'], pair['target']] for pair in val_metrics['matching_pairs']]
-            )
-        }, step=global_step)
+        }
+        
+        # Add matching pairs as individual strings
+        for i, pair in enumerate(val_metrics['matching_pairs']):
+            log_dict[f"val_match_{i}_pred"] = pair['predicted']
+            log_dict[f"val_match_{i}_target"] = pair['target']
+        
+        wandb.log(log_dict, step=global_step)
 
 
     def evaluate_on_test(model, test_loader, tokenizer, device):
