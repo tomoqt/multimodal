@@ -23,6 +23,7 @@ from datetime import datetime
 from sklearn.model_selection import train_test_split
 import json
 from rdkit import Chem
+from rdkit import RDLogger
 from rdkit.Chem import rdFMCS
 from pathlib import Path
 import numpy as np
@@ -38,6 +39,7 @@ import argparse
 import time
 import pyarrow.parquet as pq
 from pprint import pprint
+from copy import deepcopy
 
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
@@ -528,6 +530,7 @@ def get_domain_ranges(meta_data):
 
 # Add this main function to contain the training code
 def main():
+    RDLogger.DisableLog("rdApp.*")
     print("\n[Main] Starting training script...")
     args = parse_args()
     
@@ -645,6 +648,7 @@ def main():
     print("\n[Main] Starting training loop...")
     NUM_EPOCHS = config['training']['num_epochs']
     validation_frequency = config['training']['validation_frequency']
+    logging_frequency = config['training']['logging_frequency']
     verbose = False
     
     # Add timing stats
@@ -661,7 +665,7 @@ def main():
     # -------------------------------------------------------------------------
     # Helper Functions
     # -------------------------------------------------------------------------
-    def evaluate_predictions(predictions, targets, verbose=False):
+    def evaluate_predictions(predictions: list[str], targets: list[str], verbose: bool=False) -> dict:
         """
         Evaluate model predictions vs. targets using canonical SMILES.
         Returns detailed metrics and optionally prints examples.
@@ -731,13 +735,19 @@ def main():
             if verbose and i < 5:
                 print(f"\nExample {i+1}:")
                 pprint(result)
-        
+
+        return detailed_results
+
+    def aggregate_metrics(details: list[dict]) -> dict:
+        """ Aggregates molecular metrics into a batch.
+        Inputs: `details` is output from `evaluate_predictions`
+        """
         # aggregate batch-wise metrics
         metrics = {
-            'valid_smiles': np.mean([r['valid'] for r in detailed_results]),
-            'exact_match': np.mean([r['exact_match'] for r in detailed_results]),
+            'valid_smiles': np.mean([r['valid'] for r in details]),
+            'exact_match': np.mean([r['exact_match'] for r in details]),
         }
-        chem_results = list(filter(lambda x: x['valid'] and x['valid_target'], detailed_results))
+        chem_results = list(filter(lambda x: x['valid'] and x['valid_target'], details))
         metrics['avg_tanimoto'] = 0.0
         metrics['avg_exact_match'] = 0.0
         metrics['avg_ecfp6_iou'] = 0.0
@@ -746,9 +756,9 @@ def main():
             metrics['avg_tanimoto'] = np.mean([r['tanimoto'] for r in chem_results])
             metrics['avg_exact_match'] = np.mean([r['exact_match'] for r in chem_results])
             metrics['avg_ecfp6_iou'] = np.mean([r['ecfp6_iou'] for r in chem_results])
-            metrics['avg_#mcs/#target'] = np.mean([r['exact_#mcs/#target'] for r in chem_results])
-        
-        return metrics, detailed_results
+            metrics['avg_#mcs/#target'] = np.mean([r['#mcs/#target'] for r in chem_results])
+
+        return metrics
 
 
     def greedy_decode(model, nmr_data, ir_data, c_nmr_data, max_len=128):
@@ -847,9 +857,11 @@ def main():
         exact_matches = 0
         total_sequences = 0
         matching_pairs = []  # Add this to track matching SMILES pairs
+        detailed_results = []
         
         with torch.no_grad():
             for tgt_tokens, ir, h_nmr, c_nmr in val_loader:
+                target_cpu = tgt_tokens.clone().cpu()
                 tgt_tokens = tgt_tokens.to(device)
                 
                 # Handle spectral data tuples
@@ -881,51 +893,43 @@ def main():
                 # Get predictions from logits and compare with targets
                 pred_tokens = logits.argmax(dim=-1)  # Shape: [batch_size, seq_len]
                 
-                # Compare predictions from teacher forcing
-                for pred, target in zip(pred_tokens, tgt_tokens[:, 1:]):  # Skip BOS token in target
-                    pred_smiles = tokenizer.decode(pred.tolist(), skip_special_tokens=True)
-                    target_smiles = tokenizer.decode(target.tolist(), skip_special_tokens=True)
-                    
-                    # Remove spaces and compare canonical SMILES
-                    pred_no_spaces = pred_smiles.replace(" ", "")
-                    target_no_spaces = target_smiles.replace(" ", "")
-                    
-                    mol_pred = Chem.MolFromSmiles(pred_no_spaces)
-                    mol_target = Chem.MolFromSmiles(target_no_spaces)
-                    
-                    if mol_pred is not None and mol_target is not None:
-                        canon_pred = Chem.MolToSmiles(mol_pred, canonical=True)
-                        canon_target = Chem.MolToSmiles(mol_target, canonical=True)
-                        if canon_pred == canon_target:
-                            exact_matches += 1
-                            matching_pairs.append({
-                                'predicted': canon_pred,
-                                'target': canon_target
-                            })
+                # transfer pred and targets to cpu for decoding
+                first_mol = lambda x: x.replace(" ", "").lstrip("[CLS]").split("[SEP]")[0]
+                pred_cpu = pred_tokens.detach().cpu()
+                preds_decoded = [first_mol(tokenizer.decode(pred.tolist())) for pred in pred_cpu]
+                targets_decoded = [first_mol(tokenizer.decode(target.tolist())) for target in target_cpu]
+
+                details = evaluate_predictions(preds_decoded, targets_decoded)
+                detailed_results += details
+                exact_matches += sum(d["exact_match"] for d in details)
+                matching_pairs += [
+                    {"predicted": d["prediction"], "target": d["target"]} for d in details if d["exact_match"]
+                ]
                 
                 total_loss += loss.item()
                 num_batches += 1
                 total_sequences += tgt_tokens.size(0)
+
+        detailed_metrics = aggregate_metrics(detailed_results)
         
         return {
             'val_loss': total_loss / num_batches,
             'val_exact_match': exact_matches / total_sequences,
-            'matching_pairs': matching_pairs[:10]  # Store only first 10 matches to avoid excessive logging
+            # Store only a couple matches to avoid excessive logging
+            'matching_pairs': np.random.choice(matching_pairs, size=min(len(matching_pairs), 10)).tolist(),
+            **detailed_metrics
         }
 
 
     def log_validation_results(val_metrics, global_step):
         """Log validation metrics and matching SMILES pairs to wandb"""
-        # Basic metrics
-        log_dict = {
-            "val_loss": val_metrics['val_loss'],
-            "val_exact_match": val_metrics['val_exact_match'],
-        }
-        
         # Add matching pairs as individual strings
         for i, pair in enumerate(val_metrics['matching_pairs']):
-            log_dict[f"val_match_{i}_pred"] = pair['predicted']
-            log_dict[f"val_match_{i}_target"] = pair['target']
+            val_metrics[f"val_match_{i}_pred"] = pair['predicted']
+            val_metrics[f"val_match_{i}_target"] = pair['target']
+
+        log_dict = deepcopy(val_metrics)
+        del log_dict["matching_pairs"]
         
         wandb.log(log_dict, step=global_step)
 
@@ -987,12 +991,13 @@ def main():
         total_batches = len(train_loader)
         log_interval = max(1, total_batches // 20)  # Log ~20 times per epoch
         
-        for batch in train_loader:
+        pbar = tqdm(train_loader, total=total_batches, desc="Training", dynamic_ncols=True)
+        for batch in pbar:
             batch_start_time = time.time()
             
             # Unpack the batch data correctly
             tgt_tokens, ir, h_nmr, c_nmr = batch
-            
+
             # Get the batch data
             tgt_tokens = tgt_tokens.to(device)
 
@@ -1035,25 +1040,29 @@ def main():
             # Simple progress logging
             if num_batches % log_interval == 0:
                 avg_loss = epoch_loss / num_batches
-                progress = (num_batches / total_batches) * 100
-                print(f"Progress: {progress:3.0f}% | Batch {num_batches}/{total_batches} | "
-                      f"Loss: {avg_loss:.4f} | LR: {current_lr:.2e}")
+                train_log = f"Train Loss: {avg_loss.item():.4f} | LR: {current_lr:.2e}"
+                if global_step > validation_frequency:
+                    train_log += f" | Val Loss: {val_metrics['val_loss']:.4f}"
+                pbar.set_description(train_log)
 
             # Log to wandb
-            wandb.log({
-                "batch_loss": loss.item(),
-                "learning_rate": current_lr,
-                "epoch": epoch + 1,
-                "global_step": global_step,
-            }, step=global_step)
+            if global_step % logging_frequency:
+                wandb.log({
+                    "batch_loss": loss.item(),
+                    "learning_rate": current_lr,
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                }, step=global_step)
 
             # Periodic validation
             if global_step % validation_frequency == 0:
                 print("\nRunning validation...")
                 val_metrics = validate(model, val_loader, criterion, tokenizer)
                 log_validation_results(val_metrics, global_step)
-                print(f"Validation - Loss: {val_metrics['val_loss']:.4f} | "
-                      f"Exact Match: {val_metrics['val_exact_match']:.2%}")
+
+                valid_log = f"Train Loss: {loss.item():.4f} | LR: {current_lr:.2e}"
+                valid_log += f" | Val Loss: {val_metrics['val_loss']:.4f}"
+                pbar.set_description(valid_log)
                 
                 if val_metrics['val_loss'] < best_val_loss:
                     best_val_loss = val_metrics['val_loss']

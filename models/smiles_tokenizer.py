@@ -26,7 +26,7 @@ class BasicSmilesTokenizer(object):
         self.regex_pattern = regex_pattern
         self.regex = re.compile(self.regex_pattern)
 
-    def tokenize(self, text):
+    def tokenize(self, text: str) -> List[str]:
         return [token for token in self.regex.findall(text)]
 
 class SmilesTokenizer(BertTokenizer):
@@ -66,7 +66,7 @@ class SmilesTokenizer(BertTokenizer):
     def vocab_list(self):
         return list(self.vocab.keys())
 
-    def _tokenize(self, text: str, max_seq_length: int = 512, **kwargs):
+    def _tokenize(self, text: str, max_seq_length: int = 512, **kwargs) -> List[str]:
         max_len_single_sentence = max_seq_length - 2  # typically for BERT
         split_tokens = self.basic_tokenizer.tokenize(text)[:max_len_single_sentence]
         return split_tokens
