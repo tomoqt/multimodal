@@ -1,5 +1,6 @@
-import torch
+import torch as th
 import torch.nn as nn
+from typing import Any
 
 from .spectral_encoder import MultimodalSpectralEncoder
 from .transformer_decoder import SMILESDecoder
@@ -7,16 +8,16 @@ from .transformer_decoder import SMILESDecoder
 class MultiModalToSMILESModel(nn.Module):
     def __init__(
         self,
-        vocab_size,
-        max_seq_length=512,
-        embed_dim=768,
-        num_heads=8,
-        num_layers=6,
-        dropout=0.1,
-        resample_size=1000,
-        use_concat=True,
-        verbose=False,
-        domain_ranges=None
+        vocab_size: int,
+        max_seq_length: int = 512,
+        embed_dim: int = 768,
+        num_heads: int = 8,
+        num_layers: int = 6,
+        dropout: float = 0.1,
+        resample_size: int = 1000,
+        use_concat: bool = True,
+        verbose: bool = False,
+        domain_ranges: list | None = None
     ):
         super().__init__()
         
@@ -49,7 +50,7 @@ class MultiModalToSMILESModel(nn.Module):
             verbose=True
         )
 
-    def forward(self, nmr_data, ir_data, c_nmr_data, target_seq=None, target_mask=None):
+    def forward(self, nmr_data: tuple | th.Tensor | None, ir_data: tuple | th.Tensor | None, c_nmr_data: tuple | th.Tensor | None, target_seq: Any | None = None, target_mask: th.Tensor | None = None):
         if self.verbose:
             print("\n=== Starting Forward Pass ===")
             print("\nSpectroscopic data shapes inside forward:")

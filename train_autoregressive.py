@@ -447,7 +447,8 @@ def load_config(config_path=None):
             'num_heads': 8,
             'num_layers': 6,
             'dropout': 0.1,
-            'resample_size': 1000
+            'resample_size': 1000,
+            'use_concat': True
         },
         'training': {
             'batch_size': 32,

@@ -1,3 +1,4 @@
+from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -105,15 +106,15 @@ class DecoderLayer(nn.Module):
 class SMILESDecoder(nn.Module):
     def __init__(
         self,
-        vocab_size,
-        max_seq_length=512,
-        memory_dim=768,
-        embed_dim=768,
-        num_heads=8,
-        num_layers=6,
-        dropout=0.1,
-        dim_feedforward=2048,
-        verbose=True
+        vocab_size: int,
+        max_seq_length: int = 512,
+        memory_dim: int = 768,
+        embed_dim: int = 768,
+        num_heads: int = 8,
+        num_layers: int = 6,
+        dropout: int = 0.1,
+        dim_feedforward: int = 2048,
+        verbose: bool = True
     ):
         super().__init__()
         
@@ -145,7 +146,12 @@ class SMILESDecoder(nn.Module):
         # Output projection
         self.out = nn.Linear(embed_dim, vocab_size)
         
-    def forward(self, tgt, memory, tgt_mask=None):
+    def forward(self, tgt: torch.Tensor, memory: torch.Tensor, tgt_mask: torch.Tensor | None = None):
+        """ inputs:
+            tgt: target sequence tensor, shape (B, T)
+            memory: memory tensor, shape (B, D) or (B, S, D)
+            tgt_mask: mask for target sequence, shape (T, T) or None
+        """
         if self.verbose:
             print(f"\nDecoder Input Shapes:")
             print(f"Target sequence: {tgt.shape}")
@@ -157,6 +163,7 @@ class SMILESDecoder(nn.Module):
         if tgt.size(1) > self.max_seq_length:
             raise ValueError(f"Input sequence length {tgt.size(1)} exceeds maximum length {self.max_seq_length}")
         
+        # (B, T) -> (B, T, D)
         x = self.embed(tgt)
         if self.verbose:
             print(f"After embedding: {x.shape}")
@@ -176,8 +183,10 @@ class SMILESDecoder(nn.Module):
         # Expand memory batch dimension if needed
         if memory.size(0) == 1 and x.size(0) > 1:
             memory = memory.expand(x.size(0), -1, -1)
+        # TODO: why?
         # Expand memory sequence dimension if needed 
         elif memory.size(1) == 1:
+            print(f"I'm active! x is of shape {x.shape} and mem is of shape: {memory.shape}")
             memory = memory.expand(-1, x.size(1), -1)
             
         for layer in self.layers:
