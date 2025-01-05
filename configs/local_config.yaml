@@ -15,9 +15,9 @@ training:
   num_epochs: 1
   learning_rate: 1.0e-4
   min_learning_rate: 1.0e-5
-  validation_frequency: 50
+  validation_frequency: 100
   logging_frequency: 10
-  save_frequency: 1000
+  save_frequency: 5_000
 
 # Scheduler
 scheduler:

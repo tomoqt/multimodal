@@ -31,7 +31,7 @@ class MultiModalToSMILESModel(nn.Module):
             dropout=dropout,
             resample_size=resample_size,
             use_concat=use_concat,
-            verbose=True,
+            verbose=verbose,
             domain_ranges=domain_ranges
         )
         
@@ -47,7 +47,7 @@ class MultiModalToSMILESModel(nn.Module):
             num_heads=num_heads,
             num_layers=num_layers,
             dropout=dropout,
-            verbose=True
+            verbose=verbose
         )
 
     def forward(self, nmr_data: tuple | th.Tensor | None, ir_data: tuple | th.Tensor | None, c_nmr_data: tuple | th.Tensor | None, target_seq: Any | None = None, target_mask: th.Tensor | None = None):
