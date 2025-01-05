@@ -458,7 +458,8 @@ def load_config(config_path=None):
             'validation_frequency': 500,
             'logging_frequency': 100,
             'save_frequency': 1000,
-            'generate_during_training': False
+            'generate_during_training': False,
+            'save_local': False  # Default to not saving locally
         },
         'scheduler': {
             'warmup_steps': 100,
@@ -581,6 +582,8 @@ def main():
     ).to(device)
     print("[Main] Model initialized successfully")
 
+
+
     print("\n[Main] Creating data loaders...")
     train_loader, val_loader, test_loader = create_data_loaders(
         tokenizer=tokenizer,
@@ -604,6 +607,23 @@ def main():
         config=config
     )
     print("[Main] wandb initialized successfully")
+
+    # Add this section to log model size
+    print("\n[Main] Calculating model size...")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    param_size = sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 * 1024)  # Size in MB
+
+    print(f"[Main] Total parameters: {total_params:,}")
+    print(f"[Main] Trainable parameters: {trainable_params:,}")
+    print(f"[Main] Model size: {param_size:.2f} MB")
+
+    # Log to wandb
+    wandb.run.summary.update({
+        "total_parameters": total_params,
+        "trainable_parameters": trainable_params,
+        "model_size_mb": param_size
+    })
 
     print("\n[Main] Setting up training components...")
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
@@ -1032,13 +1052,33 @@ def main():
                 if val_metrics['val_loss'] < best_val_loss:
                     best_val_loss = val_metrics['val_loss']
                     print(f"New best validation loss: {best_val_loss:.4f}")
-                    torch.save({
+                    
+                    checkpoint = {
                         'epoch': epoch,
                         'global_step': global_step,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'val_metrics': val_metrics,
-                    }, save_dir / 'best_model.pt')
+                    }
+                    
+                    # Save locally if configured
+                    if config['training'].get('save_local', False):
+                        torch.save(checkpoint, save_dir / 'best_model.pt')
+                        print(f"Saved checkpoint locally to {save_dir / 'best_model.pt'}")
+                    
+                    # Always save to wandb
+                    artifact = wandb.Artifact(
+                        name=f"model-{wandb.run.id}", 
+                        type="model",
+                        description=f"Model checkpoint at step {global_step} with val_loss: {best_val_loss:.4f}"
+                    )
+                    # Save checkpoint to temporary file
+                    tmp_path = f"model_checkpoint_{global_step}.pt"
+                    torch.save(checkpoint, tmp_path)
+                    artifact.add_file(tmp_path)
+                    os.remove(tmp_path)  # Clean up temporary file
+                    wandb.log_artifact(artifact)
+                    print(f"Saved checkpoint to wandb (val_loss: {best_val_loss:.4f})")
                 model.train()
 
         # End of epoch logging

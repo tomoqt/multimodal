@@ -665,6 +665,23 @@ def main():
     ).to(device)
     print("[Main] Model initialized successfully")
 
+    # Add this section to log model size
+    print("\n[Main] Calculating model size...")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    param_size = sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 * 1024)  # Size in MB
+
+    print(f"[Main] Total parameters: {total_params:,}")
+    print(f"[Main] Trainable parameters: {trainable_params:,}")
+    print(f"[Main] Model size: {param_size:.2f} MB")
+
+    # Log to wandb
+    wandb.run.summary.update({
+        "total_parameters": total_params,
+        "trainable_parameters": trainable_params,
+        "model_size_mb": param_size
+    })
+
     print("\n[Main] Creating data loaders...")
     train_loader, val_loader, test_loader = create_data_loaders(
         tokenizer=tokenizer,

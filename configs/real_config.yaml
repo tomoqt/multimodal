@@ -2,7 +2,7 @@
 model:
   use_concat: True
   max_seq_length: 80
-  embed_dim: 2048
+  embed_dim: 2046
   num_heads: 8
   num_layers: 12
   dropout: 0.1

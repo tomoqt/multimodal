@@ -111,7 +111,7 @@ class MultimodalSpectralEncoder(nn.Module):
                  use_concat=True, verbose=True, domain_ranges=None):
         super().__init__()
         
-        # Add assertion check for embedding dimension
+        # Only check divisibility by 3 if using concatenation
         if use_concat and embed_dim % 3 != 0:
             raise ValueError(
                 f"When using concatenation (use_concat=True), embed_dim ({embed_dim}) "
@@ -141,26 +141,26 @@ class MultimodalSpectralEncoder(nn.Module):
         
         # Calculate individual backbone output dimensions
         n_modalities = 3
-        backbone_dim = embed_dim // n_modalities
+        backbone_dim = embed_dim // n_modalities if use_concat else embed_dim
         
         # Calculate the final sequence length after all downsampling
-        # resample_size -> /4 (stem) -> /2 -> /2 -> /2 (three downsampling layers)
         final_seq_len = resample_size // 32
         
-        # Base ConvNeXt config with reduced final dimension
+        # Base ConvNeXt config with appropriate final dimension
         base_config = {
             'depths': [3, 3, 6, 3],
-            'dims': [64, 128, 256, backbone_dim],  # Final dim is embed_dim//3 per modality
+            'dims': [64, 128, 256, backbone_dim],  # Final dim is embed_dim//3 if concat, else embed_dim
             'drop_path_rate': 0.1,
             'layer_scale_init_value': 1e-6,
             'regression': True,
-            'regression_dim': backbone_dim  # Each backbone outputs embed_dim//3
+            'regression_dim': backbone_dim  # Each backbone outputs embed_dim//3 if concat, else embed_dim
         }
         
         if verbose:
             print(f"Input sequence length: {resample_size}")
             print(f"Final sequence length: {final_seq_len}")
             print(f"Backbone output dimension: {backbone_dim}")
+            print(f"Using concatenation: {use_concat}")
         
         # Create 1D backbones for all spectra
         self.nmr_backbone = ConvNeXt1D(in_chans=1, **base_config)
@@ -180,8 +180,8 @@ class MultimodalSpectralEncoder(nn.Module):
             # Add higher-order cross attention
             cross_attn_config = type('Config', (), {
                 'n_head': num_heads,
-                'n_embd': embed_dim,
-                'order': 3,  # We still have 3 modalities: H-NMR, IR, C-NMR
+                'n_embd': embed_dim,  # Use full embed_dim instead of backbone_dim
+                'order': 3,
                 'dropout': dropout,
                 'bias': True
             })
