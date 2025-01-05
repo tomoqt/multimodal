@@ -472,7 +472,8 @@ def load_config(config_path=None):
         'data': {
             'use_parquet': False,
             'data_dir': "data_extraction/multimodal_spectroscopic_dataset",
-            'binary_dir': "training_binaries",
+            # 'binary_dir': "training_binaries",
+            'binary_dir': "preprocessed_binaries",
             'preprocessed': False,
             'test_size': 20,
             'val_size': 0.1
