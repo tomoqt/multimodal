@@ -150,7 +150,7 @@ class SMILESDecoder(nn.Module):
         """ inputs:
             tgt: target sequence tensor, shape (B, T)
             memory: memory tensor, shape (B, D) or (B, S, D)
-            tgt_mask: mask for target sequence, shape (T, T) or None
+            tgt_mask: mask for target sequence, ??
         """
         if self.verbose:
             print(f"\nDecoder Input Shapes:")
@@ -183,10 +183,8 @@ class SMILESDecoder(nn.Module):
         # Expand memory batch dimension if needed
         if memory.size(0) == 1 and x.size(0) > 1:
             memory = memory.expand(x.size(0), -1, -1)
-        # TODO: why?
-        # Expand memory sequence dimension if needed 
+        # Expand memory sequence dimension if needed
         elif memory.size(1) == 1:
-            print(f"I'm active! x is of shape {x.shape} and mem is of shape: {memory.shape}")
             memory = memory.expand(-1, x.size(1), -1)
             
         for layer in self.layers:
