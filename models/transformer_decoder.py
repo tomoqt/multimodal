@@ -192,13 +192,7 @@ class DecoderPromptLayer(nn.Module):
             q = th.cat((q, query_pass), dim=-1)
             k = th.cat((k, key_pass), dim=-1)
 
-        # FIXME: sdpa doesnt seem to work well with causal mask? lol
         attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
-        # TODO: inspect or switch to flex or ?
-        # attn = （q * (DH ** -0.5)） @ k.transpose(-2, -1)
-        # attn.masked_fill_(~mask, th.finfo(attn.dtype).min)
-        # attn = F.softmax(attn, dim=-1)
-        # attn = attn @ v  # (..., nh, T, hs)
 
         attn = attn.transpose(1, 2).contiguous().view(B, T, -1)
         xattn = self.attn_dropout(self.out(attn))
