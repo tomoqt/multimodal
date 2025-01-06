@@ -1017,7 +1017,7 @@ def main():
                 print("\nRunning validation...")
                 val_metrics = validate(model, val_loader, criterion, tokenizer)
                 if wandb_table is None and val_metrics["valid_set"]:
-                    keys = ["global_step"] + list(val_metrics["valid_set"].keys())
+                    keys = ["global_step"] + list(val_metrics["valid_set"][0].keys())
                     wandb_table = wandb.Table(columns=keys)
 
                 log_results(val_metrics, global_step, table=wandb_table)
@@ -1068,7 +1068,7 @@ def main():
 
     wandb_table = None
     if test_metrics["valid_set"]:
-        keys = ["global_step"] + list(test_metrics["valid_set"].keys())
+        keys = ["global_step"] + list(test_metrics["valid_set"][0].keys())
         wandb_table = wandb.Table(columns=keys)
     log_results(test_metrics, global_step, table=wandb_table, prefix="test")
 
