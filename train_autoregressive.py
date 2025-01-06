@@ -1,3 +1,4 @@
+# TODO: refactor with last function: https://chat.deepseek.com/a/chat/s/b242b028-b451-47d9-b5c3-2f692811b2c2
 # =======================
 # File: train_autoregressive.py
 # =======================
@@ -917,17 +918,23 @@ def main():
             **detailed_metrics
         }
 
-
     def log_validation_results(val_metrics, global_step):
-        """Log validation metrics and matching SMILES pairs to wandb"""
-        # Add matching pairs as individual strings
-        for i, pair in enumerate(val_metrics['matching_pairs']):
-            val_metrics[f"val_match_{i}_pred"] = pair['predicted']
-            val_metrics[f"val_match_{i}_target"] = pair['target']
+        """Log validation metrics and matching SMILES pairs to wandb as a table"""
+        # Create a wandb.Table for matching pairs
+        matching_pairs_table = wandb.Table(columns=["Predicted SMILES", "Target SMILES"])
 
+        # Add matching pairs to the table
+        for pair in val_metrics['matching_pairs']:
+            matching_pairs_table.add_data(pair['predicted'], pair['target'])
+
+        # Log the table and other metrics
         log_dict = deepcopy(val_metrics)
+        log_dict["matching_pairs_table"] = matching_pairs_table
+
+        # Remove the original matching_pairs to avoid redundancy
         del log_dict["matching_pairs"]
-        
+
+        # Log everything to W&B
         wandb.log(log_dict, step=global_step)
 
 

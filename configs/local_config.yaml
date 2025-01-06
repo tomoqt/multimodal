@@ -6,15 +6,17 @@ model:
   num_heads: 6
   num_layers: 8
   dropout: 0.1
+  # dropout: 0.0
   resample_size: 1000
 
 # Training Parameters
 training:
-  # batch_size: 64
-  batch_size: 32
+  batch_size: 64
+  # batch_size: 32
   test_batch_size: 1
-  num_epochs: 1
-  learning_rate: 1.0e-4
+  num_epochs: 5
+  learning_rate: 1.0e-4  # for BS64
+  # learning_rate: 3.0e-5
   min_learning_rate: 1.0e-5
   validation_frequency: 100
   logging_frequency: 10
