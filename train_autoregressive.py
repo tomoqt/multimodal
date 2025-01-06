@@ -920,7 +920,7 @@ def main():
         if table is not None and val_metrics["valid_set"]:
             # Add matching pairs to the table
             for pair in val_metrics['valid_set']:
-                table.add_data(*list(pair.values()))
+                table.add_data(global_step, *list(pair.values()))
 
             val_metrics["matching_pairs_table"] = table
 
