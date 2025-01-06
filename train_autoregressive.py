@@ -908,7 +908,6 @@ def main():
         detailed_metrics = aggregate_metrics(detailed_results)
         valid_set = [d for d in detailed_results if d["valid"] and d["valid_target"]]
         sample_valid_set = np.random.choice(valid_set, size=min(len(valid_set), 100)).tolist()
-        print("valid set is", sample_valid_set)
 
         return {
             f'val_loss': total_loss / num_batches,
@@ -922,7 +921,6 @@ def main():
         if table is not None and val_metrics["valid_set"]:
             # Add matching pairs to the table
             for pair in val_metrics['valid_set']:
-                print("add pair to table", pair)
                 table.add_data(*list(pair.values()))
 
             val_metrics["matching_pairs_table"] = table
@@ -1056,13 +1054,10 @@ def main():
                     wandb.log_artifact(artifact, aliases=["latest", f"step_{global_step}"])
                     print(f"Saved checkpoint to wandb (val_loss: {best_val_loss:.4f})")
                 model.train()
-                break
-
 
         # End of epoch logging
         avg_epoch_loss = epoch_loss / num_batches
         print(f"\nEpoch {epoch+1} completed | Average Loss: {avg_epoch_loss:.4f}")
-        break
 
     # -------------------------------------------------------------------------
     # Final Evaluation on Test Set
