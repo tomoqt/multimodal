@@ -1,8 +1,8 @@
 # Model Architecture
 model:
-  use_concat: True
+  use_concat: False
   max_seq_length: 80
-  embed_dim: 2048
+  embed_dim: 1024
   num_heads: 16
   num_layers: 8
   dropout: 0.1
