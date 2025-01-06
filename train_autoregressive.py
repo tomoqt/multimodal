@@ -1,4 +1,3 @@
-# TODO: refactor with last function: https://chat.deepseek.com/a/chat/s/b242b028-b451-47d9-b5c3-2f692811b2c2
 # =======================
 # File: train_autoregressive.py
 # =======================
