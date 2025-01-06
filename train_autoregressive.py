@@ -906,25 +906,24 @@ def main():
                 num_batches += 1
 
         detailed_metrics = aggregate_metrics(detailed_results)
-        matching_pairs = [
-            {"predicted": d["prediction"], "target": d["target"]} for d in details if d["exact_match"]
-        ]
+        valid_set = [d for d in details if d["valid"] and d["valid_target"]]
 
         return {
             'val_loss': total_loss / num_batches,
             # Store only a couple matches to avoid excessive logging
-            'matching_pairs': np.random.choice(matching_pairs, size=min(len(matching_pairs), 10)).tolist(),
+            'matching_pairs': np.random.choice(valid_set, size=min(len(valid_set), 100)).tolist(),
             **detailed_metrics
         }
 
     def log_validation_results(val_metrics, global_step):
         """Log validation metrics and matching SMILES pairs to wandb as a table"""
         # Create a wandb.Table for matching pairs
-        matching_pairs_table = wandb.Table(columns=["Predicted SMILES", "Target SMILES"])
+        keys = ['prediction', 'target', 'valid', 'valid_target', 'exact_match', 'tanimoto', '#mcs/#target', 'ecfp6_iou']
+        matching_pairs_table = wandb.Table(columns=keys)
 
         # Add matching pairs to the table
         for pair in val_metrics['matching_pairs']:
-            matching_pairs_table.add_data(pair['predicted'], pair['target'])
+            matching_pairs_table.add_data(**pair)
 
         # Log the table and other metrics
         log_dict = deepcopy(val_metrics)
