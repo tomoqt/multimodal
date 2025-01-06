@@ -13,5 +13,5 @@ python3 download_data.py
 python3 binaries_big_file.py
 
 # now train the model
-python3 train_autoregressive.py --config configs/local_config.yaml
+CUDA_VISIBLE_DEVICES=0 python3 train_autoregressive.py --config configs/local_config.yaml
 ```

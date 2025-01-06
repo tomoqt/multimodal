@@ -849,7 +849,7 @@ def main():
             return torch.tensor(padded_sequences, device=device)
 
 
-    def validate(model, val_loader, criterion, tokenizer):
+    def validate(model, val_loader, criterion, tokenizer, device=device):
         """Validation using teacher forcing and comparing exact matches"""
         model.eval()
         total_loss = 0
@@ -905,77 +905,42 @@ def main():
                 num_batches += 1
 
         detailed_metrics = aggregate_metrics(detailed_results)
-        matching_pairs = [
-            {"predicted": d["prediction"], "target": d["target"]} for d in details if d["exact_match"]
-        ]
+        valid_set = [d for d in detailed_results if d["valid"] and d["valid_target"]]
+        sample_valid_set = np.random.choice(valid_set, size=min(len(valid_set), 100)).tolist()
 
         return {
-            'val_loss': total_loss / num_batches,
+            f'val_loss': total_loss / num_batches,
             # Store only a couple matches to avoid excessive logging
-            'matching_pairs': np.random.choice(matching_pairs, size=min(len(matching_pairs), 10)).tolist(),
+            'valid_set': sample_valid_set,
             **detailed_metrics
         }
 
+    def log_results(val_metrics, global_step, table: wandb.Table | None = None, prefix: str | None = None):
+        """Log validation metrics and matching SMILES pairs to wandb as a table"""
+        if table is not None and val_metrics["valid_set"]:
+            # Add matching pairs to the table
+            for pair in val_metrics['valid_set']:
+                table.add_data(global_step, *list(pair.values()))
 
-    def log_validation_results(val_metrics, global_step):
-        """Log validation metrics and matching SMILES pairs to wandb"""
-        # Add matching pairs as individual strings
-        for i, pair in enumerate(val_metrics['matching_pairs']):
-            val_metrics[f"val_match_{i}_pred"] = pair['predicted']
-            val_metrics[f"val_match_{i}_target"] = pair['target']
+            val_metrics["matching_pairs_table"] = table
 
+        # Log the table and other metrics
         log_dict = deepcopy(val_metrics)
-        del log_dict["matching_pairs"]
-        
+
+        # Remove the original matching_pairs to avoid redundancy
+        del log_dict["valid_set"]
+
+        if prefix:
+            log_dict = {f'{prefix}_{k}': v for k,v in log_dict.items()}
+
+        # Log everything to W&B
         wandb.log(log_dict, step=global_step)
-
-
-    def evaluate_on_test(model, test_loader, tokenizer, device):
-        """Evaluate on test set using greedy decoding"""
-        model.eval()
-        all_predictions = []
-        all_targets = []
-        
-        with torch.no_grad():
-            for tgt_tokens, ir, h_nmr, c_nmr in tqdm(test_loader, desc="Testing"):
-                tgt_tokens = tgt_tokens.to(device)
-                
-                # Handle spectral data tuples
-                if ir is not None:
-                    if isinstance(ir, tuple):
-                        ir = (ir[0].to(device), ir[1].to(device))
-                    else:
-                        ir = ir.to(device)
-                
-                if h_nmr is not None:
-                    if isinstance(h_nmr, tuple):
-                        h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device))
-                    else:
-                        h_nmr = h_nmr.to(device)
-                
-                if c_nmr is not None:
-                    if isinstance(c_nmr, tuple):
-                        c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device))
-                    else:
-                        c_nmr = c_nmr.to(device)
-                
-                # Use greedy decode with proper tensor handling
-                pred_tokens = greedy_decode(model, h_nmr, ir, c_nmr)
-                
-                # Decode predictions and targets
-                for i in range(pred_tokens.size(0)):
-                    pred_smiles = tokenizer.decode(pred_tokens[i].tolist(), skip_special_tokens=True)
-                    target_smiles = tokenizer.decode(tgt_tokens[i].tolist(), skip_special_tokens=True)
-                    
-                    all_predictions.append(pred_smiles)
-                    all_targets.append(target_smiles)
-        
-        return all_predictions, all_targets
 
 
     # -------------------------------------------------------------------------
     # Training Loop
     # -------------------------------------------------------------------------
+    wandb_table = None
     model.train()
 
     for epoch in range(NUM_EPOCHS):
@@ -1051,7 +1016,11 @@ def main():
             if global_step % validation_frequency == 0:
                 print("\nRunning validation...")
                 val_metrics = validate(model, val_loader, criterion, tokenizer)
-                log_validation_results(val_metrics, global_step)
+                if wandb_table is None and val_metrics["valid_set"]:
+                    keys = ["global_step"] + list(val_metrics["valid_set"][0].keys())
+                    wandb_table = wandb.Table(columns=keys)
+
+                log_results(val_metrics, global_step, table=wandb_table)
 
                 valid_log = f"Train Loss: {loss.item():.4f} | LR: {current_lr:.2e}"
                 valid_log += f" | Val Loss: {val_metrics['val_loss']:.4f}"
@@ -1093,22 +1062,21 @@ def main():
     # Final Evaluation on Test Set
     # -------------------------------------------------------------------------
     print("\nRunning final evaluation on test set...")
-    all_predictions, all_targets = evaluate_on_test(model, test_loader, tokenizer, device)
+    test_metrics = validate(model, test_loader, criterion, tokenizer, device)
+    only_metrics = deepcopy(test_metrics)
+    del only_metrics["valid_set"]
 
-    results = evaluate_predictions(all_predictions, all_targets)
-    wandb.log({
-        "test_exact_match": results['exact_match'],
-        "test_valid_smiles": results['valid_smiles'],
-        "test_avg_tanimoto": results['avg_tanimoto']
-    })
+    wandb_table = None
+    if test_metrics["valid_set"]:
+        keys = ["global_step"] + list(test_metrics["valid_set"][0].keys())
+        wandb_table = wandb.Table(columns=keys)
+    log_results(test_metrics, global_step, table=wandb_table, prefix="test")
 
     with open(save_dir / 'test_results.json', 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(only_metrics, f, indent=2)
 
     print("\nTest Results:")
-    print(f"Exact Match: {results['exact_match']:.2%}")
-    print(f"Valid SMILES: {results['valid_smiles']:.2%}")
-    print(f"Avg Tanimoto: {results['avg_tanimoto']:.3f}")
+    pprint(only_metrics)
 
     wandb.finish()
 
