@@ -171,46 +171,157 @@ class DecoderPromptLayer(nn.Module):
         self.intra_mlp_dropout = nn.Dropout(0.0)
 
 
-    def forward(self, x: th.Tensor, mask: th.Tensor | None = None):
-        """ x: (B, T, D) and mask: (B, T, T) """
+    def forward(self, x: th.Tensor, memory: th.Tensor, tgt_mask: th.Tensor | None = None):
+        """ x: Target sequence tensor (B, T, D)
+            memory: Memory tensor (B, M, D)
+            tgt_mask: Optional attention mask
+        """
         B, T, D = x.shape
+        M = memory.shape[1]  # Memory sequence length
         H = self.nhead
         DH = self.head_dim
 
-        xattn = self.attn_norm(x)
+        # Concatenate memory and target sequence
+        x_full = th.cat([memory, x], dim=1)
+        
+        xattn = self.attn_norm(x_full)
 
         # Self attention
-        q = self.q(xattn).view(B, T, H, DH).transpose(1, 2)
-        k = self.k(xattn).view(B, T, H, DH).transpose(1, 2)
-        v = self.v(xattn).view(B, T, H, DH).transpose(1, 2)
+        q = self.q(xattn).view(B, M+T, H, DH).transpose(1, 2)
+        k = self.k(xattn).view(B, M+T, H, DH).transpose(1, 2)
+        v = self.v(xattn).view(B, M+T, H, DH).transpose(1, 2)
 
         if self.use_rope:
-            q, query_pass = q[..., : self.rotary_ndims], q[..., self.rotary_ndims :]
-            k, key_pass = k[..., : self.rotary_ndims], k[..., self.rotary_ndims :]
-            cos, sin = self.rotary_emb(q, seq_len=T)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)  # rotary encoding
+            q, query_pass = q[..., :self.rotary_ndims], q[..., self.rotary_ndims:]
+            k, key_pass = k[..., :self.rotary_ndims], k[..., self.rotary_ndims:]
+            cos, sin = self.rotary_emb(q, seq_len=M+T)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
             q = th.cat((q, query_pass), dim=-1)
             k = th.cat((k, key_pass), dim=-1)
 
-        # FIXME: sdpa doesnt seem to work well with causal mask? lol
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
-        # TODO: inspect or switch to flex or ?
-        # attn = （q * (DH ** -0.5)） @ k.transpose(-2, -1)
-        # attn.masked_fill_(~mask, th.finfo(attn.dtype).min)
-        # attn = F.softmax(attn, dim=-1)
-        # attn = attn @ v  # (..., nh, T, hs)
+        # Create attention mask that allows:
+        # 1. Memory tokens to attend to all memory tokens
+        # 2. Target tokens to attend causally to themselves and all memory tokens
+        if tgt_mask is None:
+            mask = th.zeros(B, H, M+T, M+T, device=x_full.device).bool()
+            # Memory can attend to itself fully
+            mask[:, :, :M, :M] = True
+            # Target sequence can attend to memory and causally to itself
+            mask[:, :, M:, :M] = True  # Can attend to all memory
+            causal_mask = th.triu(th.ones(T, T, device=x_full.device), diagonal=1).bool()
+            mask[:, :, M:, M:] = ~causal_mask  # Causal mask for target sequence
 
-        attn = attn.transpose(1, 2).contiguous().view(B, T, -1)
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
+        
+        attn = attn.transpose(1, 2).contiguous().view(B, M+T, -1)
         xattn = self.attn_dropout(self.out(attn))
-        x = xattn + x
+        x_full = xattn + x_full
 
         # FFN
-        xffn = self.mlp_norm(x)
+        xffn = self.mlp_norm(x_full)
         xffn = F.relu(self.ffn_w1(xffn)).square()
         xffn = self.mlp_dropout(self.ffn_w2(xffn))
-        x = x + xffn
+        x_full = x_full + xffn
 
-        return x
+        # Return only the target sequence part
+        return x_full[:, M:]
+
+class DecoderPromptLayerWithNMR(nn.Module):
+    def __init__(self, d_model: int, memory_dim: int, nhead: int, d_ffn: int=2048, dropout=0.1, use_rope: bool = False):
+        super().__init__()
+        """ Similar to DecoderPromptLayer but handles both memory (IR) and NMR data as prompts.
+        The memory (IR) and NMR are injected as prompts, with NMR tokens able to attend to each other.
+        The decoding remains autoregressive for the target sequence.
+        """
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+
+        self.d_model = d_model
+        self.memory_dim = memory_dim
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.use_rope = use_rope
+        assert use_rope, "Other posemb than rope not supported atm"
+        if use_rope:
+            self.rotary_ndims = int(self.head_dim * 0.5)
+            self.rotary_emb = RotaryEmbedding(self.rotary_ndims)
+
+        # Self attention
+        self.q = nn.Linear(d_model, d_model)
+        self.k = nn.Linear(d_model, d_model)
+        self.v = nn.Linear(d_model, d_model)
+        self.out = nn.Linear(d_model, d_model)
+
+        # FFN
+        self.ffn_w1 = nn.Linear(d_model, d_ffn)
+        self.ffn_w2 = nn.Linear(d_ffn, d_model)
+
+        # Layer norms
+        self.attn_norm = nn.LayerNorm(d_model)
+        self.mlp_norm = nn.LayerNorm(d_model)
+
+        self.attn_dropout = nn.Dropout(0.0)
+        self.mlp_dropout = nn.Dropout(0.0)
+
+    def forward(self, x: th.Tensor, memory: th.Tensor, nmr: th.Tensor, mask: th.Tensor | None = None):
+        """ 
+        Args:
+            x: Target sequence tensor (B, T, D)
+            memory: IR embedding tensor (B, M, D)
+            nmr: NMR tokens tensor (B, N, D)
+            mask: Optional attention mask
+        """
+        B, T, D = x.shape
+        M = memory.shape[1]  # Memory (IR) sequence length
+        N = nmr.shape[1]     # NMR sequence length
+        H = self.nhead
+        DH = self.head_dim
+
+        # Concatenate memory (IR), NMR, and target sequence
+        # Order: [memory, nmr, target]
+        x_full = th.cat([memory, nmr, x], dim=1)
+        
+        xattn = self.attn_norm(x_full)
+
+        # Self attention
+        q = self.q(xattn).view(B, M+N+T, H, DH).transpose(1, 2)
+        k = self.k(xattn).view(B, M+N+T, H, DH).transpose(1, 2)
+        v = self.v(xattn).view(B, M+N+T, H, DH).transpose(1, 2)
+
+        if self.use_rope:
+            q, query_pass = q[..., :self.rotary_ndims], q[..., self.rotary_ndims:]
+            k, key_pass = k[..., :self.rotary_ndims], k[..., self.rotary_ndims:]
+            cos, sin = self.rotary_emb(q, seq_len=M+N+T)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            q = th.cat((q, query_pass), dim=-1)
+            k = th.cat((k, key_pass), dim=-1)
+
+        # Create attention mask that allows:
+        # 1. Memory (IR) tokens to attend to themselves and NMR
+        # 2. NMR tokens to attend to themselves and memory
+        # 3. Target tokens to attend causally to all previous tokens
+        if mask is None:
+            mask = th.zeros(B, H, M+N+T, M+N+T, device=x_full.device).bool()
+            # Memory (IR) and NMR can attend to each other and themselves
+            mask[:, :, :M+N, :M+N] = True
+            # Target sequence gets causal mask for itself and can attend to memory and NMR
+            mask[:, :, M+N:, :M+N] = True  # Can attend to memory and NMR
+            causal_mask = th.triu(th.ones(T, T, device=x_full.device), diagonal=1).bool()
+            mask[:, :, M+N:, M+N:] = ~causal_mask  # Causal mask for target sequence
+
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
+        
+        attn = attn.transpose(1, 2).contiguous().view(B, M+N+T, -1)
+        xattn = self.attn_dropout(self.out(attn))
+        x_full = xattn + x_full
+
+        # FFN
+        xffn = self.mlp_norm(x_full)
+        xffn = F.relu(self.ffn_w1(xffn)).square()
+        xffn = self.mlp_dropout(self.ffn_w2(xffn))
+        x_full = x_full + xffn
+
+        # Return only the target sequence part
+        return x_full[:, M+N:]
 
 class SMILESDecoder(nn.Module):
     def __init__(
@@ -222,7 +333,8 @@ class SMILESDecoder(nn.Module):
         num_heads: int = 8,
         num_layers: int = 6,
         dropout: int = 0.1,
-        verbose: bool = True
+        verbose: bool = True,
+        decoder_type: str = "prompt_nmr"  # Add decoder type option
     ):
         super().__init__()
         
@@ -232,42 +344,58 @@ class SMILESDecoder(nn.Module):
         self.memory_dim = memory_dim
         self.verbose = verbose
         self.max_seq_length = max_seq_length
+        self.decoder_type = decoder_type
         
         # Embeddings
         self.embed = nn.Embedding(vocab_size, embed_dim)
         
         # Add input projection for memory if dimensions don't match
-        # original:
-        # self.memory_proj = nn.Linear(memory_dim, memory_dim)
         self.memory_proj = nn.Linear(memory_dim, embed_dim) if memory_dim != embed_dim else nn.Identity()
         
-        # Create decoder layers with updated memory dimension
-        self.layers = nn.ModuleList([
-            # DecoderLayer(
-            DecoderPromptLayer(
-                d_model=embed_dim,
-                memory_dim=memory_dim,
-                nhead=num_heads,
-                d_ffn=embed_dim * 4,
-                dropout=dropout,
-                use_rope=True
-            ) for _ in range(num_layers)
-        ])
+        # Create decoder layers based on type
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            if decoder_type == "vanilla":
+                layer = DecoderLayer(
+                    d_model=embed_dim,
+                    memory_dim=memory_dim,
+                    nhead=num_heads,
+                    dim_feedforward=embed_dim * 4,
+                    dropout=dropout,
+                    use_rope=True
+                )
+            elif decoder_type == "prompt":
+                layer = DecoderPromptLayer(
+                    d_model=embed_dim,
+                    memory_dim=memory_dim,
+                    nhead=num_heads,
+                    d_ffn=embed_dim * 4,
+                    dropout=dropout,
+                    use_rope=True
+                )
+            elif decoder_type == "prompt_nmr":
+                layer = DecoderPromptLayerWithNMR(
+                    d_model=embed_dim,
+                    memory_dim=memory_dim,
+                    nhead=num_heads,
+                    d_ffn=embed_dim * 4,
+                    dropout=dropout,
+                    use_rope=True
+                )
+            else:
+                raise ValueError(f"Unknown decoder type: {decoder_type}")
+            self.layers.append(layer)
         
         # Output projection
         self.out = nn.Linear(embed_dim, vocab_size)
         
-    def forward(self, tgt: th.Tensor, memory: th.Tensor, tgt_mask: th.Tensor | None = None):
-        """ inputs:
-            tgt: target sequence tensor, shape (B, T)
-            memory: memory tensor, shape (B, D) or (B, S, D)
-            tgt_mask: mask for target sequence, ??
-        """
-        B, T, = tgt.shape
+    def forward(self, tgt: th.Tensor, memory: th.Tensor, nmr: th.Tensor | None = None, tgt_mask: th.Tensor | None = None):
         if self.verbose:
             print(f"\nDecoder Input Shapes:")
             print(f"Target sequence: {tgt.shape}")
             print(f"Memory: {memory.shape}")
+            if nmr is not None:
+                print(f"NMR: {nmr.shape}")
             if tgt_mask is not None:
                 print(f"Target mask: {tgt_mask.shape}")
 
@@ -277,39 +405,19 @@ class SMILESDecoder(nn.Module):
         
         # (B, T) -> (B, T, D) token embeddings
         x = self.embed(tgt)
-        if self.verbose:
-            print(f"After embedding: {x.shape}")
-
+        
         # Project memory to correct dimensions
         memory = self.memory_proj(memory)
-        if self.verbose:
-            print(f"After memory projection: {memory.shape}")
         
-        # Ensure memory has sequence dimension
-        if memory.dim() == 2:
-            print(f"memory.shape: {memory.shape}")
-            memory = memory.unsqueeze(1)
-
-        # Expand memory batch dimension if needed
-        # if memory.size(0) == 1 and x.size(0) > 1:
-        #    memory = memory.expand(x.size(0), -1, -1)
-
-        # mix `memory` and `x` as prompt + answer, and add causal mask
-        M = memory.shape[-2]
-        x = th.cat([memory, x], dim=1)
-
-        mask = th.ones(B, T+M, T+M, device=x.device).tril().bool()
-        # memory can attend to all of itself. Unlike causal decoding
-        mask[:, :M, :M] = True
-        mask = mask[:, None].repeat(1, self.num_heads, 1, 1)
-
-
+        # Process through layers
         for layer in self.layers:
-            x = layer(x, mask)
+            if self.decoder_type == "prompt_nmr":
+                x = layer(x, memory, nmr, tgt_mask)
+            else:
+                x = layer(x, memory, tgt_mask)
             
         if self.verbose:
             print(f"Final output shape: {x.shape}")
-
-        # remove memory prompt from output tokens
-        out = self.out(x[:, M:])
+            
+        out = self.out(x)
         return out
