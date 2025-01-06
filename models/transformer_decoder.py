@@ -239,7 +239,7 @@ class SMILESDecoder(nn.Module):
         # Add input projection for memory if dimensions don't match
         # original:
         # self.memory_proj = nn.Linear(memory_dim, memory_dim)
-        self.memory_proj = nn.Linear(memory_dim, embed_dim) # if memory_dim != embed_dim else nn.Identity()
+        self.memory_proj = nn.Linear(memory_dim, embed_dim) if memory_dim != embed_dim else nn.Identity()
         
         # Create decoder layers with updated memory dimension
         self.layers = nn.ModuleList([
@@ -248,7 +248,7 @@ class SMILESDecoder(nn.Module):
                 d_model=embed_dim,
                 memory_dim=memory_dim,
                 nhead=num_heads,
-                d_ffn=embed_dim * 2,
+                d_ffn=embed_dim * 4,
                 dropout=dropout,
                 use_rope=True
             ) for _ in range(num_layers)

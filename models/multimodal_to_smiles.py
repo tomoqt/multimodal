@@ -25,7 +25,7 @@ class MultiModalToSMILESModel(nn.Module):
         self.verbose = verbose
         
         # Spectral encoder with verbose off
-        memory_dim = 2046
+        memory_dim = 2046 if use_concat else embed_dim
         self.encoder = MultimodalSpectralEncoder(
             # encode to 2046 but later downproject memory in transformer
             embed_dim=memory_dim,

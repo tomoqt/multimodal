@@ -1,0 +1,44 @@
+# Model Architecture
+model:
+  use_concat: False
+  max_seq_length: 80
+  embed_dim: 1024
+  num_heads: 16
+  num_layers: 8
+  dropout: 0.1
+  # dropout: 0.0
+  resample_size: 1000
+
+# Training Parameters
+training:
+  batch_size: 64
+  # batch_size: 32
+  test_batch_size: 1
+  num_epochs: 5
+  learning_rate: 1.0e-4  # for BS64
+  # learning_rate: 3.0e-5
+  min_learning_rate: 1.0e-5
+  validation_frequency: 100
+  logging_frequency: 10
+  save_frequency: 5_000
+
+# Scheduler
+scheduler:
+  warmup_steps: 100
+  T0: 5
+  T_mult: 2
+
+# Data
+data:
+  use_parquet: False
+  data_dir: "data_extraction/multimodal_spectroscopic_dataset"
+  binary_dir: "preprocessed_binaries"
+  test_size: 20
+  val_size: 0.001
+  preprocessed: False
+
+# Logging
+wandb:
+  project: "smiles-generation"
+  base_run_name: "smiles_gen"
+  log_examples: true 
