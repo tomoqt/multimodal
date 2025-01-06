@@ -31,4 +31,5 @@ python3 binaries_big_file.py
 
 # now train the model
 CUDA_VISIBLE_DEVICES=0 python3 train_autoregressive.py --config configs/local_config.yaml
+CUDA_VISIBLE_DEVICES=1 python3 train_autoregressive.py --config configs/local_config_nocat.yaml
 ```
