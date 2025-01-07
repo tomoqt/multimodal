@@ -50,21 +50,12 @@ vocab_path = os.path.join(current_dir, 'vocab.txt')
 tokenizer = SmilesTokenizer(vocab_file=vocab_path)
 
 # -------------------------------------------------------------------------
-# Warmup + Cosine Annealing With Restarts Scheduler
+# Linear Warmup + Constant LR Scheduler
 # -------------------------------------------------------------------------
-class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
-    """
-    Combines linear warmup with cosine annealing and warm restarts.
-    """
-    def __init__(self, optimizer, warmup_steps, T_0, T_mult=1, eta_min=0, last_epoch=-1):
+class LinearWarmupConstantLR(torch.optim.lr_scheduler._LRScheduler):
+    """Simple scheduler with linear warmup followed by constant learning rate"""
+    def __init__(self, optimizer, warmup_steps, last_epoch=-1):
         self.warmup_steps = warmup_steps
-        self.T_0_initial = T_0
-        self.T_0 = T_0
-        self.T_mult = T_mult
-        self.eta_min = eta_min
-        self.T_cur = 0
-        self.completed_warmup = False
-        self.n_restarts = 0
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
@@ -72,35 +63,9 @@ class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
             # Linear warmup
             alpha = self.last_epoch / self.warmup_steps
             return [base_lr * alpha for base_lr in self.base_lrs]
-        
-        # Cosine annealing with warm restarts
-        if not self.completed_warmup:
-            self.completed_warmup = True
-            self.T_cur = 0
-        
-        # Check for restart
-        if self.T_cur >= self.T_0:
-            self.T_cur = 0
-            self.T_0 = self.T_0 * self.T_mult
-            self.n_restarts += 1
-        
-        progress = self.T_cur / self.T_0
-        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-        self.T_cur += 1
-        
-        return [
-            self.eta_min + (base_lr - self.eta_min) * cosine_decay
-            for base_lr in self.base_lrs
-        ]
-
-    def step(self, epoch=None):
-        if epoch is None:
-            epoch = self.last_epoch + 1
-        self.last_epoch = epoch
-        self._last_lr = self.get_lr()
-        
-        for param_group, lr in zip(self.optimizer.param_groups, self._last_lr):
-            param_group['lr'] = lr
+        else:
+            # Constant learning rate after warmup
+            return self.base_lrs
 
 
 # -------------------------------------------------------------------------
@@ -465,9 +430,7 @@ def load_config(config_path=None):
             'save_local': False  # Default to not saving locally
         },
         'scheduler': {
-            'warmup_steps': 100,
-            'T0': 5,
-            'T_mult': 2
+            'warmup_steps': 100  # Only warmup_steps is needed now
         },
         'data': {
             'use_parquet': False,
@@ -632,12 +595,11 @@ def main():
     print("\n[Main] Setting up training components...")
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
     optimizer = optim.AdamW(model.parameters(), lr=config['training']['learning_rate'])
-    scheduler = WarmupCosineLR(
+    
+    # Simplified scheduler setup
+    scheduler = LinearWarmupConstantLR(
         optimizer,
-        warmup_steps=config['scheduler']['warmup_steps'],
-        T_0=config['scheduler']['T0'] * len(train_loader),
-        T_mult=config['scheduler']['T_mult'],
-        eta_min=config['training']['min_learning_rate']
+        warmup_steps=config['scheduler']['warmup_steps']
     )
 
     print("\n[Main] Creating checkpoint directory...")

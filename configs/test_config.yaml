@@ -1,9 +1,9 @@
 # Model Architecture
 model:
   use_concat: True
-  max_seq_length: 16
-  embed_dim: 33
-  num_heads: 3
+  max_seq_length: 1
+  embed_dim: 3
+  num_heads: 1
   num_layers: 1
   dropout: 0.1
   resample_size: 1000
@@ -12,7 +12,7 @@ model:
 training:
   batch_size: 32
   test_batch_size: 1
-  num_epochs: 1
+  num_epochs: 10
   learning_rate: 1.0e-4
   min_learning_rate: 1.0e-5
   validation_frequency: 50
@@ -22,8 +22,7 @@ training:
 # Scheduler
 scheduler:
   warmup_steps: 100
-  T0: 5
-  T_mult: 2
+
 
 # Data
 data:
