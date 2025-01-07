@@ -104,6 +104,16 @@ def build_mmap_dataset(parquet_dir, meta_file, out_dir):
     index_entries = []
     global_row_count = 0
 
+    # 1) Load spectrum dimensions for domains
+    spectrum_dims_path = Path(parquet_dir) / "meta_data" / "spectrum_dimensions.json"
+    with open(spectrum_dims_path, 'r') as f:
+        spectrum_dims = json.load(f)
+    
+    # Pre-load domains as numpy arrays
+    ir_domain = np.array(spectrum_dims['ir_spectra']['dimensions'], dtype=np.float32)
+    h_nmr_domain = np.array(spectrum_dims['h_nmr_spectra']['dimensions'], dtype=np.float32)
+    c_nmr_domain = np.array(spectrum_dims['c_nmr_spectra']['dimensions'], dtype=np.float32)
+
     # Open output files in binary write mode
     with open(spectra_data_path, "wb") as spectra_f, open(smiles_data_path, "wb") as smiles_f:
         # Iterate over all Parquet files
@@ -136,33 +146,30 @@ def build_mmap_dataset(parquet_dir, meta_file, out_dir):
                     if isinstance(ir_data, str):
                         ir_data = json.loads(ir_data)
                     ir_data = np.array(ir_data, dtype=np.float32) if ir_data is not None else None
-                    ir_dom = generate_domain_if_none(ir_data, 'ir')
 
                     # H-NMR
                     h_nmr_data = row.get('h_nmr_spectra', None)
                     if isinstance(h_nmr_data, str):
                         h_nmr_data = json.loads(h_nmr_data)
                     h_nmr_data = np.array(h_nmr_data, dtype=np.float32) if h_nmr_data is not None else None
-                    h_nmr_dom = generate_domain_if_none(h_nmr_data, 'h_nmr')
 
                     # C-NMR
                     c_nmr_data = row.get('c_nmr_spectra', None)
                     if isinstance(c_nmr_data, str):
                         c_nmr_data = json.loads(c_nmr_data)
                     c_nmr_data = np.array(c_nmr_data, dtype=np.float32) if c_nmr_data is not None else None
-                    c_nmr_dom = generate_domain_if_none(c_nmr_data, 'c_nmr')
 
                     # Write IR data + domain directly to file
                     ir_data_off, ir_data_len = write_float_array_to_file(spectra_f, ir_data)
-                    ir_dom_off, ir_dom_len   = write_float_array_to_file(spectra_f, ir_dom)
+                    ir_dom_off, ir_dom_len   = write_float_array_to_file(spectra_f, ir_domain if ir_data is not None else None)
 
                     # Write H-NMR data + domain
                     hnm_data_off, hnm_data_len = write_float_array_to_file(spectra_f, h_nmr_data)
-                    hnm_dom_off,  hnm_dom_len  = write_float_array_to_file(spectra_f, h_nmr_dom)
+                    hnm_dom_off, hnm_dom_len   = write_float_array_to_file(spectra_f, h_nmr_domain if h_nmr_data is not None else None)
 
                     # Write C-NMR data + domain
                     cnm_data_off, cnm_data_len = write_float_array_to_file(spectra_f, c_nmr_data)
-                    cnm_dom_off,  cnm_dom_len  = write_float_array_to_file(spectra_f, c_nmr_dom)
+                    cnm_dom_off, cnm_dom_len   = write_float_array_to_file(spectra_f, c_nmr_domain if c_nmr_data is not None else None)
 
                     # Build index for this row (14 columns)
                     index_entries.append([

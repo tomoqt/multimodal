@@ -2,15 +2,15 @@
 model:
   use_concat: True
   max_seq_length: 80
-  embed_dim: 2046
-  num_heads: 8
-  num_layers: 12
+  embed_dim: 1026
+  num_heads: 6
+  num_layers: 8
   dropout: 0.1
   resample_size: 1000
 
 # Training Parameters
 training:
-  batch_size: 100
+  batch_size: 32
   test_batch_size: 1
   num_epochs: 1
   learning_rate: 1.0e-4
@@ -39,7 +39,7 @@ data:
   binary_dir: "preprocessed_binaries"
   test_size: 20
   val_size: 0.001
-  preprocessed: True
+  preprocessed: False
 
 # Logging
 wandb:

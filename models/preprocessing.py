@@ -1,186 +1,133 @@
 import numpy as np
-from scipy.interpolate import CubicSpline, interp1d
-from typing import Optional, Tuple, List, Union
-import logging
+import torch
+import json
+from scipy.interpolate import interp1d
 
-class GlobalWindowResampler:
-    """Resample spectrum to global window with fixed size"""
-    
-    def __init__(self, target_size: int, window: List[float] = [200, 4000], method: str = 'cubic'):
+class PerSampleInterpolator:
+    """
+    Interpolate a 1D spectrum from an existing domain to a fixed-size array.
+    If do_normalize=True, min-max scale to [0,1].
+    """
+
+    def __init__(self, target_size=1000, method='linear', do_normalize=True):
         self.target_size = target_size
-        self.window = self.validate_window(window)
         self.method = method
-        self.global_domain = np.linspace(window[0], window[1], target_size)
-        
-    def validate_window(self, window: List[float]) -> List[float]:
-        if not isinstance(window, (list, tuple, np.ndarray)) or len(window) != 2:
-            raise ValueError("Window must be a list/tuple of [min, max] wavenumbers")
-        if window[0] >= window[1]:
-            raise ValueError(f"Invalid window range: [{window[0]}, {window[1]}]")
-        return [float(window[0]), float(window[1])]
-    
-    def __call__(self, spectrum: np.ndarray, domain: Union[np.ndarray, List[float]]) -> np.ndarray:
-        if isinstance(domain, list):
-            domain = np.array(domain)
-        if isinstance(spectrum, list):
-            spectrum = np.array(spectrum)
-            
+        self.do_normalize = do_normalize
+
+    def __call__(self, spectrum: np.ndarray, domain: np.ndarray) -> np.ndarray:
+        """
+        Interpolate 'spectrum' onto domain.min()..domain.max() with `target_size` points.
+        If domain is invalid, returns zeros.
+        """
+        if spectrum is None or domain is None or len(spectrum) == 0 or len(domain) == 0:
+            return np.zeros(self.target_size, dtype=np.float32)
+
+        spectrum = np.asarray(spectrum, dtype=np.float32).ravel()
+        domain   = np.asarray(domain,   dtype=np.float32).ravel()
+
         # Sort if needed
         if not np.all(np.diff(domain) > 0):
-            sort_idx = np.argsort(domain)
-            domain = domain[sort_idx]
-            spectrum = spectrum[sort_idx]
-            
-        # Create padded spectrum
-        padded_spectrum = np.zeros(self.target_size)
-        
-        # Determine window bounds
-        min_wave = max(np.min(domain), self.window[0])
-        max_wave = min(np.max(domain), self.window[1])
-        
-        # Find indices
-        start_idx = np.searchsorted(self.global_domain, min_wave)
-        end_idx = np.searchsorted(self.global_domain, max_wave, side='right')
-        
-        if start_idx < end_idx:
-            section_domain = self.global_domain[start_idx:end_idx]
-            mask = (domain >= min_wave) & (domain <= max_wave)
-            window_domain = domain[mask]
-            window_spectrum = spectrum[mask]
-            
-            if len(window_domain) > 0:
-                if len(window_domain) > 3 and self.method == 'cubic':
-                    try:
-                        # Add small epsilon to avoid division by zero
-                        eps = 1e-10
-                        if np.any(np.diff(window_domain) < eps):
-                            raise ValueError("Domain points too close together")
-                        interpolator = CubicSpline(window_domain, window_spectrum, extrapolate=False)
-                    except ValueError:
-                        interpolator = interp1d(window_domain, window_spectrum, kind='linear', 
-                                             bounds_error=False, fill_value=0)
-                else:
-                    interpolator = interp1d(window_domain, window_spectrum, kind='linear', 
-                                         bounds_error=False, fill_value=0)
-                    
-                interpolated_values = interpolator(section_domain)
-                interpolated_values = np.nan_to_num(interpolated_values, 0)
-                padded_spectrum[start_idx:end_idx] = interpolated_values
-                
-        return padded_spectrum
+            idx = np.argsort(domain)
+            domain   = domain[idx]
+            spectrum = spectrum[idx]
 
-class GlobalWindowResampler2D:
-    """Resample 2D spectrum (like HSQC) to global window with fixed size"""
-    
-    def __init__(self, target_size: Tuple[int, int], window_h: List[float] = [0, 12], window_c: List[float] = [0, 200], method: str = 'linear'):
-        if isinstance(target_size, int):
-            target_size = (target_size, target_size)
-            
-        self.target_size = target_size
-        self.window_h = self.validate_window(window_h, "H")
-        self.window_c = self.validate_window(window_c, "C")
-        self.method = method
-        
-        # Create global domains for both dimensions
-        self.global_domain_h = np.linspace(window_h[0], window_h[1], target_size[0])
-        self.global_domain_c = np.linspace(window_c[0], window_c[1], target_size[1])
-        
-    def validate_window(self, window: List[float], dim_name: str) -> List[float]:
-        if not isinstance(window, (list, tuple, np.ndarray)) or len(window) != 2:
-            raise ValueError(f"{dim_name} window must be a list/tuple of [min, max]")
-        if window[0] >= window[1]:
-            raise ValueError(f"Invalid {dim_name} window range: [{window[0]}, {window[1]}]")
-        return [float(window[0]), float(window[1])]
-    
-    def __call__(self, spectrum: np.ndarray, domain_h: Union[np.ndarray, List[float]], domain_c: Union[np.ndarray, List[float]]) -> np.ndarray:
-        """
-        Resample 2D spectrum to target size.
-        
-        Args:
-            spectrum: 2D array of intensity values
-            domain_h: 1D array of proton chemical shifts
-            domain_c: 1D array of carbon chemical shifts
-            
-        Returns:
-            Resampled 2D spectrum of shape target_size
-        """
-        if isinstance(domain_h, list):
-            domain_h = np.array(domain_h)
-        if isinstance(domain_c, list):
-            domain_c = np.array(domain_c)
-        if isinstance(spectrum, list):
-            spectrum = np.array(spectrum)
-            
-        # Ensure spectrum is 2D
-        if spectrum.ndim != 2:
-            raise ValueError(f"Expected 2D spectrum, got shape {spectrum.shape}")
-            
-        # Create empty output array
-        resampled = np.zeros(self.target_size)
-        
-        # Determine window bounds
-        min_h = max(np.min(domain_h), self.window_h[0])
-        max_h = min(np.max(domain_h), self.window_h[1])
-        min_c = max(np.min(domain_c), self.window_c[0])
-        max_c = min(np.max(domain_c), self.window_c[1])
-        
-        # Find indices in global domain
-        h_start = np.searchsorted(self.global_domain_h, min_h)
-        h_end = np.searchsorted(self.global_domain_h, max_h, side='right')
-        c_start = np.searchsorted(self.global_domain_c, min_c)
-        c_end = np.searchsorted(self.global_domain_c, max_c, side='right')
-        
-        if h_start < h_end and c_start < c_end:
-            # Get the section of the global domain we'll interpolate to
-            h_points = self.global_domain_h[h_start:h_end]
-            c_points = self.global_domain_c[c_start:c_end]
-            
-            # Create meshgrid for interpolation
-            H, C = np.meshgrid(domain_h, domain_c, indexing='ij')
-            Hnew, Cnew = np.meshgrid(h_points, c_points, indexing='ij')
-            
-            try:
-                # Try using scipy's griddata for interpolation
-                from scipy.interpolate import griddata
-                points = np.column_stack((H.flatten(), C.flatten()))
-                values = spectrum.flatten()
-                
-                # Remove any NaN or infinite values
-                valid_mask = np.isfinite(values)
-                if np.any(valid_mask):
-                    interpolated = griddata(
-                        points[valid_mask],
-                        values[valid_mask],
-                        (Hnew, Cnew),
-                        method=self.method,
-                        fill_value=0
-                    )
-                    
-                    # Fill any NaN values with 0
-                    interpolated = np.nan_to_num(interpolated, 0)
-                    
-                    # Place in output array
-                    resampled[h_start:h_end, c_start:c_end] = interpolated
-                    
-            except Exception as e:
-                logging.warning(f"Interpolation failed: {str(e)}. Returning zero array.")
-                
+        d_min, d_max = domain[0], domain[-1]
+        if d_max <= d_min:
+            return np.zeros(self.target_size, dtype=np.float32)
+
+        # Create new domain
+        new_domain = np.linspace(d_min, d_max, self.target_size, dtype=np.float32)
+
+        method = self.method
+        if method == 'cubic' and len(domain) < 4:
+            method = 'linear'
+
+        f = interp1d(domain, spectrum, kind=method, bounds_error=False, fill_value=0)
+        resampled = f(new_domain)
+        resampled = np.nan_to_num(resampled, nan=0.0).astype(np.float32)
+
+        if self.do_normalize:
+            mn, mx = resampled.min(), resampled.max()
+            if mx > mn:
+                resampled = (resampled - mn) / (mx - mn)
+
         return resampled
 
-class Normalizer:
-    """Normalize spectrum to [0,1] range"""
-    
-    def __call__(self, spectrum: Union[np.ndarray, List[float]], domain: Optional[np.ndarray] = None) -> np.ndarray:
-        if isinstance(spectrum, list):
-            spectrum = np.array(spectrum)
-            
-        non_zero_mask = spectrum != 0
-        if non_zero_mask.any():
-            min_val = np.min(spectrum[non_zero_mask])
-            max_val = np.max(spectrum[non_zero_mask])
-            
-            if not np.isclose(min_val, max_val):
-                spectrum = spectrum.copy()
-                spectrum[non_zero_mask] = (spectrum[non_zero_mask] - min_val) / (max_val - min_val)
-                
-        return spectrum 
+
+class SpectralPreprocessor:
+    """
+    If use_preloaded_domain = True, we load IR/H‑NMR/C‑NMR domain arrays from a JSON file
+    (domain_file) during init, and use those for all samples. The dataset need only
+    provide the raw spectral intensities (shape (B, L)).
+
+    If use_preloaded_domain = False, we skip domain loading and behave as a pass-through
+    or skip interpolation.
+    """
+
+    def __init__(
+        self,
+        use_preloaded_domain: bool = True,
+        domain_file: str | None = "data_extraction\multimodal_spectroscopic_dataset\meta_data\spectrum_dimensions.json",
+        # Interpolators for each modality
+        ir_interpolator: PerSampleInterpolator = None,
+        hnmr_interpolator: PerSampleInterpolator = None,
+        cnmr_interpolator: PerSampleInterpolator = None
+    ):
+        self.use_preloaded_domain = use_preloaded_domain
+        self.domain_file = domain_file
+        self.ir_interpolator   = ir_interpolator
+        self.hnmr_interpolator = hnmr_interpolator
+        self.cnmr_interpolator = cnmr_interpolator
+
+        # Always try to load domains
+        self.ir_domain   = None
+        self.h_nmr_domain= None
+        self.c_nmr_domain= None
+        if domain_file is not None:
+            try:
+                with open(self.domain_file, "r") as f:
+                    sp_dims = json.load(f)
+                # Grab arrays from JSON
+                self.ir_domain    = np.array(sp_dims["ir_spectra"]["dimensions"],   dtype=np.float32)
+                self.h_nmr_domain = np.array(sp_dims["h_nmr_spectra"]["dimensions"],dtype=np.float32)
+                self.c_nmr_domain = np.array(sp_dims["c_nmr_spectra"]["dimensions"],dtype=np.float32)
+                print(f"[SpectralPreprocessor] Loaded IR domain of shape {self.ir_domain.shape}")
+                print(f"[SpectralPreprocessor] Loaded H-NMR domain of shape {self.h_nmr_domain.shape}")
+                print(f"[SpectralPreprocessor] Loaded C-NMR domain of shape {self.c_nmr_domain.shape}")
+            except Exception as e:
+                print(f"[SpectralPreprocessor] Warning: Failed to load domains from {domain_file}: {e}")
+
+    def _process_modality(self, batch_data: torch.Tensor, domain_array: np.ndarray,
+                          interpolator: PerSampleInterpolator):
+        """
+        batch_data: shape (B, L) or None
+        domain_array: 1D array with shape (N,) from preloaded domains
+        interpolator: PerSampleInterpolator
+        """
+        if batch_data is None or interpolator is None:
+            return None
+
+        # Always interpolate using the preloaded domain
+        batch_data_np = batch_data.cpu().numpy()  # (B, L)
+        B, L = batch_data_np.shape
+
+        results = []
+        for i in range(B):
+            spectrum_i = batch_data_np[i]  # shape (L,)
+            res_i = interpolator(spectrum_i, domain_array)  # shape (target_size,)
+            results.append(res_i)
+
+        stacked = np.stack(results, axis=0)  # (B, target_size)
+        # Convert to tensor and move to same device as input
+        tensor = torch.from_numpy(stacked).unsqueeze(1)  # (B,1,target_size)
+        return tensor.to(device=batch_data.device, dtype=batch_data.dtype)
+
+    def __call__(self, ir_data, h_nmr_data, c_nmr_data):
+        """
+        Each input is shape (B, L) or None.
+        Returns up to 3 Tensors => (B,1,R) each, or None if skipping or no data.
+        """
+        x_ir = self._process_modality(ir_data, self.ir_domain,   self.ir_interpolator)
+        x_hnmr = self._process_modality(h_nmr_data, self.h_nmr_domain, self.hnmr_interpolator)
+        x_cnmr = self._process_modality(c_nmr_data, self.c_nmr_domain, self.cnmr_interpolator)
+        return x_ir, x_hnmr, x_cnmr
