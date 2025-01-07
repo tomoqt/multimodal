@@ -20,7 +20,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import wandb
 from datetime import datetime
-from sklearn.model_selection import train_test_split
+#from sklearn.model_selection import train_test_split
 import json
 from rdkit import Chem
 from rdkit import RDLogger
@@ -52,19 +52,13 @@ tokenizer = SmilesTokenizer(vocab_file=vocab_path)
 # -------------------------------------------------------------------------
 # Warmup + Cosine Annealing With Restarts Scheduler
 # -------------------------------------------------------------------------
-class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
+class WarmupConstantLR(torch.optim.lr_scheduler._LRScheduler):
     """
-    Combines linear warmup with cosine annealing and warm restarts.
+    Simple scheduler that does linear warmup followed by constant learning rate.
     """
-    def __init__(self, optimizer, warmup_steps, T_0, T_mult=1, eta_min=0, last_epoch=-1):
+    def __init__(self, optimizer, warmup_steps, last_epoch=-1):
         self.warmup_steps = warmup_steps
-        self.T_0_initial = T_0
-        self.T_0 = T_0
-        self.T_mult = T_mult
-        self.eta_min = eta_min
-        self.T_cur = 0
         self.completed_warmup = False
-        self.n_restarts = 0
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
@@ -73,34 +67,8 @@ class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
             alpha = self.last_epoch / self.warmup_steps
             return [base_lr * alpha for base_lr in self.base_lrs]
         
-        # Cosine annealing with warm restarts
-        if not self.completed_warmup:
-            self.completed_warmup = True
-            self.T_cur = 0
-        
-        # Check for restart
-        if self.T_cur >= self.T_0:
-            self.T_cur = 0
-            self.T_0 = self.T_0 * self.T_mult
-            self.n_restarts += 1
-        
-        progress = self.T_cur / self.T_0
-        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-        self.T_cur += 1
-        
-        return [
-            self.eta_min + (base_lr - self.eta_min) * cosine_decay
-            for base_lr in self.base_lrs
-        ]
-
-    def step(self, epoch=None):
-        if epoch is None:
-            epoch = self.last_epoch + 1
-        self.last_epoch = epoch
-        self._last_lr = self.get_lr()
-        
-        for param_group, lr in zip(self.optimizer.param_groups, self._last_lr):
-            param_group['lr'] = lr
+        # After warmup, return constant base learning rate
+        return self.base_lrs
 
 
 # -------------------------------------------------------------------------
@@ -372,6 +340,45 @@ def collate_fn(batch):
     return token_batch, ir_batch, h_nmr_batch, c_nmr_batch
 
 
+# Move TokenizedDataset class definition outside create_data_loaders
+class TokenizedDataset(Dataset):
+    def __init__(self, sources, targets, config, ir_data=None):
+        self.sources = sources  # NMR tokens
+        self.targets = targets  # SMILES tokens
+        self.ir_data = ir_data  # Raw IR data if available
+        self.config = config    # Add config parameter
+        
+    def __len__(self):
+        return len(self.sources)
+        
+    def __getitem__(self, idx):
+        # Convert source (NMR) string to tokens
+        nmr_tokens = tokenizer.encode(
+            self.sources[idx],
+            add_special_tokens=True,
+            max_length=self.config['model']['max_seq_length'],  # Use self.config
+            truncation=True
+        )
+        nmr_tokens = torch.tensor(nmr_tokens, dtype=torch.long)
+        
+        # Convert target SMILES to tokens
+        tgt_tokens = tokenizer.encode(
+            self.targets[idx],
+            add_special_tokens=True,
+            max_length=self.config['model']['max_seq_length'],  # Use self.config
+            truncation=True
+        )
+        tgt_tokens = torch.tensor(tgt_tokens, dtype=torch.long)
+        
+        # Get IR data if available
+        ir_data = None
+        if self.ir_data is not None:
+            ir_data = (
+                torch.from_numpy(self.ir_data[idx]).float(),
+                torch.from_numpy(np.linspace(400, 4000, len(self.ir_data[idx]))).float())
+            
+        return tgt_tokens, ir_data, nmr_tokens, None  # Last None is for c_nmr which we don't use
+
 def create_data_loaders(tokenizer, config):
     print("\n[DataLoader] Creating data loaders...")
     
@@ -402,48 +409,10 @@ def create_data_loaders(tokenizer, config):
     print(f"[DataLoader] Loaded {len(val_src)} validation samples")
     print(f"[DataLoader] Loaded {len(test_src)} test samples")
 
-    class TokenizedDataset(Dataset):
-        def __init__(self, sources, targets, ir_data=None):
-            self.sources = sources  # NMR tokens
-            self.targets = targets  # SMILES tokens
-            self.ir_data = ir_data  # Raw IR data if available
-            
-        def __len__(self):
-            return len(self.sources)
-            
-        def __getitem__(self, idx):
-            # Convert source (NMR) string to tokens
-            nmr_tokens = tokenizer.encode(
-                self.sources[idx],
-                add_special_tokens=True,
-                max_length=config['model']['max_seq_length'],
-                truncation=True
-            )
-            nmr_tokens = torch.tensor(nmr_tokens, dtype=torch.long)
-            
-            # Convert target SMILES to tokens
-            tgt_tokens = tokenizer.encode(
-                self.targets[idx],
-                add_special_tokens=True,
-                max_length=config['model']['max_seq_length'],
-                truncation=True
-            )
-            tgt_tokens = torch.tensor(tgt_tokens, dtype=torch.long)
-            
-            # Get IR data if available
-            ir_data = None
-            if self.ir_data is not None:
-                ir_data = (
-                    torch.from_numpy(self.ir_data[idx]).float(),
-                    torch.from_numpy(np.linspace(400, 4000, len(self.ir_data[idx]))).float()
-                )
-                
-            return tgt_tokens, ir_data, nmr_tokens, None  # Last None is for c_nmr which we don't use
-
-    # Create datasets
-    train_dataset = TokenizedDataset(train_src, train_tgt, train_ir)
-    val_dataset = TokenizedDataset(val_src, val_tgt, val_ir)
-    test_dataset = TokenizedDataset(test_src, test_tgt, test_ir)
+    # Create datasets with config parameter
+    train_dataset = TokenizedDataset(train_src, train_tgt, config, train_ir)
+    val_dataset = TokenizedDataset(val_src, val_tgt, config, val_ir)
+    test_dataset = TokenizedDataset(test_src, test_tgt, config, test_ir)
 
     # Create data loaders
     train_loader = DataLoader(
@@ -488,9 +457,9 @@ def load_config(config_path=None):
             'resample_size': 1000,
             'use_concat': True,
             'decoder_type': 'prompt_nmr',
-            'use_nmr': True,
+            'use_nmr': False,
             'use_ir': True,
-            'use_c_nmr': True
+            'use_c_nmr': False
         },
         'training': {
             'batch_size': 32,
@@ -547,24 +516,24 @@ def parse_args():
 def get_domain_ranges(meta_data):
     """Extract domain ranges from metadata"""
     ir_range = [
-        min(meta_data["ir_spectra"]["dimensions"]),
-        max(meta_data["ir_spectra"]["dimensions"])
+        meta_data["ir_spectra"]["range"][0],  # min
+        meta_data["ir_spectra"]["range"][1]   # max
     ]
     h_nmr_range = [
-        min(meta_data["h_nmr_spectra"]["dimensions"]),
-        max(meta_data["h_nmr_spectra"]["dimensions"])
+        meta_data["h_nmr_spectra"]["range"][0],  # min
+        meta_data["h_nmr_spectra"]["range"][1]   # max
     ]
     c_nmr_range = [
-        min(meta_data["c_nmr_spectra"]["dimensions"]),
-        max(meta_data["c_nmr_spectra"]["dimensions"])
+        meta_data["c_nmr_spectra"]["range"][0],  # min
+        meta_data["c_nmr_spectra"]["range"][1]   # max
     ]
     hsqc_h_range = [
-        min(meta_data["hsqc_nmr_spectrum"]["dimensions"]["h"]),
-        max(meta_data["hsqc_nmr_spectrum"]["dimensions"]["h"])
+        meta_data["hsqc_nmr_spectrum"]["range"]["h"][0],  # min
+        meta_data["hsqc_nmr_spectrum"]["range"]["h"][1]   # max
     ]
     hsqc_c_range = [
-        min(meta_data["hsqc_nmr_spectrum"]["dimensions"]["c"]),
-        max(meta_data["hsqc_nmr_spectrum"]["dimensions"]["c"])
+        meta_data["hsqc_nmr_spectrum"]["range"]["c"][0],  # min
+        meta_data["hsqc_nmr_spectrum"]["range"]["c"][1]   # max
     ]
     return ir_range, h_nmr_range, c_nmr_range, hsqc_h_range, hsqc_c_range
 
@@ -623,7 +592,7 @@ def main():
         domain_ranges=domain_ranges,
         verbose=False,
         use_concat=config['model']['use_concat'],
-        decoder_type=config['model']['decoder_type'],
+        decoder_type='prompt_nmr',
         use_nmr=config['model']['use_nmr'],
         use_ir=config['model']['use_ir'],
         use_c_nmr=config['model']['use_c_nmr']
@@ -676,12 +645,9 @@ def main():
     print("\n[Main] Setting up training components...")
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
     optimizer = optim.AdamW(model.parameters(), lr=config['training']['learning_rate'])
-    scheduler = WarmupCosineLR(
+    scheduler = WarmupConstantLR(
         optimizer,
-        warmup_steps=config['scheduler']['warmup_steps'],
-        T_0=config['scheduler']['T0'] * len(train_loader),
-        T_mult=config['scheduler']['T_mult'],
-        eta_min=config['training']['min_learning_rate']
+        warmup_steps=config['scheduler']['warmup_steps']
     )
 
     print("\n[Main] Creating checkpoint directory...")
@@ -908,19 +874,19 @@ def main():
                 # Handle spectral data tuples
                 if ir is not None:
                     if isinstance(ir, tuple):
-                        ir = (ir[0].to(device), ir[1].to(device))
+                        ir = ir[0].to(device)
                     else:
                         ir = ir.to(device)
                         
                 if h_nmr is not None:
                     if isinstance(h_nmr, tuple):
-                        h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device))
+                        h_nmr = h_nmr[0].to(device)
                     else:
                         h_nmr = h_nmr.to(device)
                         
                 if c_nmr is not None:
                     if isinstance(c_nmr, tuple):
-                        c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device))
+                        c_nmr = c_nmr[0].to(device)
                     else:
                         c_nmr = c_nmr.to(device)
                 
@@ -1006,22 +972,24 @@ def main():
             # Get the batch data
             tgt_tokens = tgt_tokens.to(device)
 
-            # Handle spectral data tuples
+            # Handle spectral data - extract data tensor from tuples
             if ir is not None:
                 if isinstance(ir, tuple):
-                    ir = (ir[0].to(device), ir[1].to(device))
+                    ir = ir[0].to(device)  # Just use the data part, not the domain
                 else:
                     ir = ir.to(device)
 
             if h_nmr is not None:
                 if isinstance(h_nmr, tuple):
-                    h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device))
+                    h_nmr = h_nmr[0].to(device)  # Just use the data part, not the domain
+
+                    print(h_nmr)
                 else:
                     h_nmr = h_nmr.to(device)
 
             if c_nmr is not None:
                 if isinstance(c_nmr, tuple):
-                    c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device))
+                    c_nmr = c_nmr[0].to(device)  # Just use the data part, not the domain
                 else:
                     c_nmr = c_nmr.to(device)
 

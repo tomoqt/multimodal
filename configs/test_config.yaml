@@ -28,7 +28,7 @@ scheduler:
 # Data
 data:
   use_parquet: False
-  data_dir: "data_extraction/multimodal_spectroscopic_dataset"
+  data_dir: "tokenized_baseline"
   binary_dir: "preprocessed_binaries"
   test_size: 20
   val_size: 0.001
