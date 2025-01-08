@@ -123,7 +123,6 @@ class MultimodalSpectralEncoder(nn.Module):
 
         # Concatenate along embedding dimension
         out = torch.cat([emb_nmr, emb_ir, emb_c_nmr], dim=-1)  # [B, seq_len, embed_dim]
-        
         if self.verbose:
             print(f"\nFinal concatenated output: {out.shape}")
         return out

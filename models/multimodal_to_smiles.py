@@ -98,7 +98,7 @@ class MultiModalToSMILESModel(nn.Module):
             print(f"Encoder Output (memory) shape: {memory.shape}")
 
         # 2) Decode to SMILES: target_seq => shape (B, T)
-        logits = self.decoder(target_seq, memory, target_mask)
+        logits = self.decoder(target_seq, memory)
 
         if self.verbose:
             print("\n=== Forward Pass Complete ===")

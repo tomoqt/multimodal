@@ -2,9 +2,9 @@
 model:
   use_concat: True
   max_seq_length: 80
-  embed_dim: 36
-  num_heads: 3
-  num_layers: 8
+  embed_dim: 2304
+  num_heads: 8
+  num_layers: 3
   dropout: 0.1
   resample_size: 1000
 
