@@ -151,19 +151,16 @@ class SMILESDecoder(nn.Module):
         # Output projection
         self.out = nn.Linear(embed_dim, vocab_size)
         
-    def forward(self, tgt: th.Tensor, memory: th.Tensor, tgt_mask: th.Tensor | None = None):
+    def forward(self, tgt: th.Tensor, memory: th.Tensor):
         """ inputs:
             tgt: target sequence tensor, shape (B, T)
             memory: memory tensor, shape (B, D) or (B, S, D)
-            tgt_mask: mask for target sequence, ??
         """
         B, T, = tgt.shape
         if self.verbose:
             print(f"\nDecoder Input Shapes:")
             print(f"Target sequence: {tgt.shape}")
             print(f"Memory: {memory.shape}")
-            if tgt_mask is not None:
-                print(f"Target mask: {tgt_mask.shape}")
 
         # Check sequence length
         if tgt.size(1) > self.max_seq_length + 256:
