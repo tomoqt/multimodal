@@ -33,6 +33,7 @@ import argparse
 import time
 from pprint import pprint
 from copy import deepcopy
+from logging_utils import evaluate_predictions, aggregate_metrics, log_results
 
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
@@ -435,14 +436,16 @@ def main():
     global_step = 0
 
     # Helper for validation
-    def validate(model, loader, device):
+    def validate(model, loader, criterion, tokenizer, device):
         model.eval()
         total_loss = 0.0
         total_batches = 0
+        all_details = []
+        
         with torch.no_grad():
             for tokens, ir, h_nmr, c_nmr in loader:
                 tokens = tokens.to(device)
-                if ir is not None: 
+                if ir is not None:
                     ir = (ir[0].to(device), ir[1].to(device) if ir[1] is not None else None)
                 if h_nmr is not None:
                     h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device) if h_nmr[1] is not None else None)
@@ -451,6 +454,7 @@ def main():
 
                 T = tokens.size(1)
                 mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tokens.device), 1)
+                
                 logits = model(
                     nmr_data=h_nmr,
                     ir_data=ir,
@@ -459,13 +463,33 @@ def main():
                     target_mask=mask[:-1, :-1]
                 )
                 loss = criterion(logits.reshape(-1, logits.size(-1)), tokens[:, 1:].reshape(-1))
-
+                
                 total_loss += loss.item()
                 total_batches += 1
 
-            avg_loss = total_loss / max(total_batches, 1)
+                # Convert logits to predictions for logging
+                pred_tokens = logits.argmax(dim=-1).cpu().tolist()
+                tgt_tokens = tokens[:, 1:].cpu().tolist()  # Skip BOS token
 
-        return avg_loss
+                # Decode from token IDs to SMILES strings
+                preds_decoded = [tokenizer.decode(p) for p in pred_tokens]
+                targets_decoded = [tokenizer.decode(t) for t in tgt_tokens]
+
+                # Evaluate predictions vs. targets
+                details = evaluate_predictions(preds_decoded, targets_decoded, verbose=False)
+                all_details.extend(details)
+        
+        val_loss = total_loss / max(total_batches, 1)
+        metrics_dict = aggregate_metrics(all_details)
+        
+        # Keep a subset of valid results for logging
+        valid_set = [d for d in all_details if d['valid'] and d['valid_target']]
+        metrics_dict['valid_set'] = valid_set[:100]  # store up to 100 examples
+        metrics_dict['val_loss'] = val_loss
+
+        return metrics_dict
+
+    wandb_table = None
 
     # -------------------------------------------------------------------------
     # Training Loop
@@ -520,27 +544,37 @@ def main():
             # Periodic validation
             if global_step % validation_frequency == 0:
                 print(f"\nRunning validation at step {global_step}...")
-                val_loss = validate(model, val_loader, device)
-                wandb.log({"val_loss": val_loss}, step=global_step)
-                print(f"[Val] Loss: {val_loss:.4f}")
+                val_metrics = validate(model, val_loader, criterion, tokenizer, device)
+                
+                # Initialize wandb table if needed
+                if wandb_table is None and val_metrics['valid_set']:
+                    columns = ["global_step"] + list(val_metrics['valid_set'][0].keys())
+                    wandb_table = wandb.Table(columns=columns)
+                
+                # Log results
+                log_results(val_metrics, global_step, wandb_table, prefix="val")
+                print(f"[Val] Loss: {val_metrics['val_loss']:.4f}")
 
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                if val_metrics['val_loss'] < best_val_loss:
+                    best_val_loss = val_metrics['val_loss']
                     print(f"New best validation loss: {best_val_loss:.4f}")
                     checkpoint = {
                         'epoch': epoch,
                         'global_step': global_step,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'val_loss': val_loss,
+                        'val_loss': val_metrics['val_loss'],
                     }
                     if config['training'].get('save_local', False):
                         torch.save(checkpoint, save_dir / 'best_model.pt')
                         print(f"Saved checkpoint locally at {save_dir}/best_model.pt")
 
                     # Save to W&B as an artifact
-                    artifact = wandb.Artifact("model", type="model",
-                        description=f"Checkpoint at step {global_step}, val_loss {best_val_loss:.4f}")
+                    artifact = wandb.Artifact(
+                        "model", 
+                        type="model",
+                        description=f"Checkpoint at step {global_step}, val_loss {best_val_loss:.4f}"
+                    )
                     wandb.log_artifact(artifact, aliases=["latest", f"step_{global_step}"])
                     print("[Main] Checkpoint artifact saved to W&B.")
 
@@ -549,9 +583,9 @@ def main():
 
     # Final test set evaluation
     print("\n[Main] Evaluating on test set...")
-    final_test_loss = validate(model, test_loader, device)
-    wandb.log({"test_loss": final_test_loss}, step=global_step)
-    print(f"[Test] Loss: {final_test_loss:.4f}")
+    final_test_loss = validate(model, test_loader, criterion, tokenizer, device)
+    wandb.log({"test_loss": final_test_loss['val_loss']}, step=global_step)
+    print(f"[Test] Loss: {final_test_loss['val_loss']:.4f}")
 
     # Optionally save final checkpoint
     if config['training'].get('save_local', False):
@@ -560,7 +594,7 @@ def main():
             'global_step': global_step,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'test_loss': final_test_loss
+            'test_loss': final_test_loss['val_loss']
         }
         torch.save(final_ckpt, save_dir / 'final_model.pt')
         print(f"Final checkpoint saved at {save_dir}/final_model.pt")
