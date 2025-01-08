@@ -21,6 +21,7 @@ training:
   validation_frequency: 100
   logging_frequency: 10
   save_frequency: 5_000
+  num_workers: 8
 
 # Scheduler
 scheduler:

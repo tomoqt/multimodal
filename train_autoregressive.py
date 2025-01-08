@@ -378,7 +378,7 @@ def create_data_loaders(tokenizer, config):
         torch.utils.data.Subset(dataset, train_indices),
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=0,
+        num_workers=config['training']['num_workers'],
         collate_fn=collate_fn
     )
     
