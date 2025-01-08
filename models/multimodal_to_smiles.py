@@ -17,12 +17,14 @@ class MultiModalToSMILESModel(nn.Module):
         resample_size: int = 1000,
         use_concat: bool = True,
         verbose: bool = False,
-        domain_ranges: list | None = None
+        domain_ranges: list | None = None,
+        cls_dim: int = 512
     ):
         super().__init__()
         
         self.use_concat = use_concat
         self.verbose = verbose
+        self.cls_dim = cls_dim
         
         # Spectral encoder with verbose off
         memory_dim = 2046 if use_concat else embed_dim
@@ -52,7 +54,15 @@ class MultiModalToSMILESModel(nn.Module):
             verbose=verbose
         )
 
+        # extra projections for cls
+        self.to_cls_enc = th.nn.Linear(memory_dim, cls_dim)
+        self.to_cls_dec = th.nn.Linear(embed_dim, cls_dim)
+
     def forward(self, nmr_data: tuple | th.Tensor | None, ir_data: tuple | th.Tensor | None, c_nmr_data: tuple | th.Tensor | None, target_seq: Any | None = None, target_mask: th.Tensor | None = None):
+        """ Returns the cls (dense encoding for molecule) and logits to sample smiles from
+        * (cls_enc, cls_dec) = 2x (B, D)
+        * logits: (B, L, D)
+        """
         if self.verbose:
             print("\n=== Starting Forward Pass ===")
             print("\nSpectroscopic data shapes inside forward:")
@@ -77,11 +87,15 @@ class MultiModalToSMILESModel(nn.Module):
         
         if self.verbose:
             print("\n=== Starting Decoding ===")
-            
+
         # Decode to SMILES
-        logits = self.decoder(target_seq, memory, target_mask)
+        cls, logits = self.decoder(target_seq, memory, target_mask)
         
         if self.verbose:
             print("\n=== Forward Pass Complete ===")
+
+        # [CLS] by mean pooling: (B, D)
+        cls_enc = self.to_cls_enc(memory).mean(dim=-2)
+        cls_dec = self.to_cls_dec(cls)
             
-        return logits 
+        return (cls_enc, cls_dec), logits
