@@ -21,7 +21,11 @@ training:
   validation_frequency: 100
   logging_frequency: 10
   save_frequency: 5_000
-  num_workers: 8
+  # TODO: allow multiprocess with unimol?
+  num_workers: 0
+  ce_weight: 1.0
+  cls_enc_weight: 1.0
+  cls_dec_weight: 0.05
 
 # Scheduler
 scheduler:

@@ -234,7 +234,9 @@ class SMILESDecoder(nn.Module):
         # original:
         # self.memory_proj = nn.Linear(memory_dim, memory_dim)
         self.memory_proj = nn.Linear(memory_dim, embed_dim) if memory_dim != embed_dim else nn.Identity()
-        
+        # absolute posemb (will also replace memory posemb)
+        self.pos_token = th.nn.Parameter(1e-3*th.randn(1, max_seq_length + 256, embed_dim))
+
         # Create decoder layers with updated memory dimension
         self.layers = nn.ModuleList([
             # DecoderLayer(
@@ -284,13 +286,16 @@ class SMILESDecoder(nn.Module):
             print(f"memory.shape: {memory.shape}")
             memory = memory.unsqueeze(1)
 
-        # Expand memory batch dimension if needed
-        # if memory.size(0) == 1 and x.size(0) > 1:
-        #    memory = memory.expand(x.size(0), -1, -1)
+        # Add cls token:
+        cls_token = th.zeros_like(memory[:, -1:, :])
+        memory = th.cat([memory, cls_token], dim=1)
 
         # mix `memory` and `x` as prompt + answer, and add causal mask
         M = memory.shape[-2]
         x = th.cat([memory, x], dim=1)
+
+        # add absolute posemb
+        x = x + self.pos_token[:, :T+M].repeat(B, 1, 1)
 
         mask = th.ones(B, T+M, T+M, device=x.device).tril().bool()
         # memory can attend to all of itself. Unlike causal decoding
@@ -306,4 +311,5 @@ class SMILESDecoder(nn.Module):
 
         # remove memory prompt from output tokens
         out = self.out(x[:, M:])
-        return out
+        cls = x[:, M-1:M]
+        return cls, out
