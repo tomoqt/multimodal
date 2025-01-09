@@ -2,6 +2,8 @@ import numpy as np
 import torch
 import json
 from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+import os
 
 class PerSampleInterpolator:
     """
@@ -71,7 +73,9 @@ class SpectralPreprocessor:
         # Interpolators for each modality
         ir_interpolator: PerSampleInterpolator = None,
         hnmr_interpolator: PerSampleInterpolator = None,
-        cnmr_interpolator: PerSampleInterpolator = None
+        cnmr_interpolator: PerSampleInterpolator = None,
+        test_mode: bool = False,
+        plot_dir: str = "test_plots"
     ):
         self.use_preloaded_domain = use_preloaded_domain
         self.domain_file = domain_file
@@ -97,6 +101,39 @@ class SpectralPreprocessor:
             except Exception as e:
                 print(f"[SpectralPreprocessor] Warning: Failed to load domains from {domain_file}: {e}")
 
+        self.test_mode = test_mode
+        self.plot_dir = plot_dir
+        if test_mode:
+            os.makedirs(plot_dir, exist_ok=True)
+
+    def _plot_comparison(self, original_spectrum, original_domain, 
+                        interpolated_spectrum, interpolated_domain, 
+                        modality):
+        """Plot original and interpolated spectra side by side."""
+        plt.figure(figsize=(15, 5))
+        
+        # Original spectrum
+        plt.subplot(1, 2, 1)
+        plt.plot(original_domain, original_spectrum, 'b-', label='Original')
+        plt.title(f'Original {modality} Spectrum')
+        plt.xlabel('Domain')
+        plt.ylabel('Intensity')
+        plt.grid(True)
+        plt.legend()
+
+        # Interpolated spectrum
+        plt.subplot(1, 2, 2)
+        plt.plot(interpolated_domain, interpolated_spectrum, 'r-', label='Interpolated')
+        plt.title(f'Interpolated {modality} Spectrum')
+        plt.xlabel('Domain')
+        plt.ylabel('Intensity')
+        plt.grid(True)
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plot_dir, f'{modality.lower()}_comparison.png'))
+        plt.close()
+
     def _process_modality(self, batch_data: torch.Tensor, domain_array: np.ndarray,
                           interpolator: PerSampleInterpolator):
         """
@@ -120,6 +157,31 @@ class SpectralPreprocessor:
         stacked = np.stack(results, axis=0)  # (B, target_size)
         # Convert to tensor and move to same device as input
         tensor = torch.from_numpy(stacked).unsqueeze(1)  # (B,1,target_size)
+
+        # Plot comparison in test mode
+        if self.test_mode and batch_data is not None:
+            # Determine modality by comparing arrays
+            modality = "Unknown"
+            if domain_array is not None:
+                if np.array_equal(domain_array, self.ir_domain):
+                    modality = "IR"
+                elif np.array_equal(domain_array, self.h_nmr_domain):
+                    modality = "H-NMR"
+                elif np.array_equal(domain_array, self.c_nmr_domain):
+                    modality = "C-NMR"
+            
+            # Create interpolated domain array
+            interpolated_domain = np.linspace(domain_array[0], domain_array[-1], len(stacked[0]))
+            
+            # Plot comparison of original and interpolated spectra
+            self._plot_comparison(
+                original_spectrum=batch_data_np[0],
+                original_domain=domain_array,
+                interpolated_spectrum=stacked[0],
+                interpolated_domain=interpolated_domain,
+                modality=modality
+            )
+
         return tensor.to(device=batch_data.device, dtype=batch_data.dtype)
 
     def __call__(self, ir_data, h_nmr_data, c_nmr_data):
