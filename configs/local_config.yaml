@@ -2,16 +2,16 @@
 model:
   use_concat: True
   max_seq_length: 80
-  embed_dim: 2048
-  num_heads: 16
-  num_layers: 8
+  embed_dim: 1024
+  num_heads: 8
+  num_layers: 6
   dropout: 0.1
   # dropout: 0.0
   resample_size: 1000
-
+  use_mlp_for_nmr: True #default is true
 # Training Parameters
 training:
-  batch_size: 64
+  batch_size: 32
   # batch_size: 32
   test_batch_size: 1
   num_epochs: 5
