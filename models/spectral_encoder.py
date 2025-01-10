@@ -153,21 +153,36 @@ class MultimodalSpectralEncoder(nn.Module):
         # Calculate backbone dimensions
         if use_mlp_for_nmr:
             backbone_dim = embed_dim  # IR backbone uses full dimension
-            # Create MLPs for NMRs
-            self.h_nmr_mlp = nn.Sequential(
-                nn.Linear(10000, embed_dim * 2),
-                nn.ReLU(),
-                nn.Linear(embed_dim * 2, embed_dim),
-                nn.ReLU(),
-                nn.Linear(embed_dim, embed_dim)
-            )
-            self.c_nmr_mlp = nn.Sequential(
-                nn.Linear(10000, embed_dim * 2),
-                nn.ReLU(),
-                nn.Linear(embed_dim * 2, embed_dim),
-                nn.ReLU(),
-                nn.Linear(embed_dim, embed_dim)
-            )
+            
+            # Create bottleneck MLPs for NMRs
+            def create_bottleneck_mlp():
+                layers = []
+                current_dim = 10000
+                reduction_dims = [4096, 2048, 1024]
+                
+                # Add reduction layers until we get close to embed_dim
+                for dim in reduction_dims:
+                    if dim < embed_dim:
+                        break
+                    layers.extend([
+                        nn.Linear(current_dim, dim),
+                        nn.LayerNorm(dim),
+                        nn.ReLU(),
+                        nn.Dropout(dropout)
+                    ])
+                    current_dim = dim
+                
+                # Final projection to embed_dim
+                layers.extend([
+                    nn.Linear(current_dim, embed_dim),
+                    nn.LayerNorm(embed_dim)
+                ])
+                
+                return nn.Sequential(*layers)
+            
+            self.h_nmr_mlp = create_bottleneck_mlp()
+            self.c_nmr_mlp = create_bottleneck_mlp()
+            
         else:
             n_modalities = 3
             backbone_dim = embed_dim // n_modalities if use_concat else embed_dim
