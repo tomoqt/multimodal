@@ -415,7 +415,8 @@ def load_config(config_path=None):
             'num_layers': 6,
             'dropout': 0.1,
             'resample_size': 1000,
-            'use_concat': True
+            'use_concat': True,
+            'use_mlp_for_nmr': True
         },
         'training': {
             'batch_size': 32,
@@ -545,7 +546,8 @@ def main():
         resample_size=resample_size,
         domain_ranges=domain_ranges,
         verbose=False,
-        use_concat=config['model']['use_concat']
+        use_concat=config['model']['use_concat'],
+        use_mlp_for_nmr=config['model'].get('use_mlp_for_nmr', True)
     ).to(device)
     print("[Main] Model initialized successfully")
 
