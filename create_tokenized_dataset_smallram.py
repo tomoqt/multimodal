@@ -16,7 +16,7 @@ import os
 
 def split_data(data: pd.DataFrame, seed: int, val_size: float = 0.002) -> Tuple[pd.DataFrame]:
     """Split data into train/test/val sets."""
-    train, test = train_test_split(data, test_size=0.1, random_state=seed, shuffle=True)
+    train, test = train_test_split(data, test_size=0.001, random_state=seed, shuffle=True)
     train, val = train_test_split(train, test_size=val_size, random_state=seed, shuffle=True)
     return train, test, val
 
