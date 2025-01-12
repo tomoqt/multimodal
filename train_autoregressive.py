@@ -71,216 +71,221 @@ class LinearWarmupConstantLR(torch.optim.lr_scheduler._LRScheduler):
 # -------------------------------------------------------------------------
 class SpectralSmilesDataset(Dataset):
     """
-    A PyTorch Dataset that reads from memory-mapped binary files:
-      - spectra_data.bin  (float32 arrays for IR/H-NMR/C-NMR + domains)
-      - smiles_data.bin   (raw UTF-8 bytes for SMILES)
-      - spectra_index.npy (offsets/lengths for each row)
+    A PyTorch Dataset that reads from tokenized text files and numpy arrays:
+      - src-{split}.txt  (source sequences with NMR data)
+      - tgt-{split}.txt  (target SMILES sequences) 
+      - ir-{split}.npy   (IR spectra data)
     """
-    def __init__(self, data_dir, tokenizer, max_len=128):
+    def __init__(
+        self, 
+        data_dir, 
+        smiles_tokenizer, 
+        spectral_tokenizer, 
+        split='train', 
+        max_smiles_len=512,  # Separate length limit for SMILES
+        max_nmr_len=128      # Separate length limit for NMR
+    ):
         super().__init__()
         self.data_dir = Path(data_dir)
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+        self.smiles_tokenizer = smiles_tokenizer
+        self.spectral_tokenizer = spectral_tokenizer
+        self.max_smiles_len = max_smiles_len
+        self.max_nmr_len = max_nmr_len
+        self.split = split
 
-        # Load index file
-        index_path = self.data_dir / "spectra_index.npy"
-        if not index_path.exists():
-            raise FileNotFoundError(f"Index file not found at {index_path}")
-        self.index = np.load(index_path)  # shape: (num_rows, 14)
+        # Load source (NMR) and target sequences
+        with open(self.data_dir / f"src-{split}.txt") as f:
+            self.sources = [line.strip() for line in f]
+        with open(self.data_dir / f"tgt-{split}.txt") as f:
+            self.targets = [line.strip() for line in f]
 
-        # Memory-map the data files
-        spectra_bin_path = self.data_dir / "spectra_data.bin"
-        if not spectra_bin_path.exists():
-            raise FileNotFoundError(f"Spectra data file not found at {spectra_bin_path}")
-        self.spectra_mmap = np.memmap(spectra_bin_path, dtype=np.float32, mode='r')
+        # Optionally load IR data if available
+        ir_path = self.data_dir / f"ir-{split}.npy"
+        self.ir_data = None
+        if ir_path.exists():
+            self.ir_data = np.load(ir_path)
+            print(f"[Dataset] Loaded IR data with shape: {self.ir_data.shape}")
 
-        smiles_bin_path = self.data_dir / "smiles_data.bin"
-        if not smiles_bin_path.exists():
-            raise FileNotFoundError(f"SMILES data file not found at {smiles_bin_path}")
-        self.smiles_mmap = np.memmap(smiles_bin_path, dtype=np.uint8, mode='r')
-
-        print(f"[Dataset] MemoryMappedSpectralDataset initialized:")
-        print(f"          Index shape = {self.index.shape}")
-        print(f"          Found {len(self.index)} samples total.")
+        print(f"[Dataset] SpectralSmilesDataset initialized for {split}:")
+        print(f"          Found {len(self.sources)} samples")
 
     def __len__(self):
-        return len(self.index)
+        return len(self.sources)
 
     def __getitem__(self, idx):
         """
-        Retrieve data & domain for IR, H-NMR, C-NMR + SMILES tokens.
         Returns:
-          (tokens, (ir_data, ir_dom), (h_nmr_data, h_nmr_dom), (c_nmr_data, c_nmr_dom))
+          (target_tokens, (ir_data, None), nmr_tokens, None)
         """
-        row = self.index[idx]
-
-        # Extract all offsets and lengths
-        ir_data_off, ir_data_len = row[0], row[1]
-        ir_dom_off,  ir_dom_len  = row[2], row[3]
-        hnm_data_off, hnm_data_len = row[4], row[5]
-        hnm_dom_off,  hnm_dom_len  = row[6], row[7]
-        cnm_data_off, cnm_data_len = row[8], row[9]
-        cnm_dom_off,  cnm_dom_len  = row[10], row[11]
-        smiles_off, smiles_len = row[12], row[13]
-
-        # Helper function to load data slice
-        def load_slice(offset, length):
-            if offset == -1 or length == 0:
-                return None
-            data = self.spectra_mmap[offset : offset + length]
-            return torch.from_numpy(data.copy())
-
-        # Load all data and domains
-        ir_data_t = load_slice(ir_data_off, ir_data_len)
-        ir_dom_t  = load_slice(ir_dom_off, ir_dom_len)
-        h_nmr_t = load_slice(hnm_data_off, hnm_data_len)
-        h_nmr_dom_t = load_slice(hnm_dom_off, hnm_dom_len)
-        c_nmr_t = load_slice(cnm_data_off, cnm_data_len)
-        c_nmr_dom_t = load_slice(cnm_dom_off, cnm_dom_len)
-
-        # Load and decode SMILES
-        if smiles_off == -1 or smiles_len == 0:
-            smiles_str = ""
-        else:
-            smiles_bytes = self.smiles_mmap[smiles_off : smiles_off + smiles_len]
-            smiles_str = smiles_bytes.tobytes().decode('utf-8')
-
-        # Tokenize SMILES
-        tokens = self.tokenizer.encode(
-            smiles_str,
+        # Get target sequence (SMILES) - use SMILES tokenizer
+        target_seq = self.targets[idx]
+        target_tokens = self.smiles_tokenizer.encode(
+            target_seq,
             add_special_tokens=True,
-            max_length=self.max_len,
+            max_length=self.max_smiles_len,
             truncation=True
         )
-        tokens = torch.tensor(tokens, dtype=torch.long)
+        target_tokens = torch.tensor(target_tokens, dtype=torch.long)
+
+        # Get source sequence (NMR data) - use spectral tokenizer
+        source_seq = self.sources[idx]
+        # Split into tokens and convert to IDs using the spectral vocabulary
+        nmr_tokens = source_seq.split()
+        nmr_token_ids = [self.spectral_tokenizer.get(token, self.spectral_tokenizer["<UNK>"]) 
+                        for token in nmr_tokens]
+        if len(nmr_token_ids) > self.max_nmr_len:
+            nmr_token_ids = nmr_token_ids[:self.max_nmr_len]
+        nmr_tokens = torch.tensor(nmr_token_ids, dtype=torch.long)
+
+        # Get IR data if available
+        ir_data = None
+        if self.ir_data is not None:
+            ir_data = torch.tensor(self.ir_data[idx], dtype=torch.float32)
 
         return (
-            tokens,
-            (ir_data_t, ir_dom_t),
-            (h_nmr_t, h_nmr_dom_t),
-            (c_nmr_t, c_nmr_dom_t)
+            target_tokens,
+            (ir_data, None),  # IR data and domain
+            nmr_tokens,       # Tokenized NMR data
+            None             # Placeholder for consistency
         )
 
 
 # -------------------------------------------------------------------------
 # Collate Function
 # -------------------------------------------------------------------------
-def collate_fn(batch):
+def collate_fn(batch, spectral_tokenizer):
     """
-    Custom collate: pad tokens, then group IR, H-NMR, C-NMR as (data, domain) if available.
+    Custom collate function that handles:
+    - Padding target tokens (SMILES)
+    - Padding NMR tokens
+    - Stacking IR data
     """
-    all_tokens, all_ir, all_h_nmr, all_c_nmr = zip(*batch)
+    target_tokens, ir_tuples, nmr_tokens, _ = zip(*batch)
 
-    # Pad tokens
-    max_len = max(len(seq) for seq in all_tokens)
-    padded_tokens = []
-    for seq in all_tokens:
-        pad_amount = max_len - len(seq)
-        seq_tensor = seq
+    # Pad target tokens (SMILES)
+    max_target_len = max(len(seq) for seq in target_tokens)
+    padded_target_tokens = []
+    for seq in target_tokens:
+        pad_amount = max_target_len - len(seq)
         if pad_amount > 0:
             pad_tensor = torch.full((pad_amount,), tokenizer.pad_token_id, dtype=torch.long)
-            seq_tensor = torch.cat([seq_tensor, pad_tensor], dim=0)
-        padded_tokens.append(seq_tensor)
-    token_batch = torch.stack(padded_tokens, dim=0)
+            seq = torch.cat([seq, pad_tensor], dim=0)
+        padded_target_tokens.append(seq)
+    target_batch = torch.stack(padded_target_tokens, dim=0)
 
-    def stack_data_and_domain(items):
-        """Stack data and domain tensors separately"""
-        if all(x[0] is None for x in items):
-            return None
-        
-        # Get valid shapes from first non-None item
-        first_valid = next((x for x in items if x[0] is not None), None)
-        if first_valid is None:
-            return None
+    # Pad NMR tokens
+    max_nmr_len = max(len(seq) for seq in nmr_tokens)
+    padded_nmr_tokens = []
+    for seq in nmr_tokens:
+        pad_amount = max_nmr_len - len(seq)
+        if pad_amount > 0:
+            pad_tensor = torch.full((pad_amount,), spectral_tokenizer["<PAD>"], dtype=torch.long)
+            seq = torch.cat([seq, pad_tensor], dim=0)
+        padded_nmr_tokens.append(seq)
+    nmr_batch = torch.stack(padded_nmr_tokens, dim=0)
 
-        # Prepare data and domain lists
-        data_list = []
-        domain_list = []
-        
-        for data_t, domain_t in items:
-            # Handle data
-            if data_t is None:
-                data_t = torch.zeros_like(first_valid[0])
-            data_list.append(data_t)
-            
-            # Handle domain
-            if domain_t is None:
-                domain_t = torch.zeros_like(first_valid[1]) if first_valid[1] is not None else None
-            domain_list.append(domain_t)
+    # Stack IR data if available
+    ir_batch = None
+    if ir_tuples[0] is not None:
+        # Extract just the IR tensors from the tuples (first element)
+        ir_tensors = [t[0] for t in ir_tuples if t[0] is not None]
+        if ir_tensors:
+            ir_batch = torch.stack(ir_tensors, dim=0)
 
-        # Stack data
-        data_batch = torch.nn.utils.rnn.pad_sequence(data_list, batch_first=True, padding_value=0.0)
-        
-        # Stack domain if available
-        domain_batch = None
-        if domain_list[0] is not None:
-            domain_batch = torch.nn.utils.rnn.pad_sequence(domain_list, batch_first=True, padding_value=0.0)
-            
-        return (data_batch, domain_batch)
-
-    # Stack each modality
-    ir_batch = stack_data_and_domain(all_ir)
-    h_nmr_batch = stack_data_and_domain(all_h_nmr)
-    c_nmr_batch = stack_data_and_domain(all_c_nmr)
-
-    return token_batch, ir_batch, h_nmr_batch, c_nmr_batch
+    return target_batch, ir_batch, nmr_batch, None
 
 
-def create_data_loaders(tokenizer, config):
+def load_vocabularies(config):
+    """Load both SMILES and NMR vocabularies and return their sizes"""
+    # Load NMR vocabulary
+    nmr_vocab_path = Path(config['data']['tokenized_dir']).parent / "vocab.json"
+    if not nmr_vocab_path.exists():
+        raise FileNotFoundError(f"NMR vocabulary not found at {nmr_vocab_path}")
+
+    with open(nmr_vocab_path) as f:
+        nmr_tokenizer = json.load(f)
+    
+    # Check the actual range of token IDs
+    token_ids = list(nmr_tokenizer.values())
+    min_id = min(token_ids)
+    max_id = max(token_ids)
+    nmr_vocab_size = max_id + 1  # Adjust vocab size to accommodate highest token ID
+    
+    print(f"[Vocab] Loaded NMR vocabulary with {len(nmr_tokenizer)} tokens")
+    print(f"[Vocab] NMR token ID range: [{min_id}, {max_id}]")
+    print(f"[Vocab] Setting NMR vocab size to: {nmr_vocab_size}")
+
+    # SMILES vocabulary size comes from the tokenizer
+    smiles_vocab_size = len(tokenizer)
+    print(f"[Vocab] SMILES vocabulary has {smiles_vocab_size} tokens")
+
+    return smiles_vocab_size, nmr_vocab_size, nmr_tokenizer
+
+
+def create_data_loaders(smiles_tokenizer, nmr_tokenizer, config):
     print("\n[DataLoader] Creating data loaders...")
 
-    # Always load from memory-mapped binaries
-    dataset = SpectralSmilesDataset(
-        data_dir=config['data']['binary_dir'],
-        tokenizer=tokenizer,
-        max_len=config['model']['max_seq_length']
+    # Create a collate function with the spectral tokenizer
+    collate_with_tokenizer = lambda batch: collate_fn(batch, nmr_tokenizer)
+
+    # Create datasets for each split with separate length limits
+    train_dataset = SpectralSmilesDataset(
+        data_dir=config['data']['tokenized_dir'],
+        smiles_tokenizer=smiles_tokenizer,
+        spectral_tokenizer=nmr_tokenizer,
+        split='train',
+        max_smiles_len=config['model']['max_seq_length'],
+        max_nmr_len=config['model']['max_nmr_length']
     )
 
-    print(f"[DataLoader] Total dataset size: {len(dataset)}")
-
-    # Split indices
-    print("[DataLoader] Splitting dataset into train/val/test...")
-    all_indices = list(range(len(dataset)))
-    train_val_indices, test_indices = train_test_split(
-        all_indices,
-        test_size=config['data'].get('test_size', 20),
-        random_state=42
-    )
-    train_indices, val_indices = train_test_split(
-        train_val_indices,
-        test_size=config['data'].get('val_size', 0.1),
-        random_state=42
+    val_dataset = SpectralSmilesDataset(
+        data_dir=config['data']['tokenized_dir'],
+        smiles_tokenizer=smiles_tokenizer,
+        spectral_tokenizer=nmr_tokenizer,
+        split='val',
+        max_smiles_len=config['model']['max_seq_length'],
+        max_nmr_len=config['model']['max_nmr_length']
     )
 
-    print(f"[DataLoader] Split sizes - Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
+    test_dataset = SpectralSmilesDataset(
+        data_dir=config['data']['tokenized_dir'],
+        smiles_tokenizer=smiles_tokenizer,
+        spectral_tokenizer=nmr_tokenizer,
+        split='test',
+        max_smiles_len=config['model']['max_seq_length'],
+        max_nmr_len=config['model']['max_nmr_length']
+    )
 
-    # Create loaders
-    print("[DataLoader] Creating train loader...")
+    print(f"[DataLoader] Dataset sizes:")
+    print(f"          Train: {len(train_dataset)}")
+    print(f"          Val: {len(val_dataset)}")
+    print(f"          Test: {len(test_dataset)}")
+
+    # Create data loaders with the wrapped collate function
     train_loader = DataLoader(
-        torch.utils.data.Subset(dataset, train_indices),
+        train_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn
+        num_workers=config['data'].get('num_workers', 0),
+        collate_fn=collate_with_tokenizer
     )
 
-    print("[DataLoader] Creating validation loader...")
     val_loader = DataLoader(
-        torch.utils.data.Subset(dataset, val_indices),
+        val_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        collate_fn=collate_fn
+        num_workers=config['data'].get('num_workers', 0),
+        collate_fn=collate_with_tokenizer
     )
 
-    print("[DataLoader] Creating test loader...")
     test_loader = DataLoader(
-        torch.utils.data.Subset(dataset, test_indices),
+        test_dataset,
         batch_size=config['training'].get('test_batch_size', 1),
         shuffle=False,
-        collate_fn=collate_fn
+        num_workers=config['data'].get('num_workers', 0),
+        collate_fn=collate_with_tokenizer
     )
 
-    print("[DataLoader] Data loaders created successfully")
     return train_loader, val_loader, test_loader
 
 
@@ -291,7 +296,9 @@ def load_config(config_path=None):
     """Load config from yaml file, falling back to defaults if not specified"""
     default_config = {
         'model': {
-            'max_seq_length': 128,
+            'max_seq_length': 512,      # Max SMILES sequence length
+            'max_nmr_length': 128,      # Max NMR sequence length
+            'max_memory_length': 128,   # Max memory/IR sequence length
             'embed_dim': 768,
             'num_heads': 8,
             'num_layers': 6,
@@ -315,9 +322,8 @@ def load_config(config_path=None):
             'warmup_steps': 100
         },
         'data': {
-            'binary_dir': "training_binaries",  # Path to .bin and .npy index
-            'test_size': 20,
-            'val_size': 0.1
+            'tokenized_dir': "tokenized_baseline/data",  # Path to tokenized data
+            'num_workers': 0
         },
         'wandb': {
             'project': "smiles-generation",
@@ -358,6 +364,10 @@ def main():
     config = load_config(args.config)
     print("[Main] Configuration loaded.")
 
+    # Load vocabularies first
+    print("\n[Main] Loading vocabularies...")
+    smiles_vocab_size, nmr_vocab_size, nmr_tokenizer = load_vocabularies(config)
+
     print("\n[Main] Setting up device...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.cuda.is_available():
@@ -369,10 +379,12 @@ def main():
     print(f"[Main] Using device: {device}")
 
     print("\n[Main] Initializing model...")
-    from models.multimodal_to_smiles import MultiModalToSMILESModel
     model = MultiModalToSMILESModel(
-        vocab_size=len(tokenizer),
+        smiles_vocab_size=smiles_vocab_size,
+        nmr_vocab_size=nmr_vocab_size,
         max_seq_length=config['model']['max_seq_length'],
+        max_nmr_length=config['model']['max_nmr_length'],
+        max_memory_length=config['model']['max_memory_length'],
         embed_dim=config['model']['embed_dim'],
         num_heads=config['model']['num_heads'],
         num_layers=config['model']['num_layers'],
@@ -380,10 +392,10 @@ def main():
         verbose=False
     ).to(device)
 
-
     print("\n[Main] Creating data loaders...")
     train_loader, val_loader, test_loader = create_data_loaders(
-        tokenizer=tokenizer,
+        smiles_tokenizer=tokenizer,
+        nmr_tokenizer=nmr_tokenizer,  # Pass the loaded tokenizer
         config=config
     )
 
@@ -420,7 +432,14 @@ def main():
     print(f"[Main] Model size: {param_size_mb:.2f} MB")
 
     print("\n[Main] Setting up training components...")
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    # Create weight tensor that zeros out SEP token and keeps others at 1.0
+    weights = torch.ones(len(tokenizer))
+    weights[tokenizer.sep_token_id] = 0.0
+    
+    criterion = nn.CrossEntropyLoss(
+        weight=weights.to(device),
+        ignore_index=tokenizer.pad_token_id
+    )
     optimizer = optim.AdamW(model.parameters(), lr=config['training']['learning_rate'])
     scheduler = LinearWarmupConstantLR(optimizer, warmup_steps=config['scheduler']['warmup_steps'])
 
@@ -440,54 +459,55 @@ def main():
         model.eval()
         total_loss = 0.0
         total_batches = 0
-        all_details = []
+        predictions = []
+        targets = []
         
         with torch.no_grad():
-            for tokens, ir, h_nmr, c_nmr in loader:
-                tokens = tokens.to(device)
-                if ir is not None:
-                    ir = (ir[0].to(device), ir[1].to(device) if ir[1] is not None else None)
-                if h_nmr is not None:
-                    h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device) if h_nmr[1] is not None else None)
-                if c_nmr is not None:
-                    c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device) if c_nmr[1] is not None else None)
+            for target_tokens, ir_data, nmr_tokens, _ in loader:
+                target_tokens = target_tokens.to(device)
+                if ir_data is not None:
+                    ir_data = ir_data.to(device)
+                if nmr_tokens is not None:
+                    nmr_tokens = nmr_tokens.to(device)
 
-                T = tokens.size(1)
-                mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tokens.device), 1)
+                T = target_tokens.size(1)
+                mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=target_tokens.device), 1)
                 
                 logits = model(
-                    nmr_data=h_nmr,
-                    ir_data=ir,
-                    c_nmr_data=c_nmr,
-                    target_seq=tokens[:, :-1],
+                    nmr_tokens=nmr_tokens,
+                    ir_data=ir_data,
+                    target_seq=target_tokens[:, :-1],
                     target_mask=mask[:-1, :-1]
                 )
-                loss = criterion(logits.reshape(-1, logits.size(-1)), tokens[:, 1:].reshape(-1))
+                loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
                 total_loss += loss.item()
                 total_batches += 1
 
                 # Convert logits to predictions for logging
                 pred_tokens = logits.argmax(dim=-1).cpu().tolist()
-                tgt_tokens = tokens[:, 1:].cpu().tolist()  # Skip BOS token
+                tgt_tokens = target_tokens[:, 1:].cpu().tolist()  # Skip BOS token
 
-                # Decode from token IDs to SMILES strings
-                preds_decoded = [tokenizer.decode(p) for p in pred_tokens]
-                targets_decoded = [tokenizer.decode(t) for t in tgt_tokens]
-
-                # Evaluate predictions vs. targets
-                details = evaluate_predictions(preds_decoded, targets_decoded, verbose=False)
-                all_details.extend(details)
+                # Decode from token IDs to SMILES strings and clean up special tokens
+                preds_decoded = [tokenizer.decode(p).replace('[SEP]', '').replace('[PAD]', '').strip() 
+                               for p in pred_tokens]
+                targets_decoded = [tokenizer.decode(t).replace('[SEP]', '').replace('[PAD]', '').strip() 
+                                 for t in tgt_tokens]
+                
+                predictions.extend(preds_decoded)
+                targets.extend(targets_decoded)
         
         val_loss = total_loss / max(total_batches, 1)
-        metrics_dict = aggregate_metrics(all_details)
         
-        # Keep a subset of valid results for logging
-        valid_set = [d for d in all_details if d['valid'] and d['valid_target']]
-        metrics_dict['valid_set'] = valid_set[:100]  # store up to 100 examples
-        metrics_dict['val_loss'] = val_loss
-
-        return metrics_dict
+        # Create metrics dictionary with the expected structure
+        metrics = {
+            'val_loss': val_loss,
+            'predictions': predictions,
+            'targets': targets,
+            'num_samples': len(predictions)
+        }
+        
+        return metrics
 
     wandb_table = None
 
@@ -503,26 +523,24 @@ def main():
 
         pbar = tqdm(train_loader, total=len(train_loader), desc="Training", dynamic_ncols=True)
         for batch in pbar:
-            tokens, ir, h_nmr, c_nmr = batch
-            tokens = tokens.to(device)
-            if ir is not None:
-                ir = (ir[0].to(device), ir[1].to(device) if ir[1] is not None else None)
-            if h_nmr is not None:
-                h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device) if h_nmr[1] is not None else None)
-            if c_nmr is not None:
-                c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device) if c_nmr[1] is not None else None)
+            target_tokens, ir_data, nmr_tokens, _ = batch
+            
+            target_tokens = target_tokens.to(device)
+            if ir_data is not None:
+                ir_data = ir_data.to(device)
+            if nmr_tokens is not None:
+                nmr_tokens = nmr_tokens.to(device)
 
-            T = tokens.size(1)
-            mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tokens.device), 1)
+            T = target_tokens.size(1)
+            mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=target_tokens.device), 1)
             
             logits = model(
-                nmr_data=h_nmr,
-                ir_data=ir,
-                c_nmr_data=c_nmr,
-                target_seq=tokens[:, :-1],
+                nmr_tokens=nmr_tokens,
+                ir_data=ir_data,
+                target_seq=target_tokens[:, :-1],
                 target_mask=mask[:-1, :-1]
             )
-            loss = criterion(logits.reshape(-1, logits.size(-1)), tokens[:, 1:].reshape(-1))
+            loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
 
             optimizer.zero_grad()
             loss.backward()
@@ -547,12 +565,30 @@ def main():
                 val_metrics = validate(model, val_loader, criterion, tokenizer, device)
                 
                 # Initialize wandb table if needed
-                if wandb_table is None and val_metrics['valid_set']:
-                    columns = ["global_step"] + list(val_metrics['valid_set'][0].keys())
+                if wandb_table is None and val_metrics['predictions']:
+                    columns = ["global_step", "prediction", "target", "exact_match"]
                     wandb_table = wandb.Table(columns=columns)
                 
                 # Log results
-                log_results(val_metrics, global_step, wandb_table, prefix="val")
+                if val_metrics['predictions']:
+                    for pred, tgt in zip(val_metrics['predictions'][:10], val_metrics['targets'][:10]):
+                        wandb_table.add_data(
+                            global_step,
+                            pred,
+                            tgt,
+                            pred.strip() == tgt.strip()
+                        )
+                
+                # Log metrics
+                wandb.log({
+                    "val_loss": val_metrics['val_loss'],
+                    "val_exact_matches": sum(p.strip() == t.strip() 
+                                           for p, t in zip(val_metrics['predictions'], 
+                                                 val_metrics['targets'])) / val_metrics['num_samples'],
+                    "val_examples": wandb_table,
+                    "global_step": global_step
+                }, step=global_step)
+                
                 print(f"[Val] Loss: {val_metrics['val_loss']:.4f}")
 
                 if val_metrics['val_loss'] < best_val_loss:
