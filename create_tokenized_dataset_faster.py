@@ -14,119 +14,124 @@ import uuid
 import json
 import os
 
-def split_data(data: pd.DataFrame, seed: int, val_size: float = 0.002) -> Tuple[pd.DataFrame]:
+################################################################################
+# Utility functions
+################################################################################
+
+def split_data(data: pd.DataFrame, seed: int, val_size: float = 0.002) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Split data into train/test/val sets."""
     train, test = train_test_split(data, test_size=0.001, random_state=seed, shuffle=True)
     train, val = train_test_split(train, test_size=val_size, random_state=seed, shuffle=True)
     return train, test, val
 
+
 def tokenize_formula(formula: str) -> str:
     """Tokenize molecular formula with spaces between atoms/numbers."""
-    return ' '.join(re.findall("[A-Z][a-z]?|\d+|.", formula)) + ' '
+    return ' '.join(re.findall(r"[A-Z][a-z]?|\d+|.", formula)) + ' '
+
 
 def process_hnmr(multiplets: List[Dict[str, Union[str, float, int]]]) -> str:
     """Process H-NMR multiplets into a tokenized string."""
-    multiplet_str = "1HNMR "
+    parts = ["1HNMR"]
     for peak in multiplets:
         range_max = float(peak["rangeMax"]) 
         range_min = float(peak["rangeMin"]) 
-
-        formatted_peak = "{:.2f} {:.2f} {} {}H ".format(
-            range_max, 
-            range_min,
-            peak["category"],
-            peak["nH"]
-        )
+        peak_str = f"{range_max:.2f} {range_min:.2f} {peak['category']} {peak['nH']}H"
         
         js = str(peak["j_values"])
         if js != "None":
             split_js = js.split("_")
             split_js = list(filter(None, split_js))
-            processed_js = ["{:.2f}".format(float(j)) for j in split_js]
-            formatted_js = "J " + " ".join(processed_js)
-            formatted_peak += formatted_js
+            processed_js = [f"{float(j):.2f}" for j in split_js]
+            j_part = "J " + " ".join(processed_js)
+            peak_str += " " + j_part
 
-        multiplet_str += formatted_peak.strip() + " | "
+        parts.append(peak_str)
+    return " | ".join(parts)
 
-    return multiplet_str[:-2]  # Remove last separator
 
 def process_cnmr(carbon_nmr: List[Dict[str, Union[str, float, int]]]) -> str:
     """Process C-NMR peaks into a tokenized string."""
-    nmr_string = "13CNMR "
+    parts = ["13CNMR"]
     for peak in carbon_nmr:
-        nmr_string += str(round(float(peak["delta (ppm)"]), 1)) + " "
-    return nmr_string
+        val = round(float(peak["delta (ppm)"]), 1)
+        parts.append(str(val))
+    return " ".join(parts)
 
-def process_ir(ir: np.ndarray, tokenize: bool = False, interpolation_points: int = 1000) -> Union[tuple[np.ndarray, np.ndarray], str]:
-    """Process IR spectrum with cubic spline interpolation (falls back to linear)."""
-    # Load the actual domain from spectrum_dimensions.json
-    dimensions_path = os.path.join('data_extraction', 'multimodal_spectroscopic_dataset', 
-                                 'meta_data', 'spectrum_dimensions.json')
-    with open(dimensions_path, 'r') as f:
-        spectrum_dims = json.load(f)
-    original_x = np.array(spectrum_dims['ir_spectra']['dimensions'])
-    
-    if tokenize:
-        # Original tokenization logic for text format
-        interpolation_x = np.linspace(min(original_x), max(original_x), interpolation_points)
-        interp = interp1d(original_x, ir)
-        interp_ir = interp(interpolation_x)
-        
-        # Normalize to 0-100 range
-        interp_ir = interp_ir + abs(min(interp_ir))
-        interp_ir = (interp_ir / max(interp_ir)) * 100 
-        interp_ir = np.round(interp_ir, decimals=0).astype(int).astype(str)
-        return 'IR ' + ' '.join(interp_ir) + ' '
-    else:
-        # Interpolate for model input using the actual domain range
-        target_x = np.linspace(min(original_x), max(original_x), interpolation_points)
-        
-        try:
-            # Try cubic spline first
-            if len(original_x) > 3:  # Need at least 4 points for cubic
-                eps = 1e-10
-                if not np.any(np.diff(original_x) < eps):
-                    f = interp1d(original_x, ir, kind='cubic', bounds_error=False, fill_value=0)
-                    interp_ir = f(target_x)
-                    # Normalize
-                    non_zero = interp_ir != 0
-                    if non_zero.any():
-                        min_val = np.min(interp_ir[non_zero])
-                        max_val = np.max(interp_ir[non_zero])
-                        if not np.isclose(min_val, max_val):
-                            interp_ir[non_zero] = (interp_ir[non_zero] - min_val) / (max_val - min_val)
-                    return interp_ir
-        except:
-            pass  # Fall through to linear interpolation
-            
-        # Linear interpolation as fallback
+
+def process_ir(
+    ir: np.ndarray,
+    original_x: np.ndarray,
+    tokenize: bool = False,
+    interpolation_points: int = 1000
+) -> Union[np.ndarray, str]:
+    """
+    Process IR spectrum with interpolation.
+
+    - If tokenize=True, returns a string tokenization (0–100 scaling).
+    - Otherwise returns a float numpy array normalized row by row.
+    """
+    # Pre-build target_x (only do it once if you prefer; done here for clarity)
+    target_x = np.linspace(original_x[0], original_x[-1], interpolation_points)
+
+    try:
+        # Try a linear interpolation
         f = interp1d(original_x, ir, kind='linear', bounds_error=False, fill_value=0)
         interp_ir = f(target_x)
+    except Exception:
+        # Fall back if needed
+        interp_ir = np.zeros_like(target_x)
+
+    if tokenize:
+        # Normalize to 0-100
+        interp_ir = interp_ir + abs(min(interp_ir))
+        max_val = np.max(interp_ir)
+        if max_val > 0:
+            interp_ir = (interp_ir / max_val) * 100
         
-        # Normalize
-        non_zero = interp_ir != 0
+        # Round and convert to int -> string
+        interp_ir = np.round(interp_ir, 0).astype(int).astype(str)
+        return 'IR ' + ' '.join(interp_ir) + ' '
+    else:
+        # For model input as continuous array:
+        # Normalize only non-zero portion (avoid dividing by zero on the entire array).
+        non_zero = (interp_ir != 0)
         if non_zero.any():
             min_val = np.min(interp_ir[non_zero])
             max_val = np.max(interp_ir[non_zero])
             if not np.isclose(min_val, max_val):
                 interp_ir[non_zero] = (interp_ir[non_zero] - min_val) / (max_val - min_val)
-        
         return interp_ir
+
 
 def process_msms(msms: List[List[float]]) -> str:
     """Process MS/MS peaks into a tokenized string."""
-    msms_string = ''
+    parts = []
     for peak in msms:
-        msms_string = msms_string + "{:.1f} {:.1f} ".format(
-            round(peak[0], 1), round(peak[1], 1)
-        )
-    return msms_string
+        mz = round(peak[0], 1)
+        intensity = round(peak[1], 1)
+        parts.append(f"{mz} {intensity}")
+    return " ".join(parts)
 
-def process_parquet_file(parquet_file: Path, h_nmr: bool, c_nmr: bool, ir: bool, 
-                        pos_msms: bool, neg_msms: bool, formula: bool, tokenize_ir: bool = False) -> pd.DataFrame:
+
+################################################################################
+# Core parquet processing
+################################################################################
+
+def process_parquet_file(
+    parquet_file: Path,
+    h_nmr: bool,
+    c_nmr: bool,
+    ir: bool,
+    pos_msms: bool,
+    neg_msms: bool,
+    formula: bool,
+    original_x: np.ndarray,
+    tokenize_ir: bool = False
+) -> pd.DataFrame:
     """
     Process a single parquet file in chunks (row groups),
-    returning a DataFrame containing tokenized results or raw IR.
+    returning a DataFrame containing tokenized results or raw IR arrays.
     """
     parquet_obj = pq.ParquetFile(parquet_file)
     
@@ -144,57 +149,63 @@ def process_parquet_file(parquet_file: Path, h_nmr: bool, c_nmr: bool, ir: bool,
 
     row_group_results = []
 
-    # Read each row group so we don't load the entire file into memory at once
     for rg_idx in tqdm(range(parquet_obj.num_row_groups), desc=f"Processing {parquet_file.name}"):
         table = parquet_obj.read_row_group(rg_idx, columns=columns)
         chunk_df = table.to_pandas()
-        
+
         chunk_results = []
-        for i in range(len(chunk_df)):
-            row = chunk_df.iloc[i]
-            tokenized_formula_str = tokenize_formula(row['molecular_formula']) if formula else ''
-            tokenized_input = tokenized_formula_str
+        for row in chunk_df.itertuples(index=False):
+            # Build tokenized input as a list, then join at the end
+            token_parts = []
 
+            # Add formula
+            if formula:
+                token_parts.append(tokenize_formula(row.molecular_formula))
+
+            # Add H-NMR
             if h_nmr:
-                h_nmr_string = process_hnmr(row['h_nmr_peaks'])
-                tokenized_input += h_nmr_string
+                h_nmr_string = process_hnmr(row.h_nmr_peaks)
+                token_parts.append(h_nmr_string)
 
+            # Add C-NMR
             if c_nmr:
-                c_nmr_string = process_cnmr(row['c_nmr_peaks'])
-                tokenized_input += c_nmr_string
+                c_nmr_string = process_cnmr(row.c_nmr_peaks)
+                token_parts.append(c_nmr_string)
 
+            # IR: either tokenize or store in a separate column
             if ir:
-                ir_data = process_ir(row['ir_spectra'], tokenize=tokenize_ir)
+                ir_data = process_ir(row.ir_spectra, original_x, tokenize=tokenize_ir)
                 if tokenize_ir:
-                    # Add the tokenized IR to the string
-                    tokenized_input += ir_data
+                    token_parts.append(ir_data)
                 else:
-                    # Store raw IR data in a separate column
+                    # We'll store the IR array in a separate column, skip final chunk append
                     chunk_results.append({
-                        'source': tokenized_input.strip(),
-                        'target': ' '.join(tokenize_smiles(row['smiles'])),
+                        'source': " ".join(token_parts).strip(),
+                        'target': ' '.join(tokenize_smiles(row.smiles)),
                         'ir_data': ir_data
                     })
-                    continue  # Move on
+                    continue
 
+            # Positive MS/MS
             if pos_msms:
-                pos_msms_string = ''
-                pos_msms_string += "E0Pos " + process_msms(row["msms_positive_10ev"])
-                pos_msms_string += "E1Pos " + process_msms(row["msms_positive_20ev"])
-                pos_msms_string += "E2Pos " + process_msms(row["msms_positive_40ev"])
-                tokenized_input += pos_msms_string
+                pos_msms_string = []
+                pos_msms_string.append("E0Pos " + process_msms(row.msms_positive_10ev))
+                pos_msms_string.append("E1Pos " + process_msms(row.msms_positive_20ev))
+                pos_msms_string.append("E2Pos " + process_msms(row.msms_positive_40ev))
+                token_parts.append(" ".join(pos_msms_string))
 
+            # Negative MS/MS
             if neg_msms:
-                neg_msms_string = ''
-                neg_msms_string += "E0Neg " + process_msms(row["msms_negative_10ev"])
-                neg_msms_string += "E1Neg " + process_msms(row["msms_negative_20ev"])
-                neg_msms_string += "E2Neg " + process_msms(row["msms_negative_40ev"])
-                tokenized_input += neg_msms_string
+                neg_msms_string = []
+                neg_msms_string.append("E0Neg " + process_msms(row.msms_negative_10ev))
+                neg_msms_string.append("E1Neg " + process_msms(row.msms_negative_20ev))
+                neg_msms_string.append("E2Neg " + process_msms(row.msms_negative_40ev))
+                token_parts.append(" ".join(neg_msms_string))
 
-            # If we've tokenized IR, or if IR isn't included, store the normal data
+            # If IR was tokenized or IR not included, store text result
             chunk_results.append({
-                'source': tokenized_input.strip(),
-                'target': ' '.join(tokenize_smiles(row['smiles']))
+                'source': " ".join(token_parts).strip(),
+                'target': ' '.join(tokenize_smiles(row.smiles))
             })
 
         if chunk_results:
@@ -203,66 +214,70 @@ def process_parquet_file(parquet_file: Path, h_nmr: bool, c_nmr: bool, ir: bool,
     if row_group_results:
         return pd.concat(row_group_results, ignore_index=True)
     else:
-        # In case the file had no data or columns
         return pd.DataFrame(columns=['source','target','ir_data'])
 
+
 def save_set(data_set: pd.DataFrame, out_path: Path, set_type: str, pred_spectra: bool) -> None:
-    """Save tokenized data to files."""
+    """Save tokenized data (and IR arrays if present) to disk."""
     out_path.mkdir(parents=True, exist_ok=True)
 
-    smiles = list(data_set.target)
-    spectra = list(data_set.source)
+    smiles_list = list(data_set['target'])
+    spectra_list = list(data_set['source'])
 
     # Write source file
     with (out_path / f"src-{set_type}.txt").open("w") as f:
-        src = smiles if pred_spectra else spectra
-        for item in src:
-            f.write(f"{item}\n")
+        if pred_spectra:
+            for smi in smiles_list:
+                f.write(f"{smi}\n")
+        else:
+            for spec in spectra_list:
+                f.write(f"{spec}\n")
     
     # Write target file
     with (out_path / f"tgt-{set_type}.txt").open("w") as f:
-        tgt = spectra if pred_spectra else smiles
-        for item in tgt:
-            f.write(f"{item}\n")
+        if pred_spectra:
+            for spec in spectra_list:
+                f.write(f"{spec}\n")
+        else:
+            for smi in smiles_list:
+                f.write(f"{smi}\n")
 
-    # Save IR data if it exists
+    # Save IR data if it exists in this split
     if 'ir_data' in data_set.columns:
         print(f"Saving IR data for {set_type} set...")
-        
-        # Process IR data in batches to avoid memory issues
+
         BATCH_SIZE = 1000
         total_rows = len(data_set)
-        
-        # Create the .npy file and get its shape from first batch
+
+        # Build a small initial batch to determine shape
         first_batch = []
         for i in range(min(BATCH_SIZE, total_rows)):
             ir_data = data_set.ir_data.iloc[i]
-            if isinstance(ir_data, (np.ndarray, list)):
+            if isinstance(ir_data, np.ndarray):
+                first_batch.append(ir_data)
+            elif isinstance(ir_data, list):
                 first_batch.append(np.array(ir_data))
-            elif isinstance(ir_data, str):
+            else:
+                # Attempt to parse from string if needed (rare)
                 try:
-                    ir_data = ir_data.strip('[]')
-                    ir_array = np.fromstring(ir_data, sep=' ')
-                    if len(ir_array) > 0:
-                        first_batch.append(ir_array)
+                    arr = np.fromstring(ir_data.strip('[]'), sep=' ')
+                    if len(arr) > 0:
+                        first_batch.append(arr)
                 except Exception as e:
                     print(f"Warning: Could not parse IR data: {e}")
-                    continue
-        
+
         if not first_batch:
             print(f"Warning: No valid IR data found for {set_type} set")
             return
-            
-        # Get the target shape from first batch
+        
+        # Stack the first batch to determine shape
         first_batch = np.stack(first_batch)
         array_shape = (total_rows, first_batch.shape[1])
-        
+
         # Create memory-mapped array
         fp = np.memmap(out_path / f"ir-{set_type}.npy", dtype='float32', mode='w+', shape=array_shape)
-        
-        # Write first batch
         fp[:len(first_batch)] = first_batch
-        
+
         # Process remaining data in batches
         for start_idx in range(BATCH_SIZE, total_rows, BATCH_SIZE):
             end_idx = min(start_idx + BATCH_SIZE, total_rows)
@@ -271,28 +286,35 @@ def save_set(data_set: pd.DataFrame, out_path: Path, set_type: str, pred_spectra
             batch = []
             for i in range(start_idx, end_idx):
                 ir_data = data_set.ir_data.iloc[i]
-                if isinstance(ir_data, (np.ndarray, list)):
+                if isinstance(ir_data, np.ndarray):
+                    batch.append(ir_data)
+                elif isinstance(ir_data, list):
                     batch.append(np.array(ir_data))
-                elif isinstance(ir_data, str):
+                else:
+                    # Attempt string parse
                     try:
-                        ir_data = ir_data.strip('[]')
-                        ir_array = np.fromstring(ir_data, sep=' ')
-                        if len(ir_array) > 0:
-                            batch.append(ir_array)
+                        arr = np.fromstring(ir_data.strip('[]'), sep=' ')
+                        if len(arr) > 0:
+                            batch.append(arr)
+                        else:
+                            batch.append(np.zeros(first_batch.shape[1]))
                     except Exception as e:
                         print(f"Warning: Could not parse IR data at index {i}: {e}")
-                        # Fill with zeros if parsing fails
-                        batch.append(np.zeros(array_shape[1]))
+                        batch.append(np.zeros(first_batch.shape[1]))
             
             if batch:
                 batch_array = np.stack(batch)
                 fp[start_idx:end_idx] = batch_array
-        
+
         # Flush changes to disk
         fp.flush()
-        del fp  # Close the memmap
-        
+        del fp
         print(f"Saved {total_rows} IR spectra with shape {array_shape}")
+
+
+################################################################################
+# Main CLI
+################################################################################
 
 @click.command()
 @click.option(
@@ -340,28 +362,41 @@ def main(
     """
     print("\nProcessing analytical data...")
 
-    # Create a temporary directory locally within the output path
-    temp_dir = out_path / f"temp_{uuid.uuid4().hex}"
+    # If IR is requested, read spectrum_dimensions.json once
+    if ir:
+        dimensions_path = os.path.join(
+            'data_extraction', 'multimodal_spectroscopic_dataset', 
+            'meta_data', 'spectrum_dimensions.json'
+        )
+        with open(dimensions_path, 'r') as f:
+            spectrum_dims = json.load(f)
+        original_x = np.array(spectrum_dims['ir_spectra']['dimensions'])
+    else:
+        original_x = None
+
+    # Temporary dir for intermediate chunk results
+    temp_dir = Path(tempfile.gettempdir()) / f"tokenized_{uuid.uuid4().hex}"
     temp_dir.mkdir(parents=True, exist_ok=True)
     print(f"Temporary chunk results will be stored in: {temp_dir}")
 
-    # 1) For each parquet, process row-groups and store the results into chunk-based files
+    # 1) Process each Parquet file
     chunk_files = []
     parquet_files = list(analytical_data.glob("*.parquet"))
-    
     if test_mode:
         print("Running in test mode - processing only first 3 files")
         parquet_files = parquet_files[:3]
-    
+
     for parquet_file in parquet_files:
         print(f"\nProcessing {parquet_file.name}...")
-        df_chunk = process_parquet_file(parquet_file, h_nmr, c_nmr, ir, pos_msms, neg_msms, formula, tokenize_ir)
-        # Write each parquet's result to a temporary CSV (or parquet) on disk
+        df_chunk = process_parquet_file(
+            parquet_file, h_nmr, c_nmr, ir, pos_msms, neg_msms,
+            formula, original_x, tokenize_ir
+        )
         chunk_file = temp_dir / f"{parquet_file.stem}_{uuid.uuid4().hex}.csv"
         df_chunk.to_csv(chunk_file, index=False)
         chunk_files.append(chunk_file)
 
-    # 2) Load all chunk-files back into a single DataFrame
+    # 2) Combine chunk files
     print("\nCombining chunk files...")
     tokenised_data_list = []
     for cfile in chunk_files:
@@ -387,11 +422,10 @@ def main(
     print(f"\nTokenized data saved to {out_data_path}")
     print(f"Cleaning up temp directory {temp_dir}...")
 
-    # If desired, remove temporary directory with all chunk files
     import shutil
     shutil.rmtree(temp_dir, ignore_errors=True)
     print("Done.")
 
+
 if __name__ == '__main__':
     main()
-#python create_tokenized_dataset_smallram.py --analytical_data "data_extraction/multimodal_spectroscopic_dataset" --out_path "tokenized_baseline" --h_nmr --c_nmr --ir --formula

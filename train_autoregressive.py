@@ -99,12 +99,31 @@ class SpectralSmilesDataset(Dataset):
         with open(self.data_dir / f"tgt-{split}.txt") as f:
             self.targets = [line.strip() for line in f]
 
-        # Optionally load IR data if available
+        # Load IR data using numpy.memmap instead of pickle
         ir_path = self.data_dir / f"ir-{split}.npy"
         self.ir_data = None
         if ir_path.exists():
-            self.ir_data = np.load(ir_path)
-            print(f"[Dataset] Loaded IR data with shape: {self.ir_data.shape}")
+            try:
+                # Use memmap to load the IR data
+                self.ir_data = np.memmap(
+                    ir_path,
+                    dtype='float32',
+                    mode='r',
+                    shape=None  # Let numpy figure out the shape
+                )
+                # Get the actual shape from the memmap
+                array_shape = self.ir_data.shape
+                # Reshape if needed (should be 2D: [num_samples, features])
+                if len(array_shape) == 1:
+                    # Calculate number of samples based on total size and feature dimension
+                    num_samples = len(self.sources)
+                    feature_dim = array_shape[0] // num_samples
+                    self.ir_data = self.ir_data.reshape(num_samples, feature_dim)
+                
+                print(f"[Dataset] Loaded IR data with shape: {self.ir_data.shape}")
+            except Exception as e:
+                print(f"[Warning] Failed to load IR data: {e}")
+                self.ir_data = None
 
         print(f"[Dataset] SpectralSmilesDataset initialized for {split}:")
         print(f"          Found {len(self.sources)} samples")
@@ -137,17 +156,23 @@ class SpectralSmilesDataset(Dataset):
             nmr_token_ids = nmr_token_ids[:self.max_nmr_len]
         nmr_tokens = torch.tensor(nmr_token_ids, dtype=torch.long)
 
-        # Get IR data if available
+        # Get IR data if available - modify to handle memmap
         ir_data = None
         if self.ir_data is not None:
-            ir_data = torch.tensor(self.ir_data[idx], dtype=torch.float32)
+            # Copy the data from memmap to a regular tensor
+            ir_data = torch.tensor(self.ir_data[idx].copy(), dtype=torch.float32)
 
         return (
             target_tokens,
-            (ir_data, None),  # IR data and domain
-            nmr_tokens,       # Tokenized NMR data
-            None             # Placeholder for consistency
+            (ir_data, None),
+            nmr_tokens,
+            None
         )
+
+    # Add cleanup method to properly close memmap file
+    def __del__(self):
+        if hasattr(self, 'ir_data') and self.ir_data is not None:
+            del self.ir_data
 
 
 # -------------------------------------------------------------------------
@@ -499,15 +524,24 @@ def main():
         
         val_loss = total_loss / max(total_batches, 1)
         
-        # Create metrics dictionary with the expected structure
-        metrics = {
+        # Calculate molecular metrics using logging_utils
+        detailed_results = evaluate_predictions(predictions, targets)
+        metrics = aggregate_metrics(detailed_results)
+        
+        # Combine all metrics
+        combined_metrics = {
             'val_loss': val_loss,
-            'predictions': predictions,
-            'targets': targets,
+            'valid_smiles_rate': metrics['valid_smiles'],
+            'exact_match_rate': metrics['exact_match'],
+            'tanimoto_similarity': metrics['avg_tanimoto'],
+            'mcs_ratio': metrics['avg_#mcs/#target'],
+            'ecfp6_iou': metrics['avg_ecfp6_iou'],
+            'predictions': predictions[:10],  # Store first 10 examples
+            'targets': targets[:10],
             'num_samples': len(predictions)
         }
         
-        return metrics
+        return combined_metrics
 
     wandb_table = None
 
@@ -565,26 +599,34 @@ def main():
                 val_metrics = validate(model, val_loader, criterion, tokenizer, device)
                 
                 # Initialize wandb table if needed
-                if wandb_table is None and val_metrics['predictions']:
-                    columns = ["global_step", "prediction", "target", "exact_match"]
+                if wandb_table is None:
+                    columns = ["global_step", "prediction", "target", "exact_match", 
+                              "tanimoto", "mcs_ratio", "ecfp6_iou"]
                     wandb_table = wandb.Table(columns=columns)
                 
                 # Log results
                 if val_metrics['predictions']:
                     for pred, tgt in zip(val_metrics['predictions'][:10], val_metrics['targets'][:10]):
+                        # Calculate metrics for this pair
+                        pair_results = evaluate_predictions([pred], [tgt])[0]
                         wandb_table.add_data(
                             global_step,
                             pred,
                             tgt,
-                            pred.strip() == tgt.strip()
+                            pair_results['exact_match'],
+                            pair_results['tanimoto'],
+                            pair_results['#mcs/#target'],
+                            pair_results['ecfp6_iou']
                         )
                 
                 # Log metrics
                 wandb.log({
                     "val_loss": val_metrics['val_loss'],
-                    "val_exact_matches": sum(p.strip() == t.strip() 
-                                           for p, t in zip(val_metrics['predictions'], 
-                                                 val_metrics['targets'])) / val_metrics['num_samples'],
+                    "val_valid_smiles": val_metrics['valid_smiles_rate'],
+                    "val_exact_matches": val_metrics['exact_match_rate'],
+                    "val_tanimoto": val_metrics['tanimoto_similarity'],
+                    "val_mcs_ratio": val_metrics['mcs_ratio'],
+                    "val_ecfp6_iou": val_metrics['ecfp6_iou'],
                     "val_examples": wandb_table,
                     "global_step": global_step
                 }, step=global_step)
