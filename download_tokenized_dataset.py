@@ -14,7 +14,7 @@ import shutil
 )
 @click.option(
     "--repo_id",
-    default="datasets/Tomoqt/tokenized_NMR_resample1000",
+    default="Tomoqt/tokenized_NMR_resample1000",
     help="Hugging Face repository ID"
 )
 @click.option(
@@ -28,7 +28,7 @@ def main(output_path: Path, repo_id: str, filename: str):
     The dataset will be extracted to output_path/data/ to match
     the organization used in create_tokenized_dataset_faster.py
     """
-    print(f"Downloading dataset from {repo_id}...")
+    print(f"Downloading dataset from {repo_id} (dataset repository)...")
     
     # Create temporary directory for download
     temp_dir = Path("temp_download")
