@@ -14,7 +14,7 @@ import shutil
 )
 @click.option(
     "--repo_id",
-    default="Tomoqt/tokenized_NMR_resample1000",
+    default="datasets/Tomoqt/tokenized_NMR_resample1000",
     help="Hugging Face repository ID"
 )
 @click.option(
@@ -39,7 +39,8 @@ def main(output_path: Path, repo_id: str, filename: str):
         downloaded_file = hf_hub_download(
             repo_id=repo_id,
             filename=filename,
-            local_dir=temp_dir
+            local_dir=temp_dir,
+            repo_type="dataset"
         )
         
         print("Download complete. Extracting...")
