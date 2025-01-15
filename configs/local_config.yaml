@@ -12,7 +12,7 @@ model:
 
 # Training Parameters
 training:
-  batch_size: 48
+  batch_size: 32
   test_batch_size: 1
   num_epochs: 10
   learning_rate: 1.0e-4
