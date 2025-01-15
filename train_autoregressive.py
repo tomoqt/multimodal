@@ -544,18 +544,18 @@ def main():
                 pred_tokens = logits.argmax(dim=-1).cpu().tolist()
                 tgt_tokens = target_tokens[:, 1:].cpu().tolist()
                 
-                # Decode predictions, including SEP token as it marks sequence end
+                # Decode predictions, including SEP token as sequence end marker
                 for pred_seq in pred_tokens:
                     # Find the first occurrence of SEP token if it exists
                     try:
                         sep_idx = pred_seq.index(tokenizer.sep_token_id)
-                        # Include SEP token in the sequence
-                        pred_seq = pred_seq[:sep_idx + 1]
+                        # Include SEP token in sequence but don't decode it
+                        pred_seq = pred_seq[:sep_idx]  # Don't include SEP in final string
                     except ValueError:
                         # No SEP token found, use full sequence
                         pass
                         
-                    # Decode the sequence including SEP
+                    # Decode the sequence (SEP was used to mark end but isn't included)
                     decoded = tokenizer.decode(pred_seq).strip()
                     predictions.append(decoded)
 
@@ -563,7 +563,7 @@ def main():
                 for tgt_seq in tgt_tokens:
                     try:
                         sep_idx = tgt_seq.index(tokenizer.sep_token_id)
-                        tgt_seq = tgt_seq[:sep_idx + 1]  # Include SEP
+                        tgt_seq = tgt_seq[:sep_idx]  # Don't include SEP in final string
                     except ValueError:
                         pass
                     decoded = tokenizer.decode(tgt_seq).strip()
