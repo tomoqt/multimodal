@@ -501,14 +501,21 @@ def main():
                 )
                 loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
+                # Get predictions and immediately move to CPU
+                pred_tokens = logits.argmax(dim=-1).cpu().tolist()
+                tgt_tokens = target_tokens[:, 1:].cpu().tolist()
+                
+                # Clear GPU tensors we don't need anymore
+                del logits, mask
+                if ir_data is not None:
+                    del ir_data
+                if nmr_tokens is not None:
+                    del nmr_tokens
+                
                 total_loss += loss.item()
                 total_batches += 1
 
-                # Convert logits to predictions for logging
-                pred_tokens = logits.argmax(dim=-1).cpu().tolist()
-                tgt_tokens = target_tokens[:, 1:].cpu().tolist()  # Skip BOS token
-
-                # Decode from token IDs to SMILES strings and clean up special tokens
+                # Decode predictions
                 preds_decoded = [tokenizer.decode(p).replace('[SEP]', '').replace('[PAD]', '').strip() 
                                for p in pred_tokens]
                 targets_decoded = [tokenizer.decode(t).replace('[SEP]', '').replace('[PAD]', '').strip() 
@@ -516,6 +523,9 @@ def main():
                 
                 predictions.extend(preds_decoded)
                 targets.extend(targets_decoded)
+                
+                # Clear some memory
+                torch.cuda.empty_cache()
         
         val_loss = total_loss / max(total_batches, 1)
         
@@ -578,6 +588,13 @@ def main():
             optimizer.step()
             scheduler.step()
 
+            # Clear memory after backward pass
+            del logits, mask
+            if ir_data is not None:
+                del ir_data
+            if nmr_tokens is not None:
+                del nmr_tokens
+            
             epoch_loss += loss.item()
             num_batches += 1
             global_step += 1
