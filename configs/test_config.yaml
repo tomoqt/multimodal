@@ -23,6 +23,7 @@ training:
 
 # Scheduler
 scheduler:
+  type: cosine
   warmup_steps: 100
 
 

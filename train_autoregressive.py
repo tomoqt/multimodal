@@ -48,22 +48,42 @@ tokenizer = SmilesTokenizer(vocab_file=vocab_path)
 
 
 # -------------------------------------------------------------------------
-# Linear Warmup + Constant LR Scheduler
+# Linear Warmup + Cosine/Constant LR Scheduler
 # -------------------------------------------------------------------------
-class LinearWarmupConstantLR(torch.optim.lr_scheduler._LRScheduler):
-    """Simple scheduler with linear warmup followed by constant learning rate"""
-    def __init__(self, optimizer, warmup_steps, last_epoch=-1):
+
+
+class LinearWarmupCosineDecay(torch.optim.lr_scheduler._LRScheduler):
+    """
+    Learning rate scheduler with linear warmup followed by either constant LR or cosine decay.
+    Linearly increases learning rate from 0 to max_lr over `warmup_steps`,
+    then either maintains constant LR or uses cosine decay from max_lr to min_lr.
+    """
+    def __init__(self, optimizer, warmup_steps, total_steps, decay_type='cosine', min_lr=0.0, last_epoch=-1):
         self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.decay_type = decay_type
+        self.min_lr = min_lr
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
         if self.last_epoch < self.warmup_steps:
             # Linear warmup
-            alpha = self.last_epoch / float(self.warmup_steps)
+            alpha = self.last_epoch / float(max(1, self.warmup_steps))
             return [base_lr * alpha for base_lr in self.base_lrs]
         else:
-            # Constant learning rate after warmup
-            return self.base_lrs
+            if self.decay_type == 'constant':
+                # Constant learning rate after warmup
+                return self.base_lrs
+            else:  # cosine decay
+                # Cosine decay
+                progress = (self.last_epoch - self.warmup_steps) / float(
+                    max(1, self.total_steps - self.warmup_steps)
+                )
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                return [
+                    self.min_lr + (base_lr - self.min_lr) * cosine_decay 
+                    for base_lr in self.base_lrs
+                ]
 
 
 # -------------------------------------------------------------------------
@@ -344,6 +364,7 @@ def load_config(config_path=None):
             'save_local': False
         },
         'scheduler': {
+            'type': 'constant',  # or 'cosine'
             'warmup_steps': 100
         },
         'data': {
@@ -461,7 +482,25 @@ def main():
         ignore_index=tokenizer.pad_token_id
     )
     optimizer = optim.AdamW(model.parameters(), lr=config['training']['learning_rate'])
-    scheduler = LinearWarmupConstantLR(optimizer, warmup_steps=config['scheduler']['warmup_steps'])
+
+    # Calculate total training steps (batches per epoch * num epochs)
+    total_training_steps = len(train_loader) * config['training']['num_epochs']
+    print(f"[Main] Total training steps: {total_training_steps:,}")
+    
+    # Initialize scheduler
+    scheduler = LinearWarmupCosineDecay(
+        optimizer,
+        warmup_steps=config['scheduler']['warmup_steps'],
+        total_steps=total_training_steps,
+        decay_type=config['scheduler'].get('type', 'constant'),
+        min_lr=config['training'].get('min_learning_rate', 1e-6)
+    )
+    
+    print(f"[Main] Using {config['scheduler'].get('type', 'constant')} scheduler with:")
+    print(f"      - Warmup steps: {config['scheduler']['warmup_steps']}")
+    print(f"      - Total steps: {total_training_steps}")
+    if config['scheduler'].get('type') == 'cosine':
+        print(f"      - Min LR: {config['training'].get('min_learning_rate', 1e-6)}")
 
     print("\n[Main] Creating checkpoint directory...")
     save_dir = Path('checkpoints') / datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -505,6 +544,31 @@ def main():
                 pred_tokens = logits.argmax(dim=-1).cpu().tolist()
                 tgt_tokens = target_tokens[:, 1:].cpu().tolist()
                 
+                # Decode predictions, including SEP token as it marks sequence end
+                for pred_seq in pred_tokens:
+                    # Find the first occurrence of SEP token if it exists
+                    try:
+                        sep_idx = pred_seq.index(tokenizer.sep_token_id)
+                        # Include SEP token in the sequence
+                        pred_seq = pred_seq[:sep_idx + 1]
+                    except ValueError:
+                        # No SEP token found, use full sequence
+                        pass
+                        
+                    # Decode the sequence including SEP
+                    decoded = tokenizer.decode(pred_seq).strip()
+                    predictions.append(decoded)
+
+                # Decode targets similarly
+                for tgt_seq in tgt_tokens:
+                    try:
+                        sep_idx = tgt_seq.index(tokenizer.sep_token_id)
+                        tgt_seq = tgt_seq[:sep_idx + 1]  # Include SEP
+                    except ValueError:
+                        pass
+                    decoded = tokenizer.decode(tgt_seq).strip()
+                    targets.append(decoded)
+                
                 # Clear GPU tensors we don't need anymore
                 del logits, mask
                 if ir_data is not None:
@@ -515,15 +579,6 @@ def main():
                 total_loss += loss.item()
                 total_batches += 1
 
-                # Decode predictions
-                preds_decoded = [tokenizer.decode(p).replace('[SEP]', '').replace('[PAD]', '').strip() 
-                               for p in pred_tokens]
-                targets_decoded = [tokenizer.decode(t).replace('[SEP]', '').replace('[PAD]', '').strip() 
-                                 for t in tgt_tokens]
-                
-                predictions.extend(preds_decoded)
-                targets.extend(targets_decoded)
-                
                 # Clear some memory
                 torch.cuda.empty_cache()
         
@@ -586,8 +641,8 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            scheduler.step()
-
+            scheduler.step()  # Note: Scheduler steps every batch, not every epoch
+            
             # Clear memory after backward pass
             del logits, mask
             if ir_data is not None:
@@ -600,11 +655,13 @@ def main():
             global_step += 1
 
             if global_step % logging_frequency == 0:
+                current_lr = scheduler.get_lr()[0]  # Get current learning rate
                 wandb.log({
                     "train_loss": loss.item(),
-                    "learning_rate": scheduler.get_lr()[0],
+                    "learning_rate": current_lr,
                     "epoch": epoch + 1,
-                    "global_step": global_step
+                    "global_step": global_step,
+                    "progress": global_step / total_training_steps  # Add progress tracking
                 }, step=global_step)
 
             # Periodic validation
