@@ -457,12 +457,7 @@ def main():
     print(f"[Main] Model size: {param_size_mb:.2f} MB")
 
     print("\n[Main] Setting up training components...")
-    # Create weight tensor that zeros out SEP token and keeps others at 1.0
-    weights = torch.ones(len(tokenizer))
-    weights[tokenizer.sep_token_id] = 0.0
-    
     criterion = nn.CrossEntropyLoss(
-        weight=weights.to(device),
         ignore_index=tokenizer.pad_token_id
     )
     optimizer = optim.AdamW(model.parameters(), lr=config['training']['learning_rate'])
@@ -528,7 +523,7 @@ def main():
         detailed_results = evaluate_predictions(predictions, targets)
         metrics = aggregate_metrics(detailed_results)
         
-        # Combine all metrics
+        # Store all examples, not just the first 10
         combined_metrics = {
             'val_loss': val_loss,
             'valid_smiles_rate': metrics['valid_smiles'],
@@ -536,14 +531,16 @@ def main():
             'tanimoto_similarity': metrics['avg_tanimoto'],
             'mcs_ratio': metrics['avg_#mcs/#target'],
             'ecfp6_iou': metrics['avg_ecfp6_iou'],
-            'predictions': predictions[:10],  # Store first 10 examples
-            'targets': targets[:10],
+            'predictions': predictions[:10],  # Store all predictions
+            'targets': targets[:10],         # Store all targets
             'num_samples': len(predictions)
         }
         
         return combined_metrics
 
-    wandb_table = None
+    # Initialize wandb table outside the validation loop
+    columns = ["step", "prediction", "target", "exact_match", "tanimoto", "mcs_ratio", "ecfp6_iou"]
+    examples_table = wandb.Table(columns=columns)
 
     # -------------------------------------------------------------------------
     # Training Loop
@@ -598,18 +595,25 @@ def main():
                 print(f"\nRunning validation at step {global_step}...")
                 val_metrics = validate(model, val_loader, criterion, tokenizer, device)
                 
-                # Initialize wandb table if needed
-                if wandb_table is None:
-                    columns = ["global_step", "prediction", "target", "exact_match", 
-                              "tanimoto", "mcs_ratio", "ecfp6_iou"]
-                    wandb_table = wandb.Table(columns=columns)
+                # Create a new table for each validation step
+                examples_table = wandb.Table(columns=columns)
                 
-                # Log results
+                # Log results - sample 10 random examples for logging
                 if val_metrics['predictions']:
-                    for pred, tgt in zip(val_metrics['predictions'][:10], val_metrics['targets'][:10]):
+                    # Randomly sample 10 indices
+                    num_examples = len(val_metrics['predictions'])
+                    sample_indices = np.random.choice(
+                        num_examples, 
+                        min(10, num_examples), 
+                        replace=False
+                    )
+                    
+                    for idx in sample_indices:
+                        pred = val_metrics['predictions'][idx]
+                        tgt = val_metrics['targets'][idx]
                         # Calculate metrics for this pair
                         pair_results = evaluate_predictions([pred], [tgt])[0]
-                        wandb_table.add_data(
+                        examples_table.add_data(
                             global_step,
                             pred,
                             tgt,
@@ -627,7 +631,7 @@ def main():
                     "val_tanimoto": val_metrics['tanimoto_similarity'],
                     "val_mcs_ratio": val_metrics['mcs_ratio'],
                     "val_ecfp6_iou": val_metrics['ecfp6_iou'],
-                    "val_examples": wandb_table,
+                    "val_examples": examples_table,  # Log new table each time
                     "global_step": global_step
                 }, step=global_step)
                 
