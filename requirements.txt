@@ -12,3 +12,4 @@ scikit-learn
 rdkit
 tqdm
 seaborn
+selfies

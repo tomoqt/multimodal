@@ -10,19 +10,33 @@ from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem, rdFMCS
 import wandb
 from copy import deepcopy
+import selfies as sf
+import re
+
+def is_selfies(s: str) -> bool:
+    """
+    More robust check for SELFIES format.
+    SELFIES tokens are always in the format [xxx] with no unclosed brackets.
+    """
+    if not (s.startswith('[') and s.endswith(']')):
+        return False
+    # Check if it follows SELFIES token pattern
+    tokens = re.findall(r'\[[^\]]*\]', s)
+    # Reconstruct the string from tokens and compare
+    reconstructed = ''.join(tokens)
+    return reconstructed == s
 
 def evaluate_predictions(predictions, targets, verbose=False):
     """
-    Evaluate model predictions vs. targets using canonical SMILES.
-    Returns a list of dictionaries, each containing metrics and info
-    about a single (prediction, target) pair.
+    Evaluate model predictions vs. targets.
+    Converts all inputs to SMILES before comparison.
     """
     detailed_results = []
     
     for i, (pred, target) in enumerate(zip(predictions, targets)):
         result = {
-            'prediction': pred,
-            'target': target,
+            'prediction_original': pred,
+            'target_original': target,
             'valid': False,
             'valid_target': False,
             'exact_match': False,
@@ -31,9 +45,24 @@ def evaluate_predictions(predictions, targets, verbose=False):
             'ecfp6_iou': 0.0
         }
         
+        # Convert SELFIES to SMILES if needed
+        try:
+            # More robust SELFIES detection
+            pred_smiles = sf.decoder(pred) if is_selfies(pred) else pred
+            target_smiles = sf.decoder(target) if is_selfies(target) else target
+            
+            result['prediction'] = pred_smiles
+            result['target'] = target_smiles
+            
+        except Exception as e:
+            if verbose:
+                print(f"Error converting to SMILES: {e}")
+                print(f"Problematic string: {pred if 'pred_smiles' not in locals() else target}")
+            continue
+
         # Remove spaces before creating molecules
-        pred_no_spaces = pred.replace(" ", "")
-        target_no_spaces = target.replace(" ", "")
+        pred_no_spaces = pred_smiles.replace(" ", "")
+        target_no_spaces = target_smiles.replace(" ", "")
         
         # Convert to RDKit molecules
         mol_pred = Chem.MolFromSmiles(pred_no_spaces)
@@ -47,6 +76,8 @@ def evaluate_predictions(predictions, targets, verbose=False):
             canon_pred = Chem.MolToSmiles(mol_pred, canonical=True)
             canon_target = Chem.MolToSmiles(mol_target, canonical=True)
             result['exact_match'] = canon_pred == canon_target
+            result['canonical_pred'] = canon_pred
+            result['canonical_target'] = canon_target
 
             # Standard Tanimoto similarity
             fp_pred = AllChem.GetMorganFingerprintAsBitVect(mol_pred, 2)
@@ -69,14 +100,13 @@ def evaluate_predictions(predictions, targets, verbose=False):
                 target_num_atoms = mol_target.GetNumAtoms()
                 result['#mcs/#target'] = mcs_num_atoms / target_num_atoms if target_num_atoms > 0 else 0.0
 
-            if verbose and i < 5:  # Print first 5 examples
-                print(f"\nCanonical SMILES comparison:")
-                print(f"Target (canonical):     {canon_target}")
-                print(f"Prediction (canonical): {canon_pred}")
-        
-        if verbose and i < 5:  # Print first 5 examples
+        if verbose and i < 5:
             print(f"\nExample {i+1}:")
-            print(result)
+            print(f"Original SELFIES/SMILES: {pred}")
+            print(f"Valid molecule: {result['valid']}")
+            if result['valid'] and result['valid_target']:
+                print(f"Exact SMILES match: {result['exact_match']}")
+                print(f"Canonical SMILES: {canon_pred}")
             
         detailed_results.append(result)
         
@@ -94,7 +124,7 @@ def aggregate_metrics(detailed_results):
         'avg_#mcs/#target': 0.0
     }
     
-    # Only consider pairs where both SMILES were valid
+    # Only consider pairs where both molecules were valid
     valid_pairs = [r for r in detailed_results if r['valid'] and r['valid_target']]
     if valid_pairs:
         metrics['exact_match'] = np.mean([r['exact_match'] for r in valid_pairs])
@@ -106,21 +136,38 @@ def aggregate_metrics(detailed_results):
 
 def log_results(val_metrics, step, table=None, prefix=None):
     """
-    Log validation metrics and matching SMILES pairs to wandb.
+    Log validation metrics and matching pairs to wandb.
+    Now handles both SELFIES and SMILES formats.
     """
-    if table is not None and "valid_set" in val_metrics:
+    if table is not None and "predictions" in val_metrics:
         # Add matching pairs to the table
-        for pair in val_metrics['valid_set']:
-            table.add_data(step, *list(pair.values()))
-        val_metrics["matching_pairs_table"] = table
+        for pred, tgt in zip(val_metrics['predictions'][:10], val_metrics['targets'][:10]):
+            # Convert to SMILES for logging if needed
+            try:
+                if '[' in pred and ']' in pred and any(x in pred for x in ['Branch', 'Ring', 'expl']):
+                    pred_smiles = sf.decoder(pred)
+                else:
+                    pred_smiles = pred
+
+                if '[' in tgt and ']' in tgt and any(x in tgt for x in ['Branch', 'Ring', 'expl']):
+                    tgt_smiles = sf.decoder(tgt)
+                else:
+                    tgt_smiles = tgt
+
+                table.add_data(
+                    step,
+                    pred_smiles,  # Log SMILES version for readability
+                    tgt_smiles,   # Log SMILES version for readability
+                    pred,         # Also log original SELFIES
+                    tgt          # Also log original SELFIES
+                )
+            except Exception as e:
+                print(f"Error converting for logging: {e}")
+                continue
 
     # Create a copy to avoid modifying the original dict
     log_dict = deepcopy(val_metrics)
     
-    # Remove the original matching_pairs to avoid redundancy
-    if "valid_set" in log_dict:
-        del log_dict["valid_set"]
-
     # Add prefix to metrics if specified
     if prefix:
         log_dict = {f'{prefix}_{k}': v for k, v in log_dict.items()}

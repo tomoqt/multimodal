@@ -34,17 +34,35 @@ import time
 from pprint import pprint
 from copy import deepcopy
 from logging_utils import evaluate_predictions, aggregate_metrics, log_results
+import selfies as sf
 
 # Import our custom tokenizer
-from models.smiles_tokenizer import SmilesTokenizer
+from models.selfies_tokenizer import SelfiesTokenizer
 from models.multimodal_to_smiles import MultiModalToSMILESModel
 
 # Disable RDKit logging
 RDLogger.DisableLog("rdApp.*")
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
-vocab_path = os.path.join(current_dir, 'vocab.txt')
-tokenizer = SmilesTokenizer(vocab_file=vocab_path)
+vocab_path = os.path.join(current_dir, 'selfies_vocab.txt')
+
+# Debug print to check paths
+print("\n[Debug] Looking for SELFIES vocabulary:")
+print(f"Current directory: {current_dir}")
+print(f"Trying vocab path: {vocab_path}")
+if os.path.exists(vocab_path):
+    print(f"Found vocabulary file!")
+    # Print first few lines to verify content
+    with open(vocab_path) as f:
+        print("First 5 lines of vocabulary:")
+        for i, line in enumerate(f):
+            if i < 5:
+                print(f"  {line.strip()}")
+else:
+    print(f"WARNING: Vocabulary file not found at {vocab_path}")
+
+
+tokenizer = SelfiesTokenizer(vocab_file=vocab_path)
 
 
 # -------------------------------------------------------------------------
@@ -156,14 +174,34 @@ class SpectralSmilesDataset(Dataset):
         Returns:
           (target_tokens, (ir_data, None), nmr_tokens, None)
         """
-        # Get target sequence (SMILES) - use SMILES tokenizer
+        # Get target sequence (convert SMILES to SELFIES)
         target_seq = self.targets[idx]
+        try:
+            # First check if it's already a SELFIES string
+            if '[' not in target_seq or ']' not in target_seq:
+                # Only clean spaces from SMILES strings
+                smiles = target_seq.replace(" ", "")  # More careful space removal
+                target_seq = sf.encoder(smiles)
+                if idx < 5:  # Debug first few examples
+                    print(f"\nConverting SMILES to SELFIES:")
+                    print(f"Original: {target_seq}")
+                    print(f"Cleaned SMILES: {smiles}")
+                    print(f"SELFIES: {target_seq}")
+        except Exception as e:
+            print(f"Error converting SMILES to SELFIES: {e}")
+            print(f"Problematic SMILES: {target_seq}")
+            target_seq = "[C]"
+
         target_tokens = self.smiles_tokenizer.encode(
             target_seq,
             add_special_tokens=True,
             max_length=self.max_smiles_len,
             truncation=True
         )
+        
+        if idx < 5:  # Debug first few examples
+            print(f"Tokens: {self.smiles_tokenizer.convert_ids_to_tokens(target_tokens)}")
+        
         target_tokens = torch.tensor(target_tokens, dtype=torch.long)
 
         # Get source sequence (NMR data) - use spectral tokenizer
