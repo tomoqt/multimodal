@@ -39,6 +39,7 @@ import selfies as sf
 # Import our custom tokenizer
 from models.selfies_tokenizer import SelfiesTokenizer
 from models.multimodal_to_smiles import MultiModalToSMILESModel
+from models.smiles_utils import process_smiles_to_selfies
 
 # Disable RDKit logging
 RDLogger.DisableLog("rdApp.*")
@@ -174,34 +175,19 @@ class SpectralSmilesDataset(Dataset):
         Returns:
           (target_tokens, (ir_data, None), nmr_tokens, None)
         """
-        # Get target sequence (convert SMILES to SELFIES)
+        # Get target sequence and convert to SELFIES using standardized function
         target_seq = self.targets[idx]
-        try:
-            # First check if it's already a SELFIES string
-            if '[' not in target_seq or ']' not in target_seq:
-                # Only clean spaces from SMILES strings
-                smiles = target_seq.replace(" ", "")  # More careful space removal
-                target_seq = sf.encoder(smiles)
-                if idx < 5:  # Debug first few examples
-                    print(f"\nConverting SMILES to SELFIES:")
-                    print(f"Original: {target_seq}")
-                    print(f"Cleaned SMILES: {smiles}")
-                    print(f"SELFIES: {target_seq}")
-        except Exception as e:
-            print(f"Error converting SMILES to SELFIES: {e}")
-            print(f"Problematic SMILES: {target_seq}")
-            target_seq = "[C]"
-
+        selfies = process_smiles_to_selfies(target_seq, idx)
+        if selfies is None:
+            # Fallback to a simple token if conversion fails
+            selfies = "[C]"
+        
         target_tokens = self.smiles_tokenizer.encode(
-            target_seq,
+            selfies,
             add_special_tokens=True,
             max_length=self.max_smiles_len,
             truncation=True
         )
-        
-        if idx < 5:  # Debug first few examples
-            print(f"Tokens: {self.smiles_tokenizer.convert_ids_to_tokens(target_tokens)}")
-        
         target_tokens = torch.tensor(target_tokens, dtype=torch.long)
 
         # Get source sequence (NMR data) - use spectral tokenizer

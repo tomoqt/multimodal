@@ -2,16 +2,12 @@
 # File: train_autoregressive.py
 # =======================
 """
-Script to train a MultiModalToSMILESModel using either:
-- Preprocessed .pt files created by create_training_data.py, or
-- Parquet files (loaded in one go, no row-group chunking).
-
+Script to perform hyperparameter sweeps for the MultiModalToSMILESModel using SELFIES tokenization.
 Key Steps:
-1) Loads spectral + SMILES data
-2) Tokenizes SMILES
-3) Demonstrates a basic training loop with teacher forcing
-4) Shows a minimal inference (greedy decode) function
-5) Demonstrates using ezmup to do a small HP sweep on *learning rate*
+1) Loads spectral + SMILES data from .bin and .npy index
+2) Tokenizes SMILES into SELFIES
+3) Performs quick LR sweep using Ezmup
+4) Trains final model with best LR
 """
 
 import os
@@ -24,289 +20,245 @@ from datetime import datetime
 from sklearn.model_selection import train_test_split
 import json
 from rdkit import Chem
+from rdkit import RDLogger
+from rdkit.Chem import rdFMCS
 from pathlib import Path
 import numpy as np
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import math
 from tqdm import tqdm
-import pandas as pd
-import pyarrow.dataset as ds
 import matplotlib.pyplot as plt
 import seaborn as sns
 import yaml
 import argparse
 import time
-import pyarrow.parquet as pq
+from pprint import pprint
+from copy import deepcopy
+from logging_utils import evaluate_predictions, aggregate_metrics, log_results
+import selfies as sf
 
-# ----------------------------
-#  Import Ezmup from ezmup
-# ----------------------------
+# Import our custom tokenizer and utils
+from models.selfies_tokenizer import SelfiesTokenizer
+from models.multimodal_to_smiles import MultiModalToSMILESModel
+from models.smiles_utils import process_smiles_to_selfies
 from utils.ezmup import Ezmup
 
-# Import our custom tokenizer
-from models.smiles_tokenizer import SmilesTokenizer
-from models.multimodal_to_smiles import MultiModalToSMILESModel
+# Disable RDKit logging
+RDLogger.DisableLog("rdApp.*")
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
-vocab_path = os.path.join(current_dir, 'vocab.txt')
-tokenizer = SmilesTokenizer(vocab_file=vocab_path)
+vocab_path = os.path.join(current_dir, 'selfies_vocab.txt')
+
+# Debug print to check paths
+print("\n[Debug] Looking for SELFIES vocabulary:")
+print(f"Current directory: {current_dir}")
+print(f"Trying vocab path: {vocab_path}")
+if os.path.exists(vocab_path):
+    print(f"Found vocabulary file!")
+    # Print first few lines to verify content
+    with open(vocab_path) as f:
+        print("First 5 lines of vocabulary:")
+        for i, line in enumerate(f):
+            if i < 5:
+                print(f"  {line.strip()}")
+else:
+    print(f"WARNING: Vocabulary file not found at {vocab_path}")
+
+tokenizer = SelfiesTokenizer(vocab_file=vocab_path)
 
 # -------------------------------------------------------------------------
-# Warmup + Cosine Annealing With Restarts Scheduler
+# Linear Warmup + Cosine/Constant LR Scheduler
 # -------------------------------------------------------------------------
-class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
-    def __init__(self, optimizer, warmup_steps, T_0, T_mult=1, eta_min=0, last_epoch=-1):
+class LinearWarmupCosineDecay(torch.optim.lr_scheduler._LRScheduler):
+    """
+    Learning rate scheduler with linear warmup followed by either constant LR or cosine decay.
+    Linearly increases learning rate from 0 to max_lr over `warmup_steps`,
+    then either maintains constant LR or uses cosine decay from max_lr to min_lr.
+    """
+    def __init__(self, optimizer, warmup_steps, total_steps, decay_type='cosine', min_lr=0.0, last_epoch=-1):
         self.warmup_steps = warmup_steps
-        self.T_0_initial = T_0
-        self.T_0 = T_0
-        self.T_mult = T_mult
-        self.eta_min = eta_min
-        self.T_cur = 0
-        self.completed_warmup = False
-        self.n_restarts = 0
+        self.total_steps = total_steps
+        self.decay_type = decay_type
+        self.min_lr = min_lr
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
         if self.last_epoch < self.warmup_steps:
-            alpha = self.last_epoch / self.warmup_steps
+            # Linear warmup
+            alpha = self.last_epoch / float(max(1, self.warmup_steps))
             return [base_lr * alpha for base_lr in self.base_lrs]
-        
-        # Cosine annealing with warm restarts
-        if not self.completed_warmup:
-            self.completed_warmup = True
-            self.T_cur = 0
-        
-        if self.T_cur >= self.T_0:
-            self.T_cur = 0
-            self.T_0 = self.T_0 * self.T_mult
-            self.n_restarts += 1
-        
-        progress = self.T_cur / self.T_0
+        else:
+            if self.decay_type == 'constant':
+                # Constant learning rate after warmup
+                return self.base_lrs
+            else:  # cosine decay
+                # Cosine decay
+                progress = (self.last_epoch - self.warmup_steps) / float(
+                    max(1, self.total_steps - self.warmup_steps)
+                )
         cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-        self.T_cur += 1
-        
         return [
-            self.eta_min + (base_lr - self.eta_min) * cosine_decay
+                    self.min_lr + (base_lr - self.min_lr) * cosine_decay 
             for base_lr in self.base_lrs
         ]
-
-    def step(self, epoch=None):
-        if epoch is None:
-            epoch = self.last_epoch + 1
-        self.last_epoch = epoch
-        self._last_lr = self.get_lr()
-        
-        for param_group, lr in zip(self.optimizer.param_groups, self._last_lr):
-            param_group['lr'] = lr
 
 
 # -------------------------------------------------------------------------
 # Dataset / DataLoader for Memory-Mapped Binary Files
 # -------------------------------------------------------------------------
 class SpectralSmilesDataset(Dataset):
-    def __init__(self, data_dir, tokenizer, max_len=128):
+    """
+    A PyTorch Dataset that reads from tokenized text files and numpy arrays:
+      - src-{split}.txt  (source sequences with NMR data)
+      - tgt-{split}.txt  (target SMILES sequences) 
+      - ir-{split}.npy   (IR spectra data)
+    """
+    def __init__(
+        self, 
+        data_dir, 
+        smiles_tokenizer, 
+        spectral_tokenizer, 
+        split='train', 
+        max_smiles_len=512,  # Separate length limit for SMILES
+        max_nmr_len=128      # Separate length limit for NMR
+    ):
         super().__init__()
         self.data_dir = Path(data_dir)
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+        self.smiles_tokenizer = smiles_tokenizer
+        self.spectral_tokenizer = spectral_tokenizer
+        self.max_smiles_len = max_smiles_len
+        self.max_nmr_len = max_nmr_len
+        self.split = split
 
-        index_path = self.data_dir / "spectra_index.npy"
-        if not index_path.exists():
-            raise FileNotFoundError(f"Index file not found at {index_path}")
-        self.index = np.load(index_path)
+        # Load source (NMR) and target sequences
+        with open(self.data_dir / f"src-{split}.txt") as f:
+            self.sources = [line.strip() for line in f]
+        with open(self.data_dir / f"tgt-{split}.txt") as f:
+            self.targets = [line.strip() for line in f]
 
-        spectra_bin_path = self.data_dir / "spectra_data.bin"
-        if not spectra_bin_path.exists():
-            raise FileNotFoundError(f"Spectra data file not found at {spectra_bin_path}")
-        self.spectra_mmap = np.memmap(spectra_bin_path, dtype=np.float32, mode='r')
-
-        smiles_bin_path = self.data_dir / "smiles_data.bin"
-        if not smiles_bin_path.exists():
-            raise FileNotFoundError(f"SMILES data file not found at {smiles_bin_path}")
-        self.smiles_mmap = np.memmap(smiles_bin_path, dtype=np.uint8, mode='r')
-
-        print(f"[Dataset] MemoryMappedSpectralDataset initialized:")
-        print(f"          Index shape = {self.index.shape}")
-        print(f"          Found {len(self.index)} samples total.")
-
-    def __len__(self):
-        return len(self.index)
-
-    def __getitem__(self, idx):
-        (
-            ir_data_off, ir_data_len,
-            ir_dom_off,  ir_dom_len,
-            hnm_data_off, hnm_data_len,
-            hnm_dom_off,  hnm_dom_len,
-            cnm_data_off, cnm_data_len,
-            cnm_dom_off,  cnm_dom_len,
-            smiles_off,   smiles_len
-        ) = self.index[idx]
-
-        # IR
-        if ir_data_off == -1 or ir_data_len == 0:
-            ir_tuple = None
-        else:
-            ir_data = self.spectra_mmap[ir_data_off : ir_data_off + ir_data_len]
-            if ir_dom_off == -1 or ir_dom_len == 0:
-                ir_dom = None
-            else:
-                ir_dom = self.spectra_mmap[ir_dom_off : ir_dom_off + ir_dom_len]
-            ir_data_t = torch.from_numpy(ir_data.copy()) if ir_data_len > 0 else None
-            ir_dom_t  = torch.from_numpy(ir_dom.copy())  if ir_dom is not None else None
-            ir_tuple  = (ir_data_t, ir_dom_t)
-
-        # H-NMR
-        if hnm_data_off == -1 or hnm_data_len == 0:
-            h_nmr_tuple = None
-        else:
-            h_nmr_data = self.spectra_mmap[hnm_data_off : hnm_data_off + hnm_data_len]
-            if hnm_dom_off == -1 or hnm_dom_len == 0:
-                h_nmr_dom = None
-            else:
-                h_nmr_dom = self.spectra_mmap[hnm_dom_off : hnm_dom_off + hnm_dom_len]
-            h_nmr_tuple = (
-                torch.from_numpy(h_nmr_data.copy()),
-                torch.from_numpy(h_nmr_dom.copy()) if h_nmr_dom is not None else None
-            )
-
-        # C-NMR
-        if cnm_data_off == -1 or cnm_data_len == 0:
-            c_nmr_tuple = None
-        else:
-            c_nmr_data = self.spectra_mmap[cnm_data_off : cnm_data_off + cnm_data_len]
-            if cnm_dom_off == -1 or cnm_dom_len == 0:
-                c_nmr_dom = None
-            else:
-                c_nmr_dom = self.spectra_mmap[cnm_dom_off : cnm_dom_off + cnm_dom_len]
-            c_nmr_tuple = (
-                torch.from_numpy(c_nmr_data.copy()),
-                torch.from_numpy(c_nmr_dom.copy()) if c_nmr_dom is not None else None
-            )
-
-        # SMILES
-        if smiles_off == -1 or smiles_len == 0:
-            smiles_str = ""
-        else:
-            smiles_bytes = self.smiles_mmap[smiles_off : smiles_off + smiles_len]
-            smiles_str = smiles_bytes.tobytes().decode('utf-8')
-
-        # Tokenize
-        tokens = self.tokenizer.encode(
-            smiles_str,
-            add_special_tokens=True,
-            max_length=self.max_len,
-            truncation=True
-        )
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        return tokens, ir_tuple, h_nmr_tuple, c_nmr_tuple
-
-
-# -------------------------------------------------------------------------
-# Dataset / DataLoader for Parquet Files
-# -------------------------------------------------------------------------
-class ParquetSpectralDataset(Dataset):
-    def __init__(self, data_dir, tokenizer, max_len=128):
-        super().__init__()
-        self.data_dir = Path(data_dir)
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-        
-        meta_path = self.data_dir / "meta_data/meta_data_dict.json"
-        if not meta_path.exists():
-            raise FileNotFoundError(f"Metadata file not found at {meta_path}")
-        with open(meta_path) as f:
-            self.meta_data = json.load(f)
-
-        self.ir_domain = torch.tensor(self.meta_data["ir_spectra"]["dimensions"], dtype=torch.float32)
-        self.h_nmr_domain = torch.tensor(self.meta_data["h_nmr_spectra"]["dimensions"], dtype=torch.float32)
-        self.c_nmr_domain = torch.tensor(self.meta_data["c_nmr_spectra"]["dimensions"], dtype=torch.float32)
-
-        print("[Dataset] Looking for parquet files...")
-        self.parquet_files = sorted(self.data_dir.glob("*.parquet"))
-        if not self.parquet_files:
-            raise FileNotFoundError(f"No parquet files found in {data_dir}")
-        print(f"[Dataset] Found {len(self.parquet_files)} parquet files")
-
-        print("[Dataset] Loading parquet files...")
-        dfs = []
-        for file in tqdm(self.parquet_files, desc="Loading parquet files"):
-            df = pd.read_parquet(
-                file,
-                columns=['smiles', 'ir_spectra', 'h_nmr_spectra', 'c_nmr_spectra'],
-                engine='pyarrow'
-            )
-            dfs.append(df)
-        
-        self.data = pd.concat(dfs, ignore_index=True)
-        print(f"[Dataset] Loaded {len(self.data)} total rows")
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        smiles = row['smiles']
-        tokens = self.tokenizer.encode(
-            smiles,
-            add_special_tokens=True,
-            max_length=self.max_len,
-            truncation=True
-        )
-
-        def to_tensor(x, spectrum_type):
-            if x is None:
-                return None
+        # Load IR data using numpy.memmap instead of pickle
+        ir_path = self.data_dir / f"ir-{split}.npy"
+        self.ir_data = None
+        if ir_path.exists():
             try:
-                tensor = torch.tensor(x, dtype=torch.float32)
-                if tensor.dim() == 1:
-                    if spectrum_type == 'ir':
-                        return (tensor, self.ir_domain)
-                    elif spectrum_type == 'h_nmr':
-                        return (tensor, self.h_nmr_domain)
-                    elif spectrum_type == 'c_nmr':
-                        return (tensor, self.c_nmr_domain)
-                return tensor
+                # Use memmap to load the IR data
+                self.ir_data = np.memmap(
+                    ir_path,
+                    dtype='float32',
+                    mode='r',
+                    shape=None  # Let numpy figure out the shape
+                )
+                # Get the actual shape from the memmap
+                array_shape = self.ir_data.shape
+                # Reshape if needed (should be 2D: [num_samples, features])
+                if len(array_shape) == 1:
+                    # Calculate number of samples based on total size and feature dimension
+                    num_samples = len(self.sources)
+                    feature_dim = array_shape[0] // num_samples
+                    self.ir_data = self.ir_data.reshape(num_samples, feature_dim)
+                
+                print(f"[Dataset] Loaded IR data with shape: {self.ir_data.shape}")
             except Exception as e:
-                print(f"Warning: Error converting {spectrum_type} data to tensor: {e}")
-                return None
+                print(f"[Warning] Failed to load IR data: {e}")
+                self.ir_data = None
 
-        ir_spectra = to_tensor(row['ir_spectra'], 'ir')
-        h_nmr_spectra = to_tensor(row['h_nmr_spectra'], 'h_nmr')
-        c_nmr_spectra = to_tensor(row['c_nmr_spectra'], 'c_nmr')
+        print(f"[Dataset] SpectralSmilesDataset initialized for {split}:")
+        print(f"          Found {len(self.sources)} samples")
 
-        return tokens, ir_spectra, h_nmr_spectra, c_nmr_spectra
+    def __len__(self):
+        return len(self.sources)
+
+    def __getitem__(self, idx):
+        """
+        Returns:
+          (target_tokens, (ir_data, None), nmr_tokens, None)
+        """
+        # Get target sequence and convert to SELFIES using standardized function
+        target_seq = self.targets[idx]
+        selfies = process_smiles_to_selfies(target_seq, idx)
+        if selfies is None:
+            # Fallback to a simple token if conversion fails
+            selfies = "[C]"
+        
+        target_tokens = self.smiles_tokenizer.encode(
+            selfies,
+            add_special_tokens=True,
+            max_length=self.max_smiles_len,
+            truncation=True
+        )
+        target_tokens = torch.tensor(target_tokens, dtype=torch.long)
+
+        # Get source sequence (NMR data) - use spectral tokenizer
+        source_seq = self.sources[idx]
+        # Split into tokens and convert to IDs using the spectral vocabulary
+        nmr_tokens = source_seq.split()
+        nmr_token_ids = [self.spectral_tokenizer.get(token, self.spectral_tokenizer["<UNK>"]) 
+                        for token in nmr_tokens]
+        if len(nmr_token_ids) > self.max_nmr_len:
+            nmr_token_ids = nmr_token_ids[:self.max_nmr_len]
+        nmr_tokens = torch.tensor(nmr_token_ids, dtype=torch.long)
+
+        # Get IR data if available - modify to handle memmap
+        ir_data = None
+        if self.ir_data is not None:
+            # Copy the data from memmap to a regular tensor
+            ir_data = torch.tensor(self.ir_data[idx].copy(), dtype=torch.float32)
+
+        return (
+            target_tokens,
+            (ir_data, None),
+            nmr_tokens,
+            None
+        )
+
+    # Add cleanup method to properly close memmap file
+    def __del__(self):
+        if hasattr(self, 'ir_data') and self.ir_data is not None:
+            del self.ir_data
 
 
 # -------------------------------------------------------------------------
-# Collate function
+# Collate Function
 # -------------------------------------------------------------------------
 def collate_fn(batch):
-    all_tokens, all_ir, all_h_nmr, all_c_nmr = zip(*batch)
-    
-    def maybe_stack_with_domain(items):
-        if items[0] is not None:
-            data = torch.stack([item[0] for item in items], dim=0)
-            domain = items[0][1]
-            return (data, domain)
-        return None
+    """
+    Custom collate function that handles:
+    - Padding target tokens (SMILES)
+    - Padding NMR tokens
+    - Stacking IR data
+    """
+    target_tokens, ir_tuples, nmr_tokens, _ = zip(*batch)
 
-    ir_batch = maybe_stack_with_domain(all_ir) if all_ir[0] is not None else None
-    h_nmr_batch = maybe_stack_with_domain(all_h_nmr) if all_h_nmr[0] is not None else None
-    c_nmr_batch = maybe_stack_with_domain(all_c_nmr) if all_c_nmr[0] is not None else None
-
-    max_len = max(len(t) for t in all_tokens)
-    padded_tokens = []
-    for seq in all_tokens:
-        pad_amount = max_len - len(seq)
-        seq_tensor = torch.tensor(seq, dtype=torch.long)
+    # Pad target tokens (SMILES)
+    max_target_len = max(len(seq) for seq in target_tokens)
+    padded_target_tokens = []
+    for seq in target_tokens:
+        pad_amount = max_target_len - len(seq)
         if pad_amount > 0:
             pad_tensor = torch.full((pad_amount,), tokenizer.pad_token_id, dtype=torch.long)
-            seq_tensor = torch.cat([seq_tensor, pad_tensor], dim=0)
-        padded_tokens.append(seq_tensor)
-    token_batch = torch.stack(padded_tokens, dim=0)
+            seq = torch.cat([seq, pad_tensor], dim=0)
+        padded_target_tokens.append(seq)
+    target_batch = torch.stack(padded_target_tokens, dim=0)
 
-    return token_batch, ir_batch, h_nmr_batch, c_nmr_batch
+    # Pad NMR tokens
+    max_nmr_len = max(len(seq) for seq in nmr_tokens)
+    padded_nmr_tokens = []
+    for seq in nmr_tokens:
+        pad_amount = max_nmr_len - len(seq)
+        if pad_amount > 0:
+            pad_tensor = torch.full((pad_amount,), spectral_tokenizer["<PAD>"], dtype=torch.long)
+            seq = torch.cat([seq, pad_tensor], dim=0)
+        padded_nmr_tokens.append(seq)
+    nmr_batch = torch.stack(padded_nmr_tokens, dim=0)
+
+    # Stack IR data if available
+    ir_batch = None
+    if ir_tuples[0] is not None:
+        # Extract just the IR tensors from the tuples (first element)
+        ir_tensors = [t[0] for t in ir_tuples if t[0] is not None]
+        if ir_tensors:
+            ir_batch = torch.stack(ir_tensors, dim=0)
+
+    return target_batch, ir_batch, nmr_batch, None
 
 def create_data_loaders(tokenizer, config):
     print("\n[DataLoader] Creating data loaders...")
@@ -319,8 +271,11 @@ def create_data_loaders(tokenizer, config):
     else:
         dataset = SpectralSmilesDataset(
             data_dir=config['data']['binary_dir'],
-            tokenizer=tokenizer,
-            max_len=config['model']['max_seq_length']
+            smiles_tokenizer=tokenizer,
+            spectral_tokenizer=tokenizer,
+            split='train',
+            max_smiles_len=config['model']['max_seq_length'],
+            max_nmr_len=config['model']['max_seq_length']
         )
     
     print(f"[DataLoader] Total dataset size: {len(dataset)}")
@@ -371,9 +326,12 @@ def create_data_loaders(tokenizer, config):
 # Config + Argparse
 # -------------------------------------------------------------------------
 def load_config(config_path=None):
+    """Load config from yaml file, falling back to defaults if not specified"""
     default_config = {
         'model': {
-            'max_seq_length': 128,
+            'max_seq_length': 512,      # Max SMILES sequence length
+            'max_nmr_length': 128,      # Max NMR sequence length
+            'max_memory_length': 128,   # Max memory/IR sequence length
             'embed_dim': 768,
             'num_heads': 8,
             'num_layers': 6,
@@ -385,25 +343,21 @@ def load_config(config_path=None):
             'batch_size': 32,
             'test_batch_size': 1,
             'num_epochs': 1,
-            'learning_rate': 1.0e-4,   # default
+            'learning_rate': 1.0e-4,
             'min_learning_rate': 1.0e-6,
             'validation_frequency': 500,
             'logging_frequency': 100,
             'save_frequency': 1000,
-            'generate_during_training': False
+            'generate_during_training': False,
+            'save_local': False
         },
         'scheduler': {
-            'warmup_steps': 100,
-            'T0': 5,
-            'T_mult': 2
+            'type': 'constant',  # or 'cosine'
+            'warmup_steps': 100
         },
         'data': {
-            'use_parquet': False,
-            'data_dir': "data_extraction/multimodal_spectroscopic_dataset",
-            'binary_dir': "training_binaries",
-            'preprocessed': False,
-            'test_size': 20,
-            'val_size': 0.1
+            'tokenized_dir': "tokenized_baseline/data",  # Path to tokenized data
+            'num_workers': 0
         },
         'wandb': {
             'project': "smiles-generation",
@@ -411,7 +365,7 @@ def load_config(config_path=None):
             'log_examples': True
         }
     }
-    
+
     if config_path:
         with open(config_path, 'r') as f:
             custom_config = yaml.safe_load(f)
@@ -423,7 +377,7 @@ def load_config(config_path=None):
                         d[k] = v
                 return d
             update_dict(default_config, custom_config)
-    
+
     return default_config
 
 def parse_args():
@@ -566,12 +520,12 @@ def main():
         """
         # Re-init the optimizer each time with the new LR
         optimizer = mup_engine.get_optimizer(lr=candidate_lr)
-        scheduler = WarmupCosineLR(
+        scheduler = LinearWarmupCosineDecay(
             optimizer,
             warmup_steps=config['scheduler']['warmup_steps'],
-            T_0=config['scheduler']['T0'] * len(train_loader),
-            T_mult=config['scheduler']['T_mult'],
-            eta_min=config['training']['min_learning_rate']
+            total_steps=config['scheduler']['T0'] * len(train_loader),
+            decay_type=config['scheduler']['T_mult'],
+            min_lr=config['training']['min_learning_rate']
         )
         criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
 
@@ -615,13 +569,15 @@ def main():
 
         # Evaluate on validation set
         model.eval()
-        total_loss = 0
-        count = 0
+        total_loss = 0.0
+        total_batches = 0
+        predictions = []
+        targets = []
+        
         with torch.no_grad():
             for batch in val_loader:
                 tgt_tokens, ir, h_nmr, c_nmr = batch
                 tgt_tokens = tgt_tokens.to(device)
-
                 if ir is not None:
                     if isinstance(ir, tuple):
                         ir = (ir[0].to(device), ir[1].to(device))
@@ -638,17 +594,85 @@ def main():
                     else:
                         c_nmr = c_nmr.to(device)
 
-                T = tgt_tokens.shape[1]
+                T = tgt_tokens.size(1)
                 mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
-                v_logits = model(h_nmr, ir, c_nmr, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
-                v_loss = criterion(v_logits.reshape(-1, v_logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
                 
-                total_loss += v_loss.item()
-                count += 1
+                logits = model(
+                    h_nmr, ir, c_nmr,
+                    target_seq=tgt_tokens[:, :-1],
+                    target_mask=mask[:-1, :-1]
+                )
+                loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
+                
+                # Get predictions and immediately move to CPU
+                pred_tokens = logits.argmax(dim=-1).cpu().tolist()
+                tgt_tokens = tgt_tokens[:, 1:].cpu().tolist()
+                
+                # Decode predictions, including SEP token as sequence end marker
+                for pred_seq in pred_tokens:
+                    # Find the first occurrence of SEP token if it exists
+                    try:
+                        sep_idx = pred_seq.index(tokenizer.sep_token_id)
+                        # Include SEP token in sequence but don't decode it
+                        pred_seq = pred_seq[:sep_idx]  # Don't include SEP in final string
+                    except ValueError:
+                        # No SEP token found, use full sequence
+                        pass
+                        
+                    # Decode the sequence (SEP was used to mark end but isn't included)
+                    decoded = tokenizer.decode(pred_seq).strip()
+                    predictions.append(decoded)
 
-        avg_val_loss = total_loss / max(count, 1)
-        print(f"[quick_train_eval_lr] LR={candidate_lr}, val_loss={avg_val_loss:.4f}")
-        return avg_val_loss
+                # Decode targets similarly
+                for tgt_seq in tgt_tokens:
+                    try:
+                        sep_idx = tgt_seq.index(tokenizer.sep_token_id)
+                        tgt_seq = tgt_seq[:sep_idx]  # Don't include SEP in final string
+                    except ValueError:
+                        pass
+                    decoded = tokenizer.decode(tgt_seq).strip()
+                    targets.append(decoded)
+                
+                # Clear GPU tensors we don't need anymore
+                del logits, mask
+                if ir is not None:
+                    del ir
+                if h_nmr is not None:
+                    del h_nmr
+                if c_nmr is not None:
+                    del c_nmr
+                
+                total_loss += loss.item()
+                total_batches += 1
+
+                # Clear some memory
+                torch.cuda.empty_cache()
+        
+        val_loss = total_loss / max(total_batches, 1)
+        
+        # Calculate molecular metrics using logging_utils
+        detailed_results = evaluate_predictions(predictions, targets)
+        metrics = aggregate_metrics(detailed_results)
+        
+        # Store all examples, not just the first 10
+        combined_metrics = {
+            'val_loss': val_loss,
+            'valid_smiles_rate': metrics['valid_smiles'],
+            'exact_match_rate': metrics['exact_match'],
+            'tanimoto_similarity': metrics['avg_tanimoto'],
+            'mcs_ratio': metrics['avg_#mcs/#target'],
+            'ecfp6_iou': metrics['avg_ecfp6_iou'],
+            'predictions': predictions[:10],  # Store first 10 predictions
+            'targets': targets[:10],         # Store first 10 targets
+            'num_samples': len(predictions)
+        }
+
+        print(f"[quick_train_eval_lr] LR={candidate_lr}, val_loss={val_loss:.4f}")
+        print(f"                      valid_smiles={metrics['valid_smiles']:.2%}")
+        print(f"                      exact_match={metrics['exact_match']:.2%}")
+        print(f"                      avg_tanimoto={metrics['avg_tanimoto']:.4f}")
+        
+        return combined_metrics
 
     # ---------------------------------------------------------------------
     # Step: Sweep over candidate LRs
@@ -659,11 +683,27 @@ def main():
 
     print("\n[Main] Starting mini HP sweep over learning rates:", lrs_to_try)
     for lr_candidate in lrs_to_try:
-        val_loss = quick_train_eval_lr(lr_candidate, n_steps=100)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        val_metrics = quick_train_eval_lr(lr_candidate, n_steps=100)
+        if val_metrics['val_loss'] < best_val_loss:
+            best_val_loss = val_metrics['val_loss']
             best_lr = lr_candidate
+            
+            # Log the best results so far to wandb
+            wandb.log({
+                "sweep_val_loss": val_metrics['val_loss'],
+                "sweep_valid_smiles": val_metrics['valid_smiles_rate'],
+                "sweep_exact_match": val_metrics['exact_match_rate'],
+                "sweep_tanimoto": val_metrics['tanimoto_similarity'],
+                "sweep_mcs_ratio": val_metrics['mcs_ratio'],
+                "sweep_ecfp6_iou": val_metrics['ecfp6_iou'],
+                "sweep_lr": lr_candidate
+            })
+            
     print(f"[Main] Best LR found: {best_lr} (val_loss={best_val_loss:.4f})")
+
+    # Initialize wandb table for examples
+    columns = ["step", "prediction", "target", "exact_match", "tanimoto", "mcs_ratio", "ecfp6_iou"]
+    examples_table = wandb.Table(columns=columns)
 
     # Optionally, we can now upscale the width if desired:
     print(f"\n[Main] For final training, let's scale width up to 1024 (example)...")
@@ -671,12 +711,12 @@ def main():
 
     # Build the final optimizer with best LR
     optimizer = mup_engine.get_optimizer(lr=best_lr)
-    scheduler = WarmupCosineLR(
+    scheduler = LinearWarmupCosineDecay(
         optimizer,
         warmup_steps=config['scheduler']['warmup_steps'],
-        T_0=config['scheduler']['T0'] * len(train_loader),
-        T_mult=config['scheduler']['T_mult'],
-        eta_min=config['training']['min_learning_rate']
+        total_steps=config['scheduler']['T0'] * len(train_loader),
+        decay_type=config['scheduler']['T_mult'],
+        min_lr=config['training']['min_learning_rate']
     )
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
 
@@ -690,6 +730,7 @@ def main():
     best_val_loss = float('inf')
     NUM_EPOCHS = config['training']['num_epochs']
     validation_frequency = config['training']['validation_frequency']
+    logging_frequency = config['training']['logging_frequency']
 
     for epoch in range(NUM_EPOCHS):
         print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
@@ -697,7 +738,8 @@ def main():
         epoch_loss = 0
         num_batches = 0
 
-        for batch in train_loader:
+        pbar = tqdm(train_loader, total=len(train_loader), desc="Training", dynamic_ncols=True)
+        for batch in pbar:
             tgt_tokens, ir, h_nmr, c_nmr = batch
             tgt_tokens = tgt_tokens.to(device)
             if ir is not None:
@@ -720,6 +762,7 @@ def main():
             mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
             logits = model(h_nmr, ir, c_nmr, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
             loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -729,60 +772,111 @@ def main():
             num_batches += 1
             global_step += 1
 
+            if global_step % logging_frequency == 0:
+                current_lr = scheduler.get_lr()[0]  # Get current learning rate
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "learning_rate": current_lr,
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "progress": global_step / total_training_steps  # Add progress tracking
+                }, step=global_step)
+
+            # Periodic validation
             if global_step % validation_frequency == 0:
-                # Quick val
-                model.eval()
-                total_val_loss = 0
-                val_count = 0
-                with torch.no_grad():
-                    for vbatch in val_loader:
-                        vtgt_tokens, vir, vh_nmr, vc_nmr = vbatch
-                        vtgt_tokens = vtgt_tokens.to(device)
-                        if vir is not None:
-                            if isinstance(vir, tuple):
-                                vir = (vir[0].to(device), vir[1].to(device))
-                            else:
-                                vir = vir.to(device)
-                        if vh_nmr is not None:
-                            if isinstance(vh_nmr, tuple):
-                                vh_nmr = (vh_nmr[0].to(device), vh_nmr[1].to(device))
-                            else:
-                                vh_nmr = vh_nmr.to(device)
-                        if vc_nmr is not None:
-                            if isinstance(vc_nmr, tuple):
-                                vc_nmr = (vc_nmr[0].to(device), vc_nmr[1].to(device))
-                            else:
-                                vc_nmr = vc_nmr.to(device)
+                print(f"\nRunning validation at step {global_step}...")
+                val_metrics = quick_train_eval_lr(best_lr, n_steps=0)  # n_steps=0 means just evaluate
+                
+                # Create a new table for each validation step
+                examples_table = wandb.Table(columns=columns)
+                
+                # Log results - sample 10 random examples for logging
+                if val_metrics['predictions']:
+                    # Randomly sample 10 indices
+                    num_examples = len(val_metrics['predictions'])
+                    sample_indices = np.random.choice(
+                        num_examples, 
+                        min(10, num_examples), 
+                        replace=False
+                    )
+                    
+                    for idx in sample_indices:
+                        pred = val_metrics['predictions'][idx]
+                        tgt = val_metrics['targets'][idx]
+                        # Calculate metrics for this pair
+                        pair_results = evaluate_predictions([pred], [tgt])[0]
+                        examples_table.add_data(
+                            global_step,
+                            pred,
+                            tgt,
+                            pair_results['exact_match'],
+                            pair_results['tanimoto'],
+                            pair_results['#mcs/#target'],
+                            pair_results['ecfp6_iou']
+                        )
+                
+                # Log metrics
+                wandb.log({
+                    "val_loss": val_metrics['val_loss'],
+                    "val_valid_smiles": val_metrics['valid_smiles_rate'],
+                    "val_exact_matches": val_metrics['exact_match_rate'],
+                    "val_tanimoto": val_metrics['tanimoto_similarity'],
+                    "val_mcs_ratio": val_metrics['mcs_ratio'],
+                    "val_ecfp6_iou": val_metrics['ecfp6_iou'],
+                    "val_examples": examples_table,  # Log new table each time
+                    "global_step": global_step
+                }, step=global_step)
+                
+                print(f"[Val] Loss: {val_metrics['val_loss']:.4f}")
 
-                        T = vtgt_tokens.shape[1]
-                        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=vtgt_tokens.device), 1)
-                        v_logits = model(vh_nmr, vir, vc_nmr, target_seq=vtgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
-                        v_loss = criterion(v_logits.reshape(-1, v_logits.size(-1)), vtgt_tokens[:, 1:].reshape(-1))
-                        total_val_loss += v_loss.item()
-                        val_count += 1
-
-                avg_val_loss = total_val_loss / max(val_count, 1)
-                print(f"[Validation @ step {global_step}] val_loss={avg_val_loss:.4f}")
-                wandb.log({"val_loss": avg_val_loss, "global_step": global_step})
-
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    print(f"  New best val_loss: {best_val_loss:.4f}")
-                    torch.save({
+                if val_metrics['val_loss'] < best_val_loss:
+                    best_val_loss = val_metrics['val_loss']
+                    print(f"New best validation loss: {best_val_loss:.4f}")
+                    checkpoint = {
                         'epoch': epoch,
+                        'global_step': global_step,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'val_loss': best_val_loss
-                    }, save_dir / 'best_model.pt')
+                        'val_loss': val_metrics['val_loss'],
+                    }
+                    torch.save(checkpoint, save_dir / 'best_model.pt')
+                    print(f"Saved checkpoint at {save_dir}/best_model.pt")
 
-        print(f"  [Epoch {epoch+1}] avg_train_loss={(epoch_loss/num_batches):.4f}")
-        wandb.log({"train_loss": epoch_loss/num_batches, "epoch": epoch+1})
+                    # Save to W&B as an artifact
+                    artifact = wandb.Artifact(
+                        "model", 
+                        type="model",
+                        description=f"Checkpoint at step {global_step}, val_loss {best_val_loss:.4f}"
+                    )
+                    wandb.log_artifact(artifact, aliases=["latest", f"step_{global_step}"])
+                    print("[Main] Checkpoint artifact saved to W&B.")
 
-    # -------------------------------------------------------
-    # Final Save
-    # -------------------------------------------------------
+        avg_epoch_loss = epoch_loss / max(num_batches, 1)
+        print(f"Epoch {epoch+1} completed | Average Loss: {avg_epoch_loss:.4f}")
+        wandb.log({"train_loss": avg_epoch_loss, "epoch": epoch+1})
+
+    # Final test set evaluation
+    print("\n[Main] Evaluating on test set...")
+    final_test_metrics = quick_train_eval_lr(best_lr, n_steps=0)  # n_steps=0 means just evaluate
+    wandb.log({
+        "test_loss": final_test_metrics['val_loss'],
+        "test_valid_smiles": final_test_metrics['valid_smiles_rate'],
+        "test_exact_matches": final_test_metrics['exact_match_rate'],
+        "test_tanimoto": final_test_metrics['tanimoto_similarity'],
+        "test_mcs_ratio": final_test_metrics['mcs_ratio'],
+        "test_ecfp6_iou": final_test_metrics['ecfp6_iou']
+    }, step=global_step)
+    print(f"[Test] Loss: {final_test_metrics['val_loss']:.4f}")
+
+    # Save final model
     final_model_path = save_dir / 'final_model.pt'
-    torch.save(model.state_dict(), final_model_path)
+    torch.save({
+        'epoch': NUM_EPOCHS,
+        'global_step': global_step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'test_metrics': final_test_metrics
+    }, final_model_path)
     print(f"\n[Main] Final model saved to {final_model_path}")
 
     wandb.finish()

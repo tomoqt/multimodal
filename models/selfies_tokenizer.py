@@ -4,6 +4,7 @@ import re
 from typing import List, Optional, Tuple
 import selfies as sf
 from transformers import PreTrainedTokenizer
+from .smiles_utils import safe_selfies_conversion, canonicalize_smiles, process_smiles_to_selfies
 
 VOCAB_FILES_NAMES = {"vocab_file": "selfies_vocab.txt"}
 
@@ -32,13 +33,9 @@ class BasicSelfiesTokenizer:
         Handles both direct SELFIES input and SMILES conversion.
         """
         if not (text.startswith('[') and text.endswith(']')):
-            try:
-                # Clean up SMILES string by removing extra spaces
-                text = ''.join(text.split())  # Remove all whitespace
-                text = sf.encoder(text)
-            except Exception as e:
-                print(f"Error converting SMILES to SELFIES: {e}")
-                print(f"Problematic SMILES: {text}")
+            # Convert SMILES to SELFIES
+            text = safe_selfies_conversion(text)
+            if text is None:
                 return []
 
         return [token for token in self.regex.findall(text) if token.strip()]
@@ -98,6 +95,12 @@ class SelfiesTokenizer(PreTrainedTokenizer):
         """
         Tokenize text using regex-based SELFIES tokenizer
         """
+        # Convert to SELFIES if needed using standardized function
+        if not (text.startswith('[') and text.endswith(']')):
+            text = process_smiles_to_selfies(text)
+            if text is None:
+                return []
+        
         tokens = self.basic_tokenizer.tokenize(text)
         # Debug print vocabulary coverage
         for token in tokens:
@@ -192,9 +195,9 @@ class SelfiesTokenizer(PreTrainedTokenizer):
         vocab = set()
         for smiles in smiles_list:
             try:
-                # Clean up SMILES string by removing extra spaces
-                smiles = ''.join(smiles.split())  # Remove all whitespace
-                selfies = sf.encoder(smiles)
+                selfies = safe_selfies_conversion(smiles)
+                if selfies is None:
+                    continue
                 tokens = basic_tokenizer.tokenize(selfies)
                 vocab.update(tokens)
             except Exception as e:

@@ -12,6 +12,7 @@ import wandb
 from copy import deepcopy
 import selfies as sf
 import re
+from models.smiles_utils import process_smiles_to_selfies
 
 def is_selfies(s: str) -> bool:
     """
@@ -29,7 +30,8 @@ def is_selfies(s: str) -> bool:
 def evaluate_predictions(predictions, targets, verbose=False):
     """
     Evaluate model predictions vs. targets.
-    Converts all inputs to SMILES before comparison.
+    Assumes inputs are already in SELFIES format.
+    Performs both direct SELFIES comparison and SMILES-based metrics.
     """
     detailed_results = []
     
@@ -40,16 +42,19 @@ def evaluate_predictions(predictions, targets, verbose=False):
             'valid': False,
             'valid_target': False,
             'exact_match': False,
+            'selfies_exact_match': False,  # New metric for direct SELFIES comparison
             'tanimoto': 0.0,
             '#mcs/#target': 0.0,
             'ecfp6_iou': 0.0
         }
         
-        # Convert SELFIES to SMILES if needed
+        # Direct SELFIES comparison
+        result['selfies_exact_match'] = (pred == target)
+            
+        # Convert to SMILES for chemical comparison
         try:
-            # More robust SELFIES detection
-            pred_smiles = sf.decoder(pred) if is_selfies(pred) else pred
-            target_smiles = sf.decoder(target) if is_selfies(target) else target
+            pred_smiles = sf.decoder(pred)
+            target_smiles = sf.decoder(target)
             
             result['prediction'] = pred_smiles
             result['target'] = target_smiles
@@ -57,7 +62,6 @@ def evaluate_predictions(predictions, targets, verbose=False):
         except Exception as e:
             if verbose:
                 print(f"Error converting to SMILES: {e}")
-                print(f"Problematic string: {pred if 'pred_smiles' not in locals() else target}")
             continue
 
         # Remove spaces before creating molecules
@@ -115,9 +119,11 @@ def evaluate_predictions(predictions, targets, verbose=False):
 def aggregate_metrics(detailed_results):
     """
     Aggregates molecular metrics from detailed results.
+    Includes both SMILES-based and direct SELFIES comparison metrics.
     """
     metrics = {
         'valid_smiles': np.mean([r['valid'] for r in detailed_results]),
+        'selfies_exact_match': np.mean([r['selfies_exact_match'] for r in detailed_results]),  # Direct SELFIES comparison
         'exact_match': 0.0,
         'avg_tanimoto': 0.0,
         'avg_ecfp6_iou': 0.0,
