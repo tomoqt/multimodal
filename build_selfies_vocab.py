@@ -1,6 +1,7 @@
 import os
 from models.selfies_tokenizer import SelfiesTokenizer, BasicSelfiesTokenizer, load_vocab
 from tqdm import tqdm
+import selfies as sf
 
 def build_vocab_from_data(data_dir):
     """Build SELFIES vocabulary from data files"""
