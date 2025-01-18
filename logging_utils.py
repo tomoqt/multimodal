@@ -89,10 +89,17 @@ def aggregate_metrics(detailed_results):
     metrics = {
         'valid_smiles': np.mean([r['valid'] for r in detailed_results]),
         'exact_match': 0.0,
+        'exact_match_all': 0.0,
         'avg_tanimoto': 0.0,
         'avg_ecfp6_iou': 0.0,
         'avg_#mcs/#target': 0.0
     }
+    
+    # Calculate exact match over all examples
+    metrics['exact_match_all'] = np.mean([
+        (r['valid'] and r['valid_target'] and r['exact_match']) 
+        for r in detailed_results
+    ])
     
     # Only consider pairs where both SMILES were valid
     valid_pairs = [r for r in detailed_results if r['valid'] and r['valid_target']]
