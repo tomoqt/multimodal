@@ -568,30 +568,44 @@ def main():
                 pred_tokens = logits.argmax(dim=-1).cpu().tolist()
                 tgt_tokens = target_tokens[:, 1:].cpu().tolist()
                 
-                # Decode predictions, including SEP token as sequence end marker
+                # Decode predictions using the SELFIES tokenizer
                 for pred_seq in pred_tokens:
-                    # Find the first occurrence of SEP token if it exists
                     try:
-                        sep_idx = pred_seq.index(tokenizer.sep_token_id)
-                        # Include SEP token in sequence but don't decode it
-                        pred_seq = pred_seq[:sep_idx]  # Don't include SEP in final string
-                    except ValueError:
-                        # No SEP token found, use full sequence
-                        pass
+                        # Find the first occurrence of SEP token if it exists
+                        try:
+                            sep_idx = pred_seq.index(tokenizer.sep_token_id)
+                            pred_seq = pred_seq[:sep_idx]  # Don't include SEP
+                        except ValueError:
+                            pass
                         
-                    # Decode the sequence (SEP was used to mark end but isn't included)
-                    decoded = tokenizer.decode(pred_seq).strip()
-                    predictions.append(decoded)
+                        # Use tokenizer's built-in decoding
+                        decoded = tokenizer.decode(pred_seq, skip_special_tokens=True)
+                        if decoded:
+                            predictions.append(decoded)
+                        else:
+                            print(f"Warning: Empty decoded prediction from tokens: {pred_seq}")
+                    except Exception as e:
+                        print(f"Error decoding prediction: {e}")
+                        continue
 
-                # Decode targets similarly
+                # Decode targets using the SELFIES tokenizer
                 for tgt_seq in tgt_tokens:
                     try:
-                        sep_idx = tgt_seq.index(tokenizer.sep_token_id)
-                        tgt_seq = tgt_seq[:sep_idx]  # Don't include SEP in final string
-                    except ValueError:
-                        pass
-                    decoded = tokenizer.decode(tgt_seq).strip()
-                    targets.append(decoded)
+                        try:
+                            sep_idx = tgt_seq.index(tokenizer.sep_token_id)
+                            tgt_seq = tgt_seq[:sep_idx]
+                        except ValueError:
+                            pass
+                        
+                        # Use tokenizer's built-in decoding
+                        decoded = tokenizer.decode(tgt_seq, skip_special_tokens=True)
+                        if decoded:
+                            targets.append(decoded)
+                        else:
+                            print(f"Warning: Empty decoded target from tokens: {tgt_seq}")
+                    except Exception as e:
+                        print(f"Error decoding target: {e}")
+                        continue
                 
                 # Clear GPU tensors we don't need anymore
                 del logits, mask
@@ -608,24 +622,36 @@ def main():
         
         val_loss = total_loss / max(total_batches, 1)
         
+        if not predictions or not targets:
+            print("Warning: No valid predictions or targets in validation batch")
+            return {
+                'val_loss': val_loss,
+                'valid_smiles_rate': 0.0,
+                'exact_match_rate': 0.0,
+                'tanimoto_similarity': 0.0,
+                'mcs_ratio': 0.0,
+                'ecfp6_iou': 0.0,
+                'predictions': [],
+                'targets': [],
+                'num_samples': 0
+            }
+        
         # Calculate molecular metrics using logging_utils
         detailed_results = evaluate_predictions(predictions, targets)
         metrics = aggregate_metrics(detailed_results)
         
-        # Store all examples, not just the first 10
-        combined_metrics = {
+        return {
             'val_loss': val_loss,
             'valid_smiles_rate': metrics['valid_smiles'],
             'exact_match_rate': metrics['exact_match'],
+            'selfies_exact_match_rate': metrics.get('selfies_exact_match', 0.0),  # Add SELFIES-specific metric
             'tanimoto_similarity': metrics['avg_tanimoto'],
             'mcs_ratio': metrics['avg_#mcs/#target'],
             'ecfp6_iou': metrics['avg_ecfp6_iou'],
-            'predictions': predictions[:10],  # Store all predictions
-            'targets': targets[:10],         # Store all targets
+            'predictions': predictions,
+            'targets': targets,
             'num_samples': len(predictions)
         }
-        
-        return combined_metrics
 
     # Initialize wandb table outside the validation loop
     columns = ["step", "prediction", "target", "exact_match", "tanimoto", "mcs_ratio", "ecfp6_iou"]

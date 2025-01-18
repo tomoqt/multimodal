@@ -30,8 +30,7 @@ def is_selfies(s: str) -> bool:
 def evaluate_predictions(predictions, targets, verbose=False):
     """
     Evaluate model predictions vs. targets.
-    Assumes inputs are already in SELFIES format.
-    Performs both direct SELFIES comparison and SMILES-based metrics.
+    Handles both SELFIES and SMILES inputs.
     """
     detailed_results = []
     
@@ -48,20 +47,43 @@ def evaluate_predictions(predictions, targets, verbose=False):
             'ecfp6_iou': 0.0
         }
         
-        # Direct SELFIES comparison
-        result['selfies_exact_match'] = (pred == target)
-            
-        # Convert to SMILES for chemical comparison
+        # Convert to SMILES if input is SELFIES
         try:
-            pred_smiles = sf.decoder(pred)
-            target_smiles = sf.decoder(target)
+            if is_selfies(pred):
+                pred_smiles = sf.decoder(pred)
+            else:
+                pred_smiles = pred
+
+            if is_selfies(target):
+                target_smiles = sf.decoder(target)
+            else:
+                target_smiles = target
+            
+            # Clean up and canonicalize
+            pred_mol = Chem.MolFromSmiles(pred_smiles)
+            target_mol = Chem.MolFromSmiles(target_smiles)
+            
+            if pred_mol and target_mol:
+                # Remove stereochemistry
+                Chem.rdmolops.RemoveStereochemistry(pred_mol)
+                Chem.rdmolops.RemoveStereochemistry(target_mol)
+                
+                # Get canonical SMILES
+                pred_smiles = Chem.MolToSmiles(pred_mol, canonical=True, isomericSmiles=False)
+                target_smiles = Chem.MolToSmiles(target_mol, canonical=True, isomericSmiles=False)
+                
+                # Convert back to SELFIES for comparison
+                pred_selfies = sf.encoder(pred_smiles)
+                target_selfies = sf.encoder(target_smiles)
+                
+                result['selfies_exact_match'] = (pred_selfies == target_selfies)
             
             result['prediction'] = pred_smiles
             result['target'] = target_smiles
             
         except Exception as e:
             if verbose:
-                print(f"Error converting to SMILES: {e}")
+                print(f"Error processing sequence {i}: {e}")
             continue
 
         # Remove spaces before creating molecules
