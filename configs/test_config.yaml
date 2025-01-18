@@ -1,8 +1,8 @@
 # Model Architecture
 model:
   use_concat: True
-  max_seq_length: 80
-  max_nmr_length: 128
+  max_seq_length: 95
+  max_nmr_length: 190
   max_memory_length: 32
   embed_dim: 768
   num_heads: 4
