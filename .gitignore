@@ -88,3 +88,4 @@ tokenized_baseline/
 *.pem
 compressed_datasets/
 nmr_statistics/
+smiles_statistics/
