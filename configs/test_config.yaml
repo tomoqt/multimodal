@@ -2,12 +2,12 @@
 model:
   use_concat: True
   max_seq_length: 80
-  max_nmr_length: 128
+  max_nmr_length: 190
   max_memory_length: 32
-  embed_dim: 768
+  embed_dim: 512
   num_heads: 4
   num_layers: 6
-  dropout: 0.0
+  dropout: 0.1
   resample_size: 1000
 
 # Training Parameters
