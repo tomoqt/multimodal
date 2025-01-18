@@ -79,7 +79,10 @@ def evaluate_predictions(predictions, targets, verbose=False):
             # Get canonical SMILES
             canon_pred = Chem.MolToSmiles(mol_pred, canonical=True)
             canon_target = Chem.MolToSmiles(mol_target, canonical=True)
-            result['exact_match'] = canon_pred == canon_target
+            # Strip any whitespace that might affect comparison
+            canon_pred = canon_pred.strip()
+            canon_target = canon_target.strip()
+            result['exact_match'] = (canon_pred == canon_target)
             result['canonical_pred'] = canon_pred
             result['canonical_target'] = canon_target
 
@@ -106,11 +109,13 @@ def evaluate_predictions(predictions, targets, verbose=False):
 
         if verbose and i < 5:
             print(f"\nExample {i+1}:")
-            print(f"Original SELFIES/SMILES: {pred}")
+            print(f"Original SELFIES: {pred}")
             print(f"Valid molecule: {result['valid']}")
             if result['valid'] and result['valid_target']:
-                print(f"Exact SMILES match: {result['exact_match']}")
-                print(f"Canonical SMILES: {canon_pred}")
+                print(f"SELFIES exact match: {result['selfies_exact_match']}")
+                print(f"Canonical SMILES match: {result['exact_match']}")
+                print(f"Canonical pred: '{result['canonical_pred']}'")
+                print(f"Canonical target: '{result['canonical_target']}'")
             
         detailed_results.append(result)
         
