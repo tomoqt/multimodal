@@ -2,8 +2,8 @@
 model:
   use_concat: True
   max_seq_length: 80
-  max_nmr_length: 128
-  max_memory_length: 64
+  max_nmr_length: 190
+  max_memory_length: 32
   embed_dim: 2048
   num_heads: 16
   num_layers: 8
