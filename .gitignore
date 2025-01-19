@@ -89,3 +89,5 @@ tokenized_baseline/
 compressed_datasets/
 nmr_statistics/
 smiles_statistics/
+pretrain_data/
+pretrained_decoder/

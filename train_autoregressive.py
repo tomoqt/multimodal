@@ -117,7 +117,8 @@ class SpectralSmilesDataset(Dataset):
         with open(self.data_dir / f"src-{split}.txt") as f:
             self.sources = [line.strip() for line in f]
         with open(self.data_dir / f"tgt-{split}.txt") as f:
-            self.targets = [line.strip() for line in f]
+            # Remove spaces when loading SMILES sequences
+            self.targets = [line.strip().replace(" ", "") for line in f]
 
         # Load IR data using numpy.memmap instead of pickle
         ir_path = self.data_dir / f"ir-{split}.npy"
