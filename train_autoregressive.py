@@ -180,7 +180,7 @@ class SpectralSmilesDataset(Dataset):
         selfies = process_smiles_to_selfies(target_seq, idx)
         if selfies is None:
             # Fallback to a simple token if conversion fails
-            selfies = "[C]"
+            raise ValueError(f"Failed to convert SMILES to SELFIES at index {idx}")
         
         target_tokens = self.smiles_tokenizer.encode(
             selfies,
