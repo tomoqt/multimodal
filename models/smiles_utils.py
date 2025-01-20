@@ -39,10 +39,10 @@ def process_smiles_to_selfies(smiles, idx=None):
             return None
 
         # 3) Remove stereochemistry
-        Chem.rdmolops.RemoveStereochemistry(mol)
+        #Chem.rdmolops.RemoveStereochemistry(mol)
         
         # 4) Create clean SMILES (canonical, no stereo)
-        canonical_smiles = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)
+        canonical_smiles = Chem.MolToSmiles(mol, canonical=True)#, isomericSmiles=False)
         
         # 5) Convert to SELFIES
         return sf.encoder(canonical_smiles)

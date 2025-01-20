@@ -65,12 +65,12 @@ def evaluate_predictions(predictions, targets, verbose=False):
             
             if pred_mol and target_mol:
                 # Remove stereochemistry
-                Chem.rdmolops.RemoveStereochemistry(pred_mol)
-                Chem.rdmolops.RemoveStereochemistry(target_mol)
+                #Chem.rdmolops.RemoveStereochemistry(pred_mol)
+                #Chem.rdmolops.RemoveStereochemistry(target_mol)
                 
                 # Get canonical SMILES
-                pred_smiles = Chem.MolToSmiles(pred_mol, canonical=True, isomericSmiles=False)
-                target_smiles = Chem.MolToSmiles(target_mol, canonical=True, isomericSmiles=False)
+                pred_smiles = Chem.MolToSmiles(pred_mol, canonical=True)#, isomericSmiles=False)
+                target_smiles = Chem.MolToSmiles(target_mol, canonical=True)#, isomericSmiles=False)
                 
                 # Convert back to SELFIES for comparison
                 pred_selfies = sf.encoder(pred_smiles)

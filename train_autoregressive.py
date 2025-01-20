@@ -752,6 +752,7 @@ def main():
                     "val_loss": val_metrics['val_loss'],
                     "val_valid_smiles": val_metrics['valid_smiles_rate'],
                     "val_exact_matches": val_metrics['exact_match_rate'],
+                    "val_selfies_exact_matches": val_metrics['selfies_exact_match_rate'],
                     "val_tanimoto": val_metrics['tanimoto_similarity'],
                     "val_mcs_ratio": val_metrics['mcs_ratio'],
                     "val_ecfp6_iou": val_metrics['ecfp6_iou'],
