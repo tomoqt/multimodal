@@ -34,7 +34,7 @@ import time
 from pprint import pprint
 from copy import deepcopy
 from logging_utils import evaluate_predictions, aggregate_metrics, log_results
-
+import heavyball
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
 from models.multimodal_to_smiles import MultiModalToSMILESModel
@@ -148,6 +148,17 @@ class SpectralSmilesDataset(Dataset):
 
         print(f"[Dataset] SpectralSmilesDataset initialized for {split}:")
         print(f"          Found {len(self.sources)} samples")
+
+        # Add debug printing for NMR tokens
+        print(f"\n[Debug] Inspecting first 3 NMR sequences from {split} split:")
+        for i in range(min(3, len(self.sources))):
+            nmr_seq = self.sources[i]
+            nmr_tokens = nmr_seq.split()
+            print(f"\nSequence {i+1}:")
+            print("Raw tokens:", nmr_tokens[:10], "..." if len(nmr_tokens) > 10 else "")
+            print("Token IDs:", [spectral_tokenizer.get(token, spectral_tokenizer["<UNK>"]) for token in nmr_tokens[:10]], 
+                  "..." if len(nmr_tokens) > 10 else "")
+            print("Sequence length:", len(nmr_tokens))
 
     def __len__(self):
         return len(self.sources)
@@ -376,6 +387,17 @@ def load_config(config_path=None):
             'project': "smiles-generation",
             'base_run_name': "smiles_gen",
             'log_examples': True
+        },
+        'optimizer': {
+            'type': 'adamw',
+            'adamw': {
+                'betas': (0.9, 0.999),
+                'eps': 1e-8,
+                'weight_decay': 0.01
+            },
+            'foreachadopt': {
+                'caution': True
+            }
         }
     }
 
@@ -482,7 +504,22 @@ def main():
     criterion = nn.CrossEntropyLoss(
         ignore_index=tokenizer.pad_token_id
     )
-    optimizer = optim.AdamW(model.parameters(), lr=config['training']['learning_rate'])
+
+    # Initialize optimizer based on config
+    if config.get('optimizer', {}).get('type', 'adamw') == 'foreachadopt':
+        optimizer = heavyball.ForeachADOPT(
+            model.parameters(), 
+            lr=config['training']['learning_rate'],
+            caution=config['optimizer']['foreachadopt'].get('caution', True)
+        )
+    else:  # default to AdamW
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config['training']['learning_rate'],
+            betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
+            eps=config['optimizer']['adamw'].get('eps', 1e-8),
+            weight_decay=config['optimizer']['adamw'].get('weight_decay', 0.01)
+        )
 
     # Calculate total training steps (batches per epoch * num epochs)
     total_training_steps = len(train_loader) * config['training']['num_epochs']

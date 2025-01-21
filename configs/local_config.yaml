@@ -21,6 +21,16 @@ training:
   logging_frequency: 10
   save_frequency: 1000
 
+# Optimizer
+optimizer:
+  type: "adamw"  # Options: "adamw" or "foreachadopt"
+  foreachadopt:
+    caution: True  # Whether to use caution mode in ForeachADOPT
+  adamw:
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.01
+
 # Scheduler
 scheduler:
   config: cosine
