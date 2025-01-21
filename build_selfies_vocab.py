@@ -2,6 +2,7 @@ import os
 from models.selfies_tokenizer import SelfiesTokenizer, BasicSelfiesTokenizer, load_vocab
 from tqdm import tqdm
 import selfies as sf
+from models.smiles_utils import safe_selfies_conversion, process_smiles_to_selfies
 
 def build_vocab_from_data(data_dir):
     """Build SELFIES vocabulary from data files"""
@@ -21,29 +22,64 @@ def build_vocab_from_data(data_dir):
     for smiles in smiles_list[:5]:
         print(f"  {smiles}")
     
-    # Build vocabulary
+    # Build vocabulary by collecting all unique SELFIES tokens
     print("\nBuilding vocabulary...")
-    vocab_file = SelfiesTokenizer.build_vocab_from_smiles(smiles_list)
-    print(f"\nCreated vocabulary file: {vocab_file}")
+    basic_tokenizer = BasicSelfiesTokenizer()
+    unique_tokens = set()
+    
+    # Add special tokens first
+    special_tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+    unique_tokens.update(special_tokens)
+    
+    # Process each SMILES and collect unique SELFIES tokens
+    for smiles in tqdm(smiles_list, desc="Processing SMILES"):
+        try:
+            # Convert SMILES to SELFIES using the safe conversion function
+            selfies = process_smiles_to_selfies(smiles)
+            if selfies is None:
+                continue
+                
+            # Tokenize the SELFIES string
+            tokens = basic_tokenizer.tokenize(selfies)
+            unique_tokens.update(tokens)
+        except Exception as e:
+            print(f"Error processing SMILES: {smiles}")
+            print(f"Error message: {e}")
+            continue
+    
+    # Sort tokens (keeping special tokens at the start)
+    vocab_list = special_tokens + sorted(list(unique_tokens - set(special_tokens)))
+    
+    # Save vocabulary to file
+    vocab_file = "selfies_vocab.txt"
+    with open(vocab_file, "w", encoding="utf-8") as f:
+        for token in vocab_list:
+            f.write(token + "\n")
+
+    print(f"\nCreated vocabulary with {len(vocab_list)} tokens")
+    print(f"- {len(special_tokens)} special tokens")
+    print(f"- {len(unique_tokens) - len(special_tokens)} SELFIES tokens")
     
     # Verify the vocabulary
     print("\nVerifying vocabulary...")
-    # Load vocab directly instead of using the full tokenizer
     vocab = load_vocab(vocab_file)
     print(f"Loaded vocabulary with {len(vocab)} tokens")
     
-    # Test tokenization on a few examples using BasicSelfiesTokenizer
+    # Test tokenization on a few examples
     print("\nTesting tokenization on sample SMILES:")
-    basic_tokenizer = BasicSelfiesTokenizer()
     for smiles in smiles_list[:5]:
         try:
-            # Clean up SMILES and convert to SELFIES
-            clean_smiles = ''.join(smiles.split())
-            selfies = sf.encoder(clean_smiles)
+            # Convert SMILES to SELFIES
+            selfies = process_smiles_to_selfies(smiles)
+            if selfies is None:
+                print(f"\nError converting SMILES: {smiles}")
+                continue
+                
             tokens = basic_tokenizer.tokenize(selfies)
             print(f"\nSMILES: {smiles}")
             print(f"SELFIES: {selfies}")
             print(f"Tokens: {tokens}")
+            
             # Check if tokens are in vocabulary
             missing_tokens = [t for t in tokens if t not in vocab]
             if missing_tokens:

@@ -136,7 +136,8 @@ class SpectralSmilesDataset(Dataset):
         with open(self.data_dir / f"src-{split}.txt") as f:
             self.sources = [line.strip() for line in f]
         with open(self.data_dir / f"tgt-{split}.txt") as f:
-            self.targets = [line.strip() for line in f]
+            # Remove spaces when loading SMILES sequences
+            self.targets = [line.strip().replace(" ", "") for line in f]
 
         # Load IR data using numpy.memmap instead of pickle
         ir_path = self.data_dir / f"ir-{split}.npy"
@@ -166,6 +167,85 @@ class SpectralSmilesDataset(Dataset):
 
         print(f"[Dataset] SpectralSmilesDataset initialized for {split}:")
         print(f"          Found {len(self.sources)} samples")
+
+        # Add detailed inspection of data samples
+        print(f"\n{'='*80}")
+        print(f"[Data Inspection] Detailed view of first 5 samples from {split} split:")
+        print(f"{'='*80}")
+        
+        for i in range(min(5, len(self.sources))):
+            print(f"\n[Sample {i+1}]")
+            print("-" * 40)
+            
+            # Print NMR data
+            nmr_seq = self.sources[i]
+            nmr_tokens = nmr_seq.split()
+            print("NMR Data:")
+            print(f"  Raw tokens : {nmr_tokens}")
+            print(f"  Token IDs : {[spectral_tokenizer.get(token, spectral_tokenizer['<UNK>']) for token in nmr_tokens]}")
+            print(f"  Total NMR tokens: {len(nmr_tokens)}")
+            
+            # Print SMILES data
+            smiles_seq = self.targets[i]
+            print("\nSMILES Data:")
+            print(f"  Raw SMILES: {smiles_seq}")
+            
+            # Tokenize SMILES
+            smiles_tokens = smiles_tokenizer.encode(
+                smiles_seq,
+                add_special_tokens=True,
+                max_length=max_smiles_len,
+                truncation=True
+            )
+            decoded_smiles = smiles_tokenizer.decode(smiles_tokens)
+            
+            print(f"  Tokenized IDs: {smiles_tokens}")
+            print(f"  Decoded tokens: {decoded_smiles}")
+            print(f"  Total SMILES tokens: {len(smiles_tokens)}")
+            
+            # Print IR data if available
+            if self.ir_data is not None:
+                ir_sample = self.ir_data[i]
+                print("\nIR Data:")
+                print(f"  Shape: {ir_sample.shape}")
+                print(f"  First 5 values: {ir_sample[:5]}")
+                print(f"  Min/Max values: {ir_sample.min():.3f}/{ir_sample.max():.3f}")
+            
+            print("-" * 40)
+        
+        print(f"\n{'='*80}")
+        print("[Data Inspection] End of detailed inspection")
+        print(f"{'='*80}\n")
+
+        # Add debug printing for NMR tokens
+        print(f"\n[Debug] Inspecting first 3 NMR sequences from {split} split:")
+        for i in range(min(3, len(self.sources))):
+            nmr_seq = self.sources[i]
+            nmr_tokens = nmr_seq.split()
+            print(f"\nSequence {i+1}:")
+            print("Raw tokens:", nmr_tokens[:10], "..." if len(nmr_tokens) > 10 else "")
+            print("Token IDs:", [spectral_tokenizer.get(token, spectral_tokenizer["<UNK>"]) for token in nmr_tokens[:10]], 
+                  "..." if len(nmr_tokens) > 10 else "")
+            print("Sequence length:", len(nmr_tokens))
+
+        # Add debug printing for SMILES sequences
+        print(f"\n[Debug] Inspecting first 3 SMILES sequences from {split} split:")
+        for i in range(min(3, len(self.targets))):
+            smiles_seq = self.targets[i]
+            print(f"\nSMILES {i+1}:")
+            print("Raw SMILES (before tokenization):", smiles_seq)
+            tokens = smiles_tokenizer.encode(
+                smiles_seq,
+                add_special_tokens=True,
+                max_length=max_smiles_len,
+                truncation=True
+            )
+            decoded = smiles_tokenizer.decode(tokens)
+            decoded_no_spaces = decoded.replace(" ", "")
+            print("Tokenized IDs:", tokens)
+            print("Decoded (space-separated tokens):", decoded)
+            print("Decoded (no spaces):", decoded_no_spaces)
+            print("Token count:", len(tokens))
 
     def __len__(self):
         return len(self.sources)
