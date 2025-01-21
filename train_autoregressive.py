@@ -393,7 +393,8 @@ def load_config(config_path=None):
             'adamw': {
                 'betas': (0.9, 0.999),
                 'eps': 1e-8,
-                'weight_decay': 0.01
+                'weight_decay': 0.01,
+                'caution': False
             },
             'foreachadopt': {
                 'caution': True
@@ -512,14 +513,25 @@ def main():
             lr=config['training']['learning_rate'],
             caution=config['optimizer']['foreachadopt'].get('caution', True)
         )
-    else:  # default to AdamW
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=config['training']['learning_rate'],
-            betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
-            eps=config['optimizer']['adamw'].get('eps', 1e-8),
-            weight_decay=config['optimizer']['adamw'].get('weight_decay', 0.01)
-        )
+    else:  # AdamW variants
+        use_caution = config['optimizer']['adamw'].get('caution', False)
+        if use_caution:
+            optimizer = heavyball.AdamW(
+                model.parameters(),
+                lr=config['training']['learning_rate'],
+                betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
+                eps=config['optimizer']['adamw'].get('eps', 1e-8),
+                weight_decay=config['optimizer']['adamw'].get('weight_decay', 0.01),
+                caution=True
+            )
+        else:
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=config['training']['learning_rate'],
+                betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
+                eps=config['optimizer']['adamw'].get('eps', 1e-8),
+                weight_decay=config['optimizer']['adamw'].get('weight_decay', 0.01)
+            )
 
     # Calculate total training steps (batches per epoch * num epochs)
     total_training_steps = len(train_loader) * config['training']['num_epochs']
