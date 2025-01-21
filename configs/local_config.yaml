@@ -23,7 +23,7 @@ training:
 
 # Optimizer
 optimizer:
-  type: "adamw"  # Options: "adamw" or "foreachadopt"
+  type: "foreachadopt"  # Options: "adamw" or "foreachadopt"
   foreachadopt:
     caution: True  # Whether to use caution mode in ForeachADOPT
   adamw:
