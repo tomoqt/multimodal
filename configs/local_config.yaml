@@ -4,9 +4,9 @@ model:
   max_seq_length: 80
   max_nmr_length: 190
   max_memory_length: 64
-  embed_dim: 2400
-  num_heads: 8
-  num_layers: 10
+  embed_dim: 2048
+  num_heads: 16
+  num_layers: 8
   dropout: 0
   resample_size: 1000
 
