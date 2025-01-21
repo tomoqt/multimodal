@@ -160,6 +160,25 @@ class SpectralSmilesDataset(Dataset):
                   "..." if len(nmr_tokens) > 10 else "")
             print("Sequence length:", len(nmr_tokens))
 
+        # Add debug printing for SMILES sequences
+        print(f"\n[Debug] Inspecting first 3 SMILES sequences from {split} split:")
+        for i in range(min(3, len(self.targets))):
+            smiles_seq = self.targets[i]
+            print(f"\nSMILES {i+1}:")
+            print("Raw SMILES (before tokenization):", smiles_seq)
+            tokens = smiles_tokenizer.encode(
+                smiles_seq,
+                add_special_tokens=True,
+                max_length=max_smiles_len,
+                truncation=True
+            )
+            decoded = smiles_tokenizer.decode(tokens)
+            decoded_no_spaces = decoded.replace(" ", "")
+            print("Tokenized IDs:", tokens)
+            print("Decoded (space-separated tokens):", decoded)
+            print("Decoded (no spaces):", decoded_no_spaces)
+            print("Token count:", len(tokens))
+
     def __len__(self):
         return len(self.sources)
 

@@ -30,7 +30,7 @@ optimizer:
     betas: [0.9, 0.999]
     eps: 1.0e-8
     weight_decay: 0.01
-    caution: True  # Whether to use heavyball's AdamW with caution mode
+    caution: False  # Whether to use heavyball's AdamW with caution mode
 
 # Scheduler
 scheduler:
