@@ -541,12 +541,17 @@ def main():
         )
     elif optimizer_type == 'ortho_adamw':
         # Use our orthogonal gradient wrapper with AdamW
+        # Separate base optimizer args from ortho args
         base_args = {
             'lr': config['training']['learning_rate'],
             'betas': config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
-            'eps': config['optimizer']['adamw'].get('eps', 1e-8),
             'weight_decay': config['optimizer']['adamw'].get('weight_decay', 0.01)
         }
+        # Only pass eps to base optimizer if not using ortho's eps
+        if not config['optimizer'].get('ortho', {}).get('eps'):
+            base_args['eps'] = config['optimizer']['adamw'].get('eps', 1e-8)
+            
+        # Create optimizer with proper parameter separation
         optimizer = OrthoGrad(
             model.parameters(),
             base_optimizer_cls=optim.AdamW,
