@@ -21,6 +21,18 @@ training:
   logging_frequency: 10
   save_frequency: 1000
 
+# Optimizer Configuration
+optimizer:
+  type: ortho_adamw  # Use orthogonal gradient optimization
+  adamw:  # Base optimizer settings
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.01
+    caution: false
+  ortho:  # Orthogonal gradient settings
+    eps: 1.0e-30
+    rescale: true
+
 # Scheduler
 scheduler:
   type: cosine

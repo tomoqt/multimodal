@@ -35,6 +35,7 @@ from pprint import pprint
 from copy import deepcopy
 from logging_utils import evaluate_predictions, aggregate_metrics, log_results
 import heavyball
+from ortho_grad import OrthoGrad  # Import our new optimizer wrapper
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
 from models.multimodal_to_smiles import MultiModalToSMILESModel
@@ -408,7 +409,7 @@ def load_config(config_path=None):
             'log_examples': True
         },
         'optimizer': {
-            'type': 'adamw',
+            'type': 'adamw',  # Options: 'adamw', 'foreachadopt', 'ortho_adamw'
             'adamw': {
                 'betas': (0.9, 0.999),
                 'eps': 1e-8,
@@ -417,6 +418,10 @@ def load_config(config_path=None):
             },
             'foreachadopt': {
                 'caution': True
+            },
+            'ortho': {
+                'eps': 1e-30,
+                'rescale': True
             }
         }
     }
@@ -526,11 +531,28 @@ def main():
     )
 
     # Initialize optimizer based on config
-    if config.get('optimizer', {}).get('type', 'adamw') == 'foreachadopt':
+    optimizer_type = config.get('optimizer', {}).get('type', 'adamw')
+    
+    if optimizer_type == 'foreachadopt':
         optimizer = heavyball.ForeachADOPT(
             model.parameters(), 
             lr=config['training']['learning_rate'],
             caution=config['optimizer']['foreachadopt'].get('caution', True)
+        )
+    elif optimizer_type == 'ortho_adamw':
+        # Use our orthogonal gradient wrapper with AdamW
+        base_args = {
+            'lr': config['training']['learning_rate'],
+            'betas': config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
+            'eps': config['optimizer']['adamw'].get('eps', 1e-8),
+            'weight_decay': config['optimizer']['adamw'].get('weight_decay', 0.01)
+        }
+        optimizer = OrthoGrad(
+            model.parameters(),
+            base_optimizer_cls=optim.AdamW,
+            eps=config['optimizer']['ortho'].get('eps', 1e-30),
+            rescale=config['optimizer']['ortho'].get('rescale', True),
+            **base_args
         )
     else:  # AdamW variants
         use_caution = config['optimizer']['adamw'].get('caution', False)
@@ -551,6 +573,12 @@ def main():
                 eps=config['optimizer']['adamw'].get('eps', 1e-8),
                 weight_decay=config['optimizer']['adamw'].get('weight_decay', 0.01)
             )
+
+    print(f"[Main] Using optimizer: {optimizer_type}")
+    if optimizer_type == 'ortho_adamw':
+        print(f"      - Base optimizer: AdamW")
+        print(f"      - Orthogonalization eps: {config['optimizer']['ortho'].get('eps', 1e-30)}")
+        print(f"      - Rescale gradients: {config['optimizer']['ortho'].get('rescale', True)}")
 
     # Calculate total training steps (batches per epoch * num epochs)
     total_training_steps = len(train_loader) * config['training']['num_epochs']
