@@ -9,6 +9,7 @@ model:
   num_layers: 6
   dropout: 0.0
   resample_size: 1000
+  use_stablemax: False
 
 # Training Parameters
 training:

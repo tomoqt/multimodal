@@ -24,7 +24,8 @@ class MultiModalToSMILESModel(nn.Module):
         num_heads: int = 8,
         num_layers: int = 6,
         dropout: float = 0.1,
-        verbose: bool = False
+        verbose: bool = False,
+        use_stablemax: bool = False
     ):
         """
         Args:
@@ -38,6 +39,7 @@ class MultiModalToSMILESModel(nn.Module):
             num_layers: Number of decoder layers.
             dropout:    Dropout probability in the decoder.
             verbose:    If True, print debugging shapes in forward pass.
+            use_stablemax: If True, use stablemax instead of softmax in the decoder.
         """
         super().__init__()
         self.verbose = verbose
@@ -60,7 +62,8 @@ class MultiModalToSMILESModel(nn.Module):
             num_heads=num_heads,
             num_layers=num_layers,
             dropout=dropout,
-            verbose=verbose
+            verbose=verbose,
+            use_stablemax=use_stablemax
         )
 
     def forward(

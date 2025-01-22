@@ -381,7 +381,8 @@ def load_config(config_path=None):
             'num_layers': 6,
             'dropout': 0.1,
             'resample_size': 1000,
-            'use_concat': True
+            'use_concat': True,
+            'use_stablemax': False
         },
         'training': {
             'batch_size': 32,
@@ -483,7 +484,8 @@ def main():
         num_heads=config['model']['num_heads'],
         num_layers=config['model']['num_layers'],
         dropout=config['model']['dropout'],
-        verbose=False
+        verbose=False,
+        use_stablemax=config['model'].get('use_stablemax', False)
     ).to(device)
 
     print("\n[Main] Creating data loaders...")

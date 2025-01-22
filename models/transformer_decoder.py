@@ -1,6 +1,7 @@
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 class RotaryEmbedding(th.nn.Module):
     def __init__(self, dim, base=10000):
@@ -33,8 +34,21 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     cos, sin = cos[..., : q.shape[-2], :], sin[..., : q.shape[-2], :]
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
+def s(x, epsilon=1e-30):
+    """Helper function for stablemax computation"""
+    return th.where(
+        x < 0,
+        1 / (1 - x + epsilon),
+        x + 1
+    )
+
+def log_stablemax(x, dim=-1):
+    """Compute log of stablemax for enhanced numerical stability"""
+    s_x = s(x)
+    return th.log(s_x / th.sum(s_x, dim=dim, keepdim=True))
+
 class DecoderPromptLayer(nn.Module):
-    def __init__(self, d_model: int, memory_dim: int, nhead: int, d_ffn: int=2048, dropout=0.1, use_rope: bool = False):
+    def __init__(self, d_model: int, memory_dim: int, nhead: int, d_ffn: int=2048, dropout=0.1, use_rope: bool = False, use_stablemax: bool = False):
         super().__init__()
         """ Same application as `DecoderLayer` but removes the x-attn part and only usesself-attn
         The `memory` is injected as the prompt, and allowed to fully interact. 
@@ -47,6 +61,7 @@ class DecoderPromptLayer(nn.Module):
         self.nhead = nhead
         self.head_dim = d_model // nhead
         self.use_rope = use_rope
+        self.use_stablemax = use_stablemax
         assert use_rope, "Other posemb than rope not supported atm"
         if use_rope:
             self.rotary_ndims = int(self.head_dim * 0.5)
@@ -92,7 +107,18 @@ class DecoderPromptLayer(nn.Module):
             q = th.cat((q, query_pass), dim=-1)
             k = th.cat((k, key_pass), dim=-1)
 
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
+        # Modified attention computation to use stablemax if enabled
+        if self.use_stablemax:
+            # Compute attention scores
+            scores = (q @ k.transpose(-2, -1)) / math.sqrt(DH)
+            if mask is not None:
+                scores = scores.masked_fill(~mask, float('-inf'))
+            # Use log_stablemax instead of softmax
+            attn_weights = log_stablemax(scores, dim=-1).exp()
+            attn = attn_weights @ v
+        else:
+            # Use standard scaled dot-product attention
+            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
 
         attn = attn.transpose(1, 2).contiguous().view(B, T, -1)
         xattn = self.attn_dropout(self.out(attn))
@@ -119,7 +145,8 @@ class SMILESDecoder(nn.Module):
         num_heads: int = 8,
         num_layers: int = 6,
         dropout: int = 0.1,
-        verbose: bool = True
+        verbose: bool = True,
+        use_stablemax: bool = False  # Add this parameter
     ):
         super().__init__()
         
@@ -139,7 +166,7 @@ class SMILESDecoder(nn.Module):
         # Add input projection for memory if dimensions don't match
         self.memory_proj = nn.Linear(memory_dim, embed_dim) if memory_dim != embed_dim else nn.Identity()
         
-        # Create decoder layers
+        # Create decoder layers with stablemax option
         self.layers = nn.ModuleList([
             DecoderPromptLayer(
                 d_model=embed_dim,
@@ -147,9 +174,13 @@ class SMILESDecoder(nn.Module):
                 nhead=num_heads,
                 d_ffn=embed_dim * 4,
                 dropout=dropout,
-                use_rope=True
+                use_rope=True,
+                use_stablemax=use_stablemax  # Pass the stablemax option
             ) for _ in range(num_layers)
         ])
+        
+        # Add final layer norm
+        self.final_norm = nn.LayerNorm(embed_dim)
         
         # Output projection to SMILES vocabulary
         self.out = nn.Linear(embed_dim, smiles_vocab_size)
@@ -240,6 +271,7 @@ class SMILESDecoder(nn.Module):
         
         # Only project the target sequence portion to vocabulary
         x_target = x[:, M:]  # Extract only the target sequence part
+        x_target = self.final_norm(x_target)  # Apply final layer normalization
         out = self.out(x_target)  # (B, T, vocab_size)
         
         if self.verbose:
