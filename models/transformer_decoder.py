@@ -34,18 +34,45 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     cos, sin = cos[..., : q.shape[-2], :], sin[..., : q.shape[-2], :]
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
-def s(x, epsilon=1e-30):
-    """Helper function for stablemax computation"""
-    return th.where(
-        x < 0,
-        1 / (1 - x + epsilon),
-        x + 1
-    )
+def stable_s(x, clamp_val=20.0, epsilon=1e-9):
+    """
+    Piecewise transform:
+        s(x) = 1 / (1 - x + epsilon)   if x < 0
+               x + 1                  if x >= 0
+    
+    with added clamping and replacements to avoid NaNs.
+    """
+    # 1) Replace +/- inf with 0.0 (or some sentinel value)
+    x = th.where(th.isinf(x), th.tensor(0.0, device=x.device, dtype=x.dtype), x)
 
-def log_stablemax(x, dim=-1):
-    """Compute log of stablemax for enhanced numerical stability"""
-    s_x = s(x)
-    return th.log(s_x / th.sum(s_x, dim=dim, keepdim=True))
+    # 2) Clamp to avoid huge magnitudes: [-20, 20] is somewhat arbitrary, 
+    #    but typically prevents float over-/under-flow in exponent-like transforms
+    x = x.clamp(-clamp_val, clamp_val)
+
+    # 3) Apply your piecewise function
+    s_x = th.where(
+        x < 0,
+        1.0 / (1.0 - x + epsilon),  # denominator won't blow up unless x ~ 1
+        x + 1.0
+    )
+    return s_x
+
+
+def stablemax(x, dim=-1, clamp_val=20.0, epsilon=1e-9):
+    """
+    'Stablemax' using the piecewise transform above, plus a safe denominator.
+    """
+    # 1) Transform
+    s_x = stable_s(x, clamp_val=clamp_val, epsilon=epsilon)
+
+    # 2) Sum along dim
+    denom = s_x.sum(dim=dim, keepdim=True)
+
+    # 3) Avoid zero denominator -> clamp_min
+    denom = denom.clamp_min(epsilon)
+
+    # 4) Divide
+    return s_x / denom
 
 class DecoderPromptLayer(nn.Module):
     def __init__(self, d_model: int, memory_dim: int, nhead: int, d_ffn: int=2048, dropout=0.1, use_rope: bool = False, use_stablemax: bool = False):
@@ -111,10 +138,15 @@ class DecoderPromptLayer(nn.Module):
         if self.use_stablemax:
             # Compute attention scores
             scores = (q @ k.transpose(-2, -1)) / math.sqrt(DH)
+
+            
             if mask is not None:
                 scores = scores.masked_fill(~mask, float('-inf'))
-            # Use log_stablemax instead of softmax
-            attn_weights = log_stablemax(scores, dim=-1).exp()
+
+            
+            # Use stablemax directly
+            attn_weights = stablemax(scores, dim=-1)
+
             attn = attn_weights @ v
         else:
             # Use standard scaled dot-product attention

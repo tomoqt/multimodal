@@ -4,12 +4,12 @@ model:
   max_seq_length: 95
   max_nmr_length: 190
   max_memory_length: 32
-  embed_dim: 768
+  embed_dim: 512
   num_heads: 4
   num_layers: 6
   dropout: 0.0
   resample_size: 1000
-  use_stablemax: False
+  use_stablemax: True
 
 # Training Parameters
 training:
@@ -31,7 +31,7 @@ optimizer:
     weight_decay: 0.01
     caution: false
   ortho:  # Orthogonal gradient settings
-    eps: 1.0e-30
+    eps: 1.0e-8
     rescale: true
 
 # Scheduler
