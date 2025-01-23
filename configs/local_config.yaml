@@ -1,7 +1,7 @@
 # Model Architecture
 model:
   use_concat: True
-  max_seq_length: 80
+  max_seq_length: 95
   max_nmr_length: 190
   max_memory_length: 32
   embed_dim: 2048
@@ -9,6 +9,7 @@ model:
   num_layers: 8
   dropout: 0.1
   resample_size: 1000
+  use_stablemax: True
 
 # Training Parameters
 training:
@@ -21,21 +22,23 @@ training:
   logging_frequency: 10
   save_frequency: 1000
 
-# Optimizer
+# Optimizer Configuration
 optimizer:
-  type: "adamw"  # Options: "adamw" or "foreachadopt"
-  foreachadopt:
-    caution: True  # Whether to use caution mode in ForeachADOPT
-  adamw:
+  type: ortho_adamw  # Use orthogonal gradient optimization
+  adamw:  # Base optimizer settings
     betas: [0.9, 0.999]
     eps: 1.0e-8
     weight_decay: 0.01
-    caution: False  # Whether to use heavyball's AdamW with caution mode
+    caution: false
+  ortho:  # Orthogonal gradient settings
+    eps: 1.0e-8
+    rescale: true
 
 # Scheduler
 scheduler:
-  config: cosine
+  type: cosine
   warmup_steps: 100
+
 
 # Data
 data:
