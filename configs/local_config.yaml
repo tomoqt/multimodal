@@ -4,7 +4,7 @@ model:
   max_seq_length: 95
   max_nmr_length: 190
   max_memory_length: 32
-  embed_dim: 2048
+  embed_dim: 768
   num_heads: 16
   num_layers: 8
   dropout: 0.1
@@ -13,7 +13,7 @@ model:
 
 # Training Parameters
 training:
-  batch_size: 28
+  batch_size: 32
   test_batch_size: 1
   num_epochs: 10
   learning_rate: 1.0e-4
