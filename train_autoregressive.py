@@ -48,6 +48,145 @@ vocab_path = os.path.join(current_dir, 'vocab.txt')
 tokenizer = SmilesTokenizer(vocab_file=vocab_path)
 
 
+def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=None):
+    """
+    Simple greedy decoding for SMILES generation.
+    Args:
+        model: The MultiModalToSMILESModel instance
+        nmr_tokens: NMR token tensor or None
+        ir_data: IR data tensor or None
+        tokenizer: SmilesTokenizer instance
+        max_len: Maximum sequence length for generation
+        device: torch device to use
+    """
+    if device is None:
+        device = next(model.parameters()).device
+    
+    # Get tokenizer's special token IDs
+    BOS_TOKEN_ID = tokenizer.cls_token_id  # [CLS] token is used as BOS
+    EOS_TOKEN_ID = tokenizer.sep_token_id  # [SEP] token is used as EOS
+    PAD_TOKEN_ID = tokenizer.pad_token_id
+        
+    model.eval()
+    with torch.no_grad():
+        # Get batch size from input data
+        batch_size = 1  # Default
+        if nmr_tokens is not None:
+            batch_size = nmr_tokens.size(0)
+        elif ir_data is not None:
+            batch_size = ir_data.size(0)
+            
+        # Start tokens for each sequence in the batch
+        current_token = torch.tensor([[BOS_TOKEN_ID]] * batch_size, device=device)
+        
+        # Encode spectral data - pass as positional args
+        memory = model.encoder(None, ir_data, None)  # NMR tokens not needed here
+        
+        # Initialize storage for generated tokens
+        generated_sequences = [[] for _ in range(batch_size)]
+        for seq in generated_sequences:
+            seq.append(BOS_TOKEN_ID)
+        
+        # Use model's max sequence length as the limit
+        max_len = min(max_len, model.decoder.max_seq_length)
+        
+        finished_sequences = [False] * batch_size
+        
+        for _ in range(max_len):
+            # Get next token predictions - pass nmr_tokens through
+            logits = model.decoder(
+                tgt=current_token,
+                memory=memory,
+                nmr_tokens=nmr_tokens  # NMR tokens used here
+            )
+            next_token = logits[:, -1:].argmax(dim=-1)
+            
+            # Update each sequence
+            for i in range(batch_size):
+                if not finished_sequences[i]:
+                    token = next_token[i].item()
+                    generated_sequences[i].append(token)
+                    if token == EOS_TOKEN_ID:
+                        finished_sequences[i] = True
+            
+            # Stop if all sequences are finished
+            if all(finished_sequences):
+                break
+            
+            current_token = torch.cat([current_token, next_token], dim=1)
+        
+        # Decode sequences
+        decoded_sequences = []
+        for seq in generated_sequences:
+            # Find EOS token if present
+            try:
+                eos_idx = seq.index(EOS_TOKEN_ID)
+                seq = seq[:eos_idx]  # Exclude EOS token
+            except ValueError:
+                pass  # No EOS found, use full sequence
+            
+            # Remove BOS token and decode
+            decoded = tokenizer.decode(seq[1:])  # Skip BOS token
+            decoded_sequences.append(decoded)
+            
+        return decoded_sequences
+
+
+def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examples=None):
+    """Evaluate model using greedy decoding"""
+    model.eval()
+    all_predictions = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for target_tokens, ir_data, nmr_tokens, _ in tqdm(test_loader, desc="Greedy decoding"):
+            # Move data to device
+            if ir_data is not None:
+                ir_data = ir_data.to(device)
+            if nmr_tokens is not None:
+                nmr_tokens = nmr_tokens.to(device)
+            
+            # Generate predictions
+            predictions = greedy_decode(
+                model=model,
+                nmr_tokens=nmr_tokens,
+                ir_data=ir_data,
+                tokenizer=tokenizer,
+                device=device
+            )
+            
+            # Get target sequences
+            targets = []
+            for tgt in target_tokens:
+                # Find EOS token if present
+                try:
+                    eos_idx = tgt.tolist().index(tokenizer.sep_token_id)
+                    tgt = tgt[:eos_idx]
+                except ValueError:
+                    pass
+                
+                # Decode target sequence
+                decoded = tokenizer.decode(tgt[1:])  # Skip BOS token
+                targets.append(decoded)
+            
+            all_predictions.extend(predictions)
+            all_targets.extend(targets)
+            
+            if num_examples and len(all_predictions) >= num_examples:
+                break
+    
+    # Calculate metrics
+    detailed_results = evaluate_predictions(all_predictions, all_targets)
+    metrics = aggregate_metrics(detailed_results)
+    
+    # Add predictions and targets to metrics
+    metrics['predictions'] = all_predictions[:10]  # Store first 10 examples
+    metrics['targets'] = all_targets[:10]
+    metrics['num_samples'] = len(all_predictions)
+    
+    return metrics
+
+
 # -------------------------------------------------------------------------
 # Linear Warmup + Cosine/Constant LR Scheduler
 # -------------------------------------------------------------------------
@@ -394,7 +533,8 @@ def load_config(config_path=None):
             'logging_frequency': 100,
             'save_frequency': 1000,
             'generate_during_training': False,
-            'save_local': False
+            'save_local': False,
+            'greedy_decode_frequency': 1000
         },
         'scheduler': {
             'type': 'constant',  # or 'cosine'
@@ -614,6 +754,7 @@ def main():
     NUM_EPOCHS = config['training']['num_epochs']
     validation_frequency = config['training']['validation_frequency']
     logging_frequency = config['training']['logging_frequency']
+    greedy_decode_frequency = config['training'].get('greedy_decode_frequency', 1000)
     best_val_loss = float('inf')
     global_step = 0
 
@@ -701,8 +842,8 @@ def main():
             'tanimoto_similarity': metrics['avg_tanimoto'],
             'mcs_ratio': metrics['avg_#mcs/#target'],
             'ecfp6_iou': metrics['avg_ecfp6_iou'],
-            'predictions': predictions[:10],  # Store all predictions
-            'targets': targets[:10],         # Store all targets
+            'predictions': predictions[:10],  # Store first 10 predictions
+            'targets': targets[:10],         # Store first 10 targets
             'num_samples': len(predictions)
         }
         
@@ -840,6 +981,50 @@ def main():
                     wandb.log_artifact(artifact, aliases=["latest", f"step_{global_step}"])
                     print("[Main] Checkpoint artifact saved to W&B.")
 
+            # Periodic greedy decode evaluation
+            if global_step % greedy_decode_frequency == 0:
+                print(f"\nRunning greedy decode evaluation at step {global_step}...")
+                greedy_metrics = evaluate_with_greedy_decode(
+                    model=model,
+                    test_loader=test_loader,
+                    tokenizer=tokenizer,
+                    device=device,
+                    num_examples=10  # Evaluate on 100 examples for speed
+                )
+                
+                # Create a new table for greedy decode examples
+                greedy_table = wandb.Table(columns=columns)
+                
+                # Log sample results
+                for pred, tgt in zip(greedy_metrics['predictions'], greedy_metrics['targets']):
+                    # Calculate metrics for this pair
+                    pair_results = evaluate_predictions([pred], [tgt])[0]
+                    greedy_table.add_data(
+                        global_step,
+                        pred,
+                        tgt,
+                        pair_results['exact_match'],
+                        pair_results['tanimoto'],
+                        pair_results['#mcs/#target'],
+                        pair_results['ecfp6_iou']
+                    )
+                
+                # Log metrics
+                wandb.log({
+                    "greedy_valid_smiles": greedy_metrics['valid_smiles'],
+                    "greedy_exact_matches": greedy_metrics['exact_match'],
+                    "greedy_exact_matches_all": greedy_metrics['exact_match_all'],
+                    "greedy_tanimoto": greedy_metrics['avg_tanimoto'],
+                    "greedy_mcs_ratio": greedy_metrics['avg_#mcs/#target'],
+                    "greedy_ecfp6_iou": greedy_metrics['avg_ecfp6_iou'],
+                    "greedy_examples": greedy_table,
+                    "global_step": global_step
+                }, step=global_step)
+                
+                print(f"[Greedy] Valid SMILES: {greedy_metrics['valid_smiles']:.2%}")
+                print(f"[Greedy] Exact matches: {greedy_metrics['exact_match']:.2%}")
+                print(f"[Greedy] Tanimoto similarity: {greedy_metrics['avg_tanimoto']:.4f}")
+
         avg_epoch_loss = epoch_loss / max(num_batches, 1)
         print(f"Epoch {epoch+1} completed | Average Loss: {avg_epoch_loss:.4f}")
 
@@ -848,6 +1033,25 @@ def main():
     final_test_loss = validate(model, test_loader, criterion, tokenizer, device)
     wandb.log({"test_loss": final_test_loss['val_loss']}, step=global_step)
     print(f"[Test] Loss: {final_test_loss['val_loss']:.4f}")
+
+    # Final greedy decode evaluation
+    print("\n[Main] Running final greedy decode evaluation...")
+    final_greedy_metrics = evaluate_with_greedy_decode(
+        model=model,
+        test_loader=test_loader,
+        tokenizer=tokenizer,
+        device=device
+    )
+    wandb.log({
+        "final_greedy_valid_smiles": final_greedy_metrics['valid_smiles'],
+        "final_greedy_exact_matches": final_greedy_metrics['exact_match'],
+        "final_greedy_tanimoto": final_greedy_metrics['avg_tanimoto'],
+        "final_greedy_mcs_ratio": final_greedy_metrics['avg_#mcs/#target'],
+        "final_greedy_ecfp6_iou": final_greedy_metrics['avg_ecfp6_iou']
+    }, step=global_step)
+    print(f"[Final Greedy] Valid SMILES: {final_greedy_metrics['valid_smiles']:.2%}")
+    print(f"[Final Greedy] Exact matches: {final_greedy_metrics['exact_match']:.2%}")
+    print(f"[Final Greedy] Tanimoto similarity: {final_greedy_metrics['avg_tanimoto']:.4f}")
 
     # Optionally save final checkpoint
     if config['training'].get('save_local', False):

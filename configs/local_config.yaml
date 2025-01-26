@@ -4,12 +4,12 @@ model:
   max_seq_length: 95
   max_nmr_length: 190
   max_memory_length: 32
-  embed_dim: 768
+  embed_dim: 1792
   num_heads: 16
   num_layers: 8
   dropout: 0.1
   resample_size: 1000
-  use_stablemax: True
+  use_stablemax: False
 
 # Training Parameters
 training:

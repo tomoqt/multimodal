@@ -43,11 +43,11 @@ def stable_s(x, clamp_val=20.0, epsilon=1e-9):
     with added clamping and replacements to avoid NaNs.
     """
     # 1) Replace +/- inf with 0.0 (or some sentinel value)
-    x = th.where(th.isinf(x), th.tensor(0.0, device=x.device, dtype=x.dtype), x)
+    #x = th.where(th.isinf(x), th.tensor(0.0, device=x.device, dtype=x.dtype), x)
 
     # 2) Clamp to avoid huge magnitudes: [-20, 20] is somewhat arbitrary, 
     #    but typically prevents float over-/under-flow in exponent-like transforms
-    x = x.clamp(-clamp_val, clamp_val)
+    #x = x.clamp(-clamp_val, clamp_val)
 
     # 3) Apply your piecewise function
     s_x = th.where(
