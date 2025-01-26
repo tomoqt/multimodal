@@ -4,10 +4,10 @@ model:
   max_seq_length: 95
   max_nmr_length: 190
   max_memory_length: 32
-  embed_dim: 1792
+  embed_dim: 2048
   num_heads: 16
   num_layers: 8
-  dropout: 0.1
+  dropout: 0.0
   resample_size: 1000
   use_stablemax: True
 
@@ -21,6 +21,7 @@ training:
   validation_frequency: 50
   logging_frequency: 10
   save_frequency: 1000
+  greedy_decode_frequency: 100
 
 # Optimizer Configuration
 optimizer:
