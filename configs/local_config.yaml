@@ -4,7 +4,7 @@ model:
   max_seq_length: 95
   max_nmr_length: 190
   max_memory_length: 32
-  embed_dim: 1920
+  embed_dim: 1760
   num_heads: 16
   num_layers: 8
   dropout: 0.0
