@@ -2,16 +2,11 @@
 # File: train_autoregressive.py
 # =======================
 """
-Script to train a MultiModalToSMILESModel using either:
-- Preprocessed .pt files created by create_training_data.py, or
-- Parquet files (loaded in one go, no row-group chunking).
-
+Script to perform learning rate sweep for MultiModalToSMILESModel.
 Key Steps:
 1) Loads spectral + SMILES data
-2) Tokenizes SMILES
-3) Demonstrates a basic training loop with teacher forcing
-4) Shows a minimal inference (greedy decode) function
-5) Demonstrates using ezmup to do a small HP sweep on *learning rate*
+2) Performs quick training with different learning rates
+3) Saves the best learning rate found
 """
 
 import os
@@ -26,22 +21,11 @@ import json
 from rdkit import Chem
 from pathlib import Path
 import numpy as np
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import math
 from tqdm import tqdm
-import pandas as pd
-import pyarrow.dataset as ds
-import matplotlib.pyplot as plt
-import seaborn as sns
 import yaml
 import argparse
-import time
-import pyarrow.parquet as pq
-
-# ----------------------------
-#  Import Ezmup from ezmup
-# ----------------------------
-from utils.ezmup import Ezmup
+import itertools
 
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
@@ -52,53 +36,38 @@ vocab_path = os.path.join(current_dir, 'vocab.txt')
 tokenizer = SmilesTokenizer(vocab_file=vocab_path)
 
 # -------------------------------------------------------------------------
-# Warmup + Cosine Annealing With Restarts Scheduler
+# Linear Warmup + Cosine/Constant LR Scheduler
 # -------------------------------------------------------------------------
-class WarmupCosineLR(torch.optim.lr_scheduler._LRScheduler):
-    def __init__(self, optimizer, warmup_steps, T_0, T_mult=1, eta_min=0, last_epoch=-1):
+class LinearWarmupCosineDecay(torch.optim.lr_scheduler._LRScheduler):
+    """
+    Learning rate scheduler with linear warmup followed by either constant LR or cosine decay.
+    """
+    def __init__(self, optimizer, warmup_steps, total_steps, decay_type='cosine', min_lr=0.0, last_epoch=-1):
         self.warmup_steps = warmup_steps
-        self.T_0_initial = T_0
-        self.T_0 = T_0
-        self.T_mult = T_mult
-        self.eta_min = eta_min
-        self.T_cur = 0
-        self.completed_warmup = False
-        self.n_restarts = 0
+        self.total_steps = total_steps
+        self.decay_type = decay_type
+        self.min_lr = min_lr
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
         if self.last_epoch < self.warmup_steps:
-            alpha = self.last_epoch / self.warmup_steps
+            # Linear warmup
+            alpha = self.last_epoch / float(max(1, self.warmup_steps))
             return [base_lr * alpha for base_lr in self.base_lrs]
-        
-        # Cosine annealing with warm restarts
-        if not self.completed_warmup:
-            self.completed_warmup = True
-            self.T_cur = 0
-        
-        if self.T_cur >= self.T_0:
-            self.T_cur = 0
-            self.T_0 = self.T_0 * self.T_mult
-            self.n_restarts += 1
-        
-        progress = self.T_cur / self.T_0
-        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-        self.T_cur += 1
-        
-        return [
-            self.eta_min + (base_lr - self.eta_min) * cosine_decay
-            for base_lr in self.base_lrs
-        ]
-
-    def step(self, epoch=None):
-        if epoch is None:
-            epoch = self.last_epoch + 1
-        self.last_epoch = epoch
-        self._last_lr = self.get_lr()
-        
-        for param_group, lr in zip(self.optimizer.param_groups, self._last_lr):
-            param_group['lr'] = lr
-
+        else:
+            if self.decay_type == 'constant':
+                # Constant learning rate after warmup
+                return self.base_lrs
+            else:  # cosine decay
+                # Cosine decay
+                progress = (self.last_epoch - self.warmup_steps) / float(
+                    max(1, self.total_steps - self.warmup_steps)
+                )
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                return [
+                    self.min_lr + (base_lr - self.min_lr) * cosine_decay 
+                    for base_lr in self.base_lrs
+                ]
 
 # -------------------------------------------------------------------------
 # Dataset / DataLoader for Memory-Mapped Binary Files
@@ -109,7 +78,7 @@ class SpectralSmilesDataset(Dataset):
         self.data_dir = Path(data_dir)
         self.tokenizer = tokenizer
         self.max_len = max_len
-
+        
         index_path = self.data_dir / "spectra_index.npy"
         if not index_path.exists():
             raise FileNotFoundError(f"Index file not found at {index_path}")
@@ -201,82 +170,11 @@ class SpectralSmilesDataset(Dataset):
         tokens = torch.tensor(tokens, dtype=torch.long)
         return tokens, ir_tuple, h_nmr_tuple, c_nmr_tuple
 
-
-# -------------------------------------------------------------------------
-# Dataset / DataLoader for Parquet Files
-# -------------------------------------------------------------------------
-class ParquetSpectralDataset(Dataset):
-    def __init__(self, data_dir, tokenizer, max_len=128):
-        super().__init__()
-        self.data_dir = Path(data_dir)
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-        
-        meta_path = self.data_dir / "meta_data/meta_data_dict.json"
-        if not meta_path.exists():
-            raise FileNotFoundError(f"Metadata file not found at {meta_path}")
-        with open(meta_path) as f:
-            self.meta_data = json.load(f)
-
-        self.ir_domain = torch.tensor(self.meta_data["ir_spectra"]["dimensions"], dtype=torch.float32)
-        self.h_nmr_domain = torch.tensor(self.meta_data["h_nmr_spectra"]["dimensions"], dtype=torch.float32)
-        self.c_nmr_domain = torch.tensor(self.meta_data["c_nmr_spectra"]["dimensions"], dtype=torch.float32)
-
-        print("[Dataset] Looking for parquet files...")
-        self.parquet_files = sorted(self.data_dir.glob("*.parquet"))
-        if not self.parquet_files:
-            raise FileNotFoundError(f"No parquet files found in {data_dir}")
-        print(f"[Dataset] Found {len(self.parquet_files)} parquet files")
-
-        print("[Dataset] Loading parquet files...")
-        dfs = []
-        for file in tqdm(self.parquet_files, desc="Loading parquet files"):
-            df = pd.read_parquet(
-                file,
-                columns=['smiles', 'ir_spectra', 'h_nmr_spectra', 'c_nmr_spectra'],
-                engine='pyarrow'
-            )
-            dfs.append(df)
-        
-        self.data = pd.concat(dfs, ignore_index=True)
-        print(f"[Dataset] Loaded {len(self.data)} total rows")
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        smiles = row['smiles']
-        tokens = self.tokenizer.encode(
-            smiles,
-            add_special_tokens=True,
-            max_length=self.max_len,
-            truncation=True
-        )
-
-        def to_tensor(x, spectrum_type):
-            if x is None:
-                return None
-            try:
-                tensor = torch.tensor(x, dtype=torch.float32)
-                if tensor.dim() == 1:
-                    if spectrum_type == 'ir':
-                        return (tensor, self.ir_domain)
-                    elif spectrum_type == 'h_nmr':
-                        return (tensor, self.h_nmr_domain)
-                    elif spectrum_type == 'c_nmr':
-                        return (tensor, self.c_nmr_domain)
-                return tensor
-            except Exception as e:
-                print(f"Warning: Error converting {spectrum_type} data to tensor: {e}")
-                return None
-
-        ir_spectra = to_tensor(row['ir_spectra'], 'ir')
-        h_nmr_spectra = to_tensor(row['h_nmr_spectra'], 'h_nmr')
-        c_nmr_spectra = to_tensor(row['c_nmr_spectra'], 'c_nmr')
-
-        return tokens, ir_spectra, h_nmr_spectra, c_nmr_spectra
-
+    def __del__(self):
+        if hasattr(self, 'spectra_mmap'):
+            del self.spectra_mmap
+        if hasattr(self, 'smiles_mmap'):
+            del self.smiles_mmap
 
 # -------------------------------------------------------------------------
 # Collate function
@@ -310,18 +208,11 @@ def collate_fn(batch):
 
 def create_data_loaders(tokenizer, config):
     print("\n[DataLoader] Creating data loaders...")
-    if config['data']['use_parquet']:
-        dataset = ParquetSpectralDataset(
-            data_dir=config['data']['data_dir'],
-            tokenizer=tokenizer,
-            max_len=config['model']['max_seq_length']
-        )
-    else:
-        dataset = SpectralSmilesDataset(
-            data_dir=config['data']['binary_dir'],
-            tokenizer=tokenizer,
-            max_len=config['model']['max_seq_length']
-        )
+    dataset = SpectralSmilesDataset(
+        data_dir=config['data']['binary_dir'],
+        tokenizer=tokenizer,
+        max_len=config['model']['max_seq_length']
+    )
     
     print(f"[DataLoader] Total dataset size: {len(dataset)}")
     print("[DataLoader] Splitting dataset into train/val/test...")
@@ -338,7 +229,6 @@ def create_data_loaders(tokenizer, config):
     )
     print(f"[DataLoader] Split sizes - Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
     
-    print("[DataLoader] Creating train loader...")
     train_loader = DataLoader(
         torch.utils.data.Subset(dataset, train_indices),
         batch_size=config['training']['batch_size'],
@@ -347,7 +237,6 @@ def create_data_loaders(tokenizer, config):
         collate_fn=collate_fn
     )
     
-    print("[DataLoader] Creating validation loader...")
     val_loader = DataLoader(
         torch.utils.data.Subset(dataset, val_indices),
         batch_size=config['training']['batch_size'],
@@ -355,17 +244,7 @@ def create_data_loaders(tokenizer, config):
         collate_fn=collate_fn
     )
     
-    print("[DataLoader] Creating test loader...")
-    test_loader = DataLoader(
-        torch.utils.data.Subset(dataset, test_indices),
-        batch_size=config['training'].get('test_batch_size', 1),
-        shuffle=False,
-        collate_fn=collate_fn
-    )
-    
-    print("[DataLoader] Data loaders created successfully")
-    return train_loader, val_loader, test_loader
-
+    return train_loader, val_loader
 
 # -------------------------------------------------------------------------
 # Config + Argparse
@@ -374,10 +253,10 @@ def load_config(config_path=None):
     default_config = {
         'model': {
             'max_seq_length': 128,
-            'embed_dim': 768,
-            'num_heads': 8,
-            'num_layers': 6,
-            'dropout': 0.1,
+            'embed_dim': 768,      # Fixed value
+            'num_heads': 8,        # Fixed value
+            'num_layers': 6,       # Fixed value
+            'dropout': 0.1,        # Fixed value
             'resample_size': 1000,
             'use_concat': True
         },
@@ -385,7 +264,7 @@ def load_config(config_path=None):
             'batch_size': 32,
             'test_batch_size': 1,
             'num_epochs': 1,
-            'learning_rate': 1.0e-4,   # default
+            'learning_rate': [1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3],  # LRs to try
             'min_learning_rate': 1.0e-6,
             'validation_frequency': 500,
             'logging_frequency': 100,
@@ -393,21 +272,18 @@ def load_config(config_path=None):
             'generate_during_training': False
         },
         'scheduler': {
-            'warmup_steps': 100,
+            'warmup_steps': 100,  # Fixed value
             'T0': 5,
             'T_mult': 2
         },
         'data': {
-            'use_parquet': False,
-            'data_dir': "data_extraction/multimodal_spectroscopic_dataset",
             'binary_dir': "training_binaries",
-            'preprocessed': False,
             'test_size': 20,
             'val_size': 0.1
         },
         'wandb': {
-            'project': "smiles-generation",
-            'base_run_name': "smiles_gen",
+            'project': "smiles-generation-sweep",
+            'base_run_name': "lr_sweep",
             'log_examples': True
         }
     }
@@ -427,66 +303,20 @@ def load_config(config_path=None):
     return default_config
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train SMILES generation model')
+    parser = argparse.ArgumentParser(description='Learning rate sweep for SMILES generation model')
     parser.add_argument('--config', type=str, help='Path to config file')
     return parser.parse_args()
 
-def get_domain_ranges(meta_data):
-    ir_range = [
-        min(meta_data["ir_spectra"]["dimensions"]),
-        max(meta_data["ir_spectra"]["dimensions"])
-    ]
-    h_nmr_range = [
-        min(meta_data["h_nmr_spectra"]["dimensions"]),
-        max(meta_data["h_nmr_spectra"]["dimensions"])
-    ]
-    c_nmr_range = [
-        min(meta_data["c_nmr_spectra"]["dimensions"]),
-        max(meta_data["c_nmr_spectra"]["dimensions"])
-    ]
-    hsqc_h_range = [
-        min(meta_data["hsqc_nmr_spectrum"]["dimensions"]["h"]),
-        max(meta_data["hsqc_nmr_spectrum"]["dimensions"]["h"])
-    ]
-    hsqc_c_range = [
-        min(meta_data["hsqc_nmr_spectrum"]["dimensions"]["c"]),
-        max(meta_data["hsqc_nmr_spectrum"]["dimensions"]["c"])
-    ]
-    return ir_range, h_nmr_range, c_nmr_range, hsqc_h_range, hsqc_c_range
-
-
 # -------------------------------------------------------------------------
-# Main Training Script
+# Main Sweep Script
 # -------------------------------------------------------------------------
 def main():
-    print("\n[Main] Starting training script...")
+    print("\n[Main] Starting learning rate sweep...")
     args = parse_args()
     
     print("[Main] Loading configuration...")
     config = load_config(args.config)
     print(f"[Main] Loaded config with {len(config)} sections")
-
-    # -------------------------------------------------------
-    # (Optional) Demonstration of prime-based "width" for MuP
-    # We'll set a default so we can still show usage of Ezmup,
-    # but this time we'll *sweep learning rates*, not widths.
-    # -------------------------------------------------------
-    config['model']['embed_dim'] = 47 * 8   # 47 is our "width_basis"
-    config['model']['num_heads'] = 47       # for demonstration
-    # If you had a feedforward dimension, you could do 47 * 32, etc.
-
-    # Prepare model hyperparameters
-    max_seq_length = config['model']['max_seq_length']
-    batch_size = config['training']['batch_size']
-    embed_dim = config['model']['embed_dim']
-    num_heads = config['model']['num_heads']
-    num_layers = config['model']['num_layers']
-    dropout = config['model']['dropout']
-    resample_size = config['model']['resample_size']
-
-    PAD_TOKEN_ID = tokenizer.pad_token_id
-    BOS_TOKEN_ID = tokenizer.cls_token_id
-    EOS_TOKEN_ID = tokenizer.sep_token_id
 
     print("\n[Main] Setting up device...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -498,91 +328,52 @@ def main():
         print("[Main] No CUDA devices found, using CPU")
     print(f"[Main] Using device: {device}")
 
-    print("\n[Main] Initializing model (with prime-based dimension for MuP)...")
-    if config['data']['use_parquet']:
-        meta_path = Path(config['data']['data_dir']) / "meta_data/meta_data_dict.json"
-        with open(meta_path) as f:
-            meta_data = json.load(f)
-        domain_ranges = get_domain_ranges(meta_data)
-    else:
-        domain_ranges = None
-
-    # Instantiate your model
-    model = MultiModalToSMILESModel(
-        vocab_size=len(tokenizer),
-        max_seq_length=max_seq_length,
-        embed_dim=embed_dim,    
-        num_heads=num_heads,    
-        num_layers=num_layers,  
-        dropout=dropout,
-        resample_size=resample_size,
-        domain_ranges=domain_ranges,
-        verbose=False,
-        use_concat=config['model']['use_concat']
-    ).to(device)
-    print("[Main] Model initialized successfully")
-
-    # -------------------------------------------------------
-    # Wrap model with Ezmup (though we'll keep width *fixed*).
-    # We'll do the LR sweep instead of a width sweep.
-    # -------------------------------------------------------
-    print("\n[Main] Wrapping model with Ezmup (width_basis=47)...")
-    mup_engine = Ezmup(width_basis=47, model=model)
-
-    # For demonstration, let's fix the width to something small, e.g. 32:
-    # (so we don't have to do full-scale training).
-    print("[Main] Setting initial model width to 32 for MuP demonstration...")
-    mup_engine.change_width_as(32)
-
     print("\n[Main] Creating data loaders...")
-    train_loader, val_loader, test_loader = create_data_loaders(tokenizer=tokenizer, config=config)
+    train_loader, val_loader = create_data_loaders(tokenizer=tokenizer, config=config)
 
     print("\n[Main] Initializing wandb...")
-    run_name = (
-        f"{config['wandb']['base_run_name']}_"
-        f"enc_d{embed_dim}_"
-        f"enc_h{num_heads}_"
-        f"dec_l{num_layers}_"
-        f"bs{batch_size}_"
-        f"lr{config['training']['learning_rate']}_warm{config['scheduler']['warmup_steps']}_"
-        f"{datetime.now().strftime('%m%d_%H%M')}"
-    )
     wandb.init(
         project=config['wandb']['project'],
-        name=run_name,
+        name=f"{config['wandb']['base_run_name']}_{datetime.now().strftime('%m%d_%H%M')}",
         config=config
     )
-    print("[Main] wandb initialized successfully")
 
     # ---------------------------------------------------------------------
-    # Function: quick_train_eval_lr
-    #   We'll do a very short training loop for each candidate LR, then
-    #   evaluate on the validation set to find the best LR.
+    # Function: quick_train_eval
+    #   Does a short training loop with given learning rate and evaluates
     # ---------------------------------------------------------------------
-    def quick_train_eval_lr(candidate_lr, n_steps=200):
-        """
-        Sets the optimizer to candidate_lr, does a short training loop,
-        returns the final validation loss. 
-        """
-        # Re-init the optimizer each time with the new LR
-        optimizer = mup_engine.get_optimizer(lr=candidate_lr)
-        scheduler = WarmupCosineLR(
+    def quick_train_eval(learning_rate, n_steps=100):
+        """Quick training and evaluation with given learning rate"""
+        model = MultiModalToSMILESModel(
+            vocab_size=len(tokenizer),
+            max_seq_length=config['model']['max_seq_length'],
+            embed_dim=config['model']['embed_dim'],
+            num_heads=config['model']['num_heads'],
+            num_layers=config['model']['num_layers'],
+            dropout=config['model']['dropout'],
+            resample_size=config['model']['resample_size'],
+            verbose=False,
+            use_concat=config['model']['use_concat']
+        ).to(device)
+
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+        scheduler = LinearWarmupCosineDecay(
             optimizer,
             warmup_steps=config['scheduler']['warmup_steps'],
-            T_0=config['scheduler']['T0'] * len(train_loader),
-            T_mult=config['scheduler']['T_mult'],
-            eta_min=config['training']['min_learning_rate']
+            total_steps=n_steps,
+            decay_type='cosine',
+            min_lr=config['training']['min_learning_rate']
         )
-        criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
+        criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
         model.train()
         step_count = 0
+        train_loss = 0
 
         # Short training loop
         for batch in train_loader:
             tgt_tokens, ir, h_nmr, c_nmr = batch
             tgt_tokens = tgt_tokens.to(device)
-
             if ir is not None:
                 if isinstance(ir, tuple):
                     ir = (ir[0].to(device), ir[1].to(device))
@@ -609,6 +400,7 @@ def main():
             optimizer.step()
             scheduler.step()
 
+            train_loss += loss.item()
             step_count += 1
             if step_count >= n_steps:
                 break
@@ -621,7 +413,6 @@ def main():
             for batch in val_loader:
                 tgt_tokens, ir, h_nmr, c_nmr = batch
                 tgt_tokens = tgt_tokens.to(device)
-
                 if ir is not None:
                     if isinstance(ir, tuple):
                         ir = (ir[0].to(device), ir[1].to(device))
@@ -646,147 +437,81 @@ def main():
                 total_loss += v_loss.item()
                 count += 1
 
+        avg_train_loss = train_loss / max(step_count, 1)
         avg_val_loss = total_loss / max(count, 1)
-        print(f"[quick_train_eval_lr] LR={candidate_lr}, val_loss={avg_val_loss:.4f}")
-        return avg_val_loss
+        
+        # Clear memory
+        del model, optimizer, scheduler
+        torch.cuda.empty_cache()
+        
+        return avg_train_loss, avg_val_loss
 
     # ---------------------------------------------------------------------
-    # Step: Sweep over candidate LRs
+    # Run learning rate sweep
     # ---------------------------------------------------------------------
-    lrs_to_try = [1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2]  # an example list
+    print("\n[Main] Starting learning rate sweep...")
+    print(f"Learning rates to try: {config['training']['learning_rate']}")
+
     best_val_loss = float('inf')
     best_lr = None
+    results = []
 
-    print("\n[Main] Starting mini HP sweep over learning rates:", lrs_to_try)
-    for lr_candidate in lrs_to_try:
-        val_loss = quick_train_eval_lr(lr_candidate, n_steps=100)
+    for lr in tqdm(config['training']['learning_rate'], desc="Learning rates"):
+        print(f"\nTrying learning rate: {lr}")
+        
+        train_loss, val_loss = quick_train_eval(lr)
+        
+        # Log to wandb
+        wandb.log({
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'learning_rate': lr
+        })
+        
+        # Save results
+        results.append({
+            'learning_rate': lr,
+            'train_loss': train_loss,
+            'val_loss': val_loss
+        })
+        
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_lr = lr_candidate
-    print(f"[Main] Best LR found: {best_lr} (val_loss={best_val_loss:.4f})")
+            best_lr = lr
+            print(f"\nNew best learning rate found!")
+            print(f"Learning rate: {lr}")
+            print(f"Validation loss: {val_loss:.4f}")
 
-    # Optionally, we can now upscale the width if desired:
-    print(f"\n[Main] For final training, let's scale width up to 1024 (example)...")
-    mup_engine.change_width_as(1024)
-
-    # Build the final optimizer with best LR
-    optimizer = mup_engine.get_optimizer(lr=best_lr)
-    scheduler = WarmupCosineLR(
-        optimizer,
-        warmup_steps=config['scheduler']['warmup_steps'],
-        T_0=config['scheduler']['T0'] * len(train_loader),
-        T_mult=config['scheduler']['T_mult'],
-        eta_min=config['training']['min_learning_rate']
-    )
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
-
-    print("\n[Main] Creating checkpoint directory...")
-    save_dir = Path('checkpoints') / datetime.now().strftime('%Y%m%d_%H%M%S')
+    # ---------------------------------------------------------------------
+    # Save results
+    # ---------------------------------------------------------------------
+    print("\n[Main] Saving sweep results...")
+    save_dir = Path('sweep_results') / datetime.now().strftime('%Y%m%d_%H%M%S')
     save_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[Main] Checkpoint directory created at {save_dir}")
 
-    print("\n[Main] Final Training (width=1024, LR=", best_lr, ")")
-    global_step = 0
-    best_val_loss = float('inf')
-    NUM_EPOCHS = config['training']['num_epochs']
-    validation_frequency = config['training']['validation_frequency']
+    # Save all results
+    with open(save_dir / 'lr_sweep_results.json', 'w') as f:
+        json.dump(results, f, indent=2)
 
-    for epoch in range(NUM_EPOCHS):
-        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
-        model.train()
-        epoch_loss = 0
-        num_batches = 0
+    # Save best learning rate
+    best_result = {
+        'best_lr': best_lr,
+        'best_val_loss': best_val_loss,
+        'model_config': {
+            'embed_dim': config['model']['embed_dim'],
+            'num_heads': config['model']['num_heads'],
+            'num_layers': config['model']['num_layers'],
+            'dropout': config['model']['dropout']
+        }
+    }
+    with open(save_dir / 'best_lr.json', 'w') as f:
+        json.dump(best_result, f, indent=2)
 
-        for batch in train_loader:
-            tgt_tokens, ir, h_nmr, c_nmr = batch
-            tgt_tokens = tgt_tokens.to(device)
-            if ir is not None:
-                if isinstance(ir, tuple):
-                    ir = (ir[0].to(device), ir[1].to(device))
-                else:
-                    ir = ir.to(device)
-            if h_nmr is not None:
-                if isinstance(h_nmr, tuple):
-                    h_nmr = (h_nmr[0].to(device), h_nmr[1].to(device))
-                else:
-                    h_nmr = h_nmr.to(device)
-            if c_nmr is not None:
-                if isinstance(c_nmr, tuple):
-                    c_nmr = (c_nmr[0].to(device), c_nmr[1].to(device))
-                else:
-                    c_nmr = c_nmr.to(device)
-
-            T = tgt_tokens.shape[1]
-            mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=tgt_tokens.device), 1)
-            logits = model(h_nmr, ir, c_nmr, target_seq=tgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
-            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_tokens[:, 1:].reshape(-1))
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            epoch_loss += loss.item()
-            num_batches += 1
-            global_step += 1
-
-            if global_step % validation_frequency == 0:
-                # Quick val
-                model.eval()
-                total_val_loss = 0
-                val_count = 0
-                with torch.no_grad():
-                    for vbatch in val_loader:
-                        vtgt_tokens, vir, vh_nmr, vc_nmr = vbatch
-                        vtgt_tokens = vtgt_tokens.to(device)
-                        if vir is not None:
-                            if isinstance(vir, tuple):
-                                vir = (vir[0].to(device), vir[1].to(device))
-                            else:
-                                vir = vir.to(device)
-                        if vh_nmr is not None:
-                            if isinstance(vh_nmr, tuple):
-                                vh_nmr = (vh_nmr[0].to(device), vh_nmr[1].to(device))
-                            else:
-                                vh_nmr = vh_nmr.to(device)
-                        if vc_nmr is not None:
-                            if isinstance(vc_nmr, tuple):
-                                vc_nmr = (vc_nmr[0].to(device), vc_nmr[1].to(device))
-                            else:
-                                vc_nmr = vc_nmr.to(device)
-
-                        T = vtgt_tokens.shape[1]
-                        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=vtgt_tokens.device), 1)
-                        v_logits = model(vh_nmr, vir, vc_nmr, target_seq=vtgt_tokens[:, :-1], target_mask=mask[:-1, :-1])
-                        v_loss = criterion(v_logits.reshape(-1, v_logits.size(-1)), vtgt_tokens[:, 1:].reshape(-1))
-                        total_val_loss += v_loss.item()
-                        val_count += 1
-
-                avg_val_loss = total_val_loss / max(val_count, 1)
-                print(f"[Validation @ step {global_step}] val_loss={avg_val_loss:.4f}")
-                wandb.log({"val_loss": avg_val_loss, "global_step": global_step})
-
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    print(f"  New best val_loss: {best_val_loss:.4f}")
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'val_loss': best_val_loss
-                    }, save_dir / 'best_model.pt')
-
-        print(f"  [Epoch {epoch+1}] avg_train_loss={(epoch_loss/num_batches):.4f}")
-        wandb.log({"train_loss": epoch_loss/num_batches, "epoch": epoch+1})
-
-    # -------------------------------------------------------
-    # Final Save
-    # -------------------------------------------------------
-    final_model_path = save_dir / 'final_model.pt'
-    torch.save(model.state_dict(), final_model_path)
-    print(f"\n[Main] Final model saved to {final_model_path}")
+    print(f"\n[Main] Best learning rate found: {best_lr}")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"\nResults saved to {save_dir}")
 
     wandb.finish()
-
 
 if __name__ == '__main__':
     main()

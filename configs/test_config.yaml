@@ -1,12 +1,15 @@
 # Model Architecture
 model:
   use_concat: True
-  max_seq_length: 1
-  embed_dim: 3
-  num_heads: 1
-  num_layers: 1
-  dropout: 0.1
+  max_seq_length: 95
+  max_nmr_length: 190
+  max_memory_length: 32
+  embed_dim: 768
+  num_heads: 4
+  num_layers: 8
+  dropout: 0.0
   resample_size: 1000
+  use_stablemax: True
 
 # Training Parameters
 training:
@@ -18,9 +21,23 @@ training:
   validation_frequency: 50
   logging_frequency: 10
   save_frequency: 1000
+  greedy_decode_frequency: 100
+
+# Optimizer Configuration
+optimizer:
+  type: ortho_adamw  # Use orthogonal gradient optimization
+  adamw:  # Base optimizer settings
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.01
+    caution: false
+  ortho:  # Orthogonal gradient settings
+    eps: 1.0e-8
+    rescale: true
 
 # Scheduler
 scheduler:
+  type: cosine
   warmup_steps: 100
 
 

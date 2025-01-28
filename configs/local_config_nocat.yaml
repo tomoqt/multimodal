@@ -2,31 +2,28 @@
 model:
   use_concat: False
   max_seq_length: 80
+  max_nmr_length: 128
+  max_memory_length: 64
   embed_dim: 1024
-  num_heads: 16
-  num_layers: 8
+  num_heads: 8
+  num_layers: 4
   dropout: 0.1
-  # dropout: 0.0
   resample_size: 1000
 
 # Training Parameters
 training:
-  batch_size: 64
-  # batch_size: 32
+  batch_size: 32
   test_batch_size: 1
-  num_epochs: 5
-  learning_rate: 1.0e-4  # for BS64
-  # learning_rate: 3.0e-5
+  num_epochs: 10
+  learning_rate: 1.0e-4
   min_learning_rate: 1.0e-5
-  validation_frequency: 100
+  validation_frequency: 50
   logging_frequency: 10
-  save_frequency: 5_000
+  save_frequency: 1000
 
 # Scheduler
 scheduler:
   warmup_steps: 100
-  T0: 5
-  T_mult: 2
 
 # Data
 data:

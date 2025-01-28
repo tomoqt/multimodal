@@ -1,11 +1,13 @@
 # Model Architecture
 model:
   use_concat: True
-  max_seq_length: 80
-  embed_dim: 1024
-  num_heads: 8
-  num_layers: 6
-  dropout: 0.1
+  max_seq_length: 95
+  max_nmr_length: 190
+  max_memory_length: 32
+  embed_dim: 128
+  num_heads: 2
+  num_layers: 3
+  dropout: 0.0
   resample_size: 1000
 
 # Training Parameters
@@ -13,24 +15,17 @@ training:
   batch_size: 32
   test_batch_size: 1
   num_epochs: 1
-  learning_rate: 1.0e-4
+  learning_rate: [1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3]  # List of LRs to try
   min_learning_rate: 1.0e-5
   validation_frequency: 50
   logging_frequency: 10
   save_frequency: 1000
-  muon_lr: 0.001
-  muon_momentum: 0.95
-  muon_nesterov: true
-  muon_ns_steps: 5
-  adamw_betas: [0.9, 0.999]
-  adamw_eps: 1.0e-8
-  weight_decay: 0.01
 
 # Scheduler
 scheduler:
+  type: cosine
   warmup_steps: 100
-  T0: 5
-  T_mult: 2
+
 
 # Data
 data:
@@ -39,10 +34,10 @@ data:
   binary_dir: "preprocessed_binaries"
   test_size: 20
   val_size: 0.001
-  preprocessed: True
+  preprocessed: False
 
 # Logging
 wandb:
-  project: "smiles-generation"
-  base_run_name: "smiles_gen_muon"
+  project: "smiles-generation-sweep"  # Changed project name for sweep
+  base_run_name: "lr_sweep"           # Changed run name for sweep
   log_examples: true 

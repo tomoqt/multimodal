@@ -1,6 +1,7 @@
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 class RotaryEmbedding(th.nn.Module):
     def __init__(self, dim, base=10000):
@@ -33,8 +34,48 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     cos, sin = cos[..., : q.shape[-2], :], sin[..., : q.shape[-2], :]
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
+def stable_s(x, clamp_val=20.0, epsilon=1e-9):
+    """
+    Piecewise transform:
+        s(x) = 1 / (1 - x + epsilon)   if x < 0
+               x + 1                  if x >= 0
+    
+    with added clamping and replacements to avoid NaNs.
+    """
+    # 1) Replace +/- inf with 0.0 (or some sentinel value)
+    #x = th.where(th.isinf(x), th.tensor(0.0, device=x.device, dtype=x.dtype), x)
+
+    # 2) Clamp to avoid huge magnitudes: [-20, 20] is somewhat arbitrary, 
+    #    but typically prevents float over-/under-flow in exponent-like transforms
+    #x = x.clamp(-clamp_val, clamp_val)
+
+    # 3) Apply your piecewise function
+    s_x = th.where(
+        x < 0,
+        1.0 / (1.0 - x + epsilon),  # denominator won't blow up unless x ~ 1
+        x + 1.0
+    )
+    return s_x
+
+
+def stablemax(x, dim=-1, clamp_val=20.0, epsilon=1e-9):
+    """
+    'Stablemax' using the piecewise transform above, plus a safe denominator.
+    """
+    # 1) Transform
+    s_x = stable_s(x, clamp_val=clamp_val, epsilon=epsilon)
+
+    # 2) Sum along dim
+    denom = s_x.sum(dim=dim, keepdim=True)
+
+    # 3) Avoid zero denominator -> clamp_min
+    denom = denom.clamp_min(epsilon)
+
+    # 4) Divide
+    return s_x / denom
+
 class DecoderPromptLayer(nn.Module):
-    def __init__(self, d_model: int, memory_dim: int, nhead: int, d_ffn: int=2048, dropout=0.1, use_rope: bool = False):
+    def __init__(self, d_model: int, memory_dim: int, nhead: int, d_ffn: int=2048, dropout=0.1, use_rope: bool = False, use_stablemax: bool = False):
         super().__init__()
         """ Same application as `DecoderLayer` but removes the x-attn part and only usesself-attn
         The `memory` is injected as the prompt, and allowed to fully interact. 
@@ -47,6 +88,7 @@ class DecoderPromptLayer(nn.Module):
         self.nhead = nhead
         self.head_dim = d_model // nhead
         self.use_rope = use_rope
+        self.use_stablemax = use_stablemax
         assert use_rope, "Other posemb than rope not supported atm"
         if use_rope:
             self.rotary_ndims = int(self.head_dim * 0.5)
@@ -92,7 +134,23 @@ class DecoderPromptLayer(nn.Module):
             q = th.cat((q, query_pass), dim=-1)
             k = th.cat((k, key_pass), dim=-1)
 
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
+        # Modified attention computation to use stablemax if enabled
+        if self.use_stablemax:
+            # Compute attention scores
+            scores = (q @ k.transpose(-2, -1)) / math.sqrt(DH)
+
+            
+            if mask is not None:
+                scores = scores.masked_fill(~mask, float('-inf'))
+
+            
+            # Use stablemax directly
+            attn_weights = stablemax(scores, dim=-1)
+
+            attn = attn_weights @ v
+        else:
+            # Use standard scaled dot-product attention
+            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
 
         attn = attn.transpose(1, 2).contiguous().view(B, T, -1)
         xattn = self.attn_dropout(self.out(attn))
@@ -109,14 +167,18 @@ class DecoderPromptLayer(nn.Module):
 class SMILESDecoder(nn.Module):
     def __init__(
         self,
-        vocab_size: int,
+        smiles_vocab_size: int,
+        nmr_vocab_size: int,  # Separate vocab size for NMR tokens
         max_seq_length: int = 512,
+        max_nmr_length: int = 128,
+        max_memory_length: int = 128,
         memory_dim: int = 768,
         embed_dim: int = 768,
         num_heads: int = 8,
         num_layers: int = 6,
         dropout: int = 0.1,
-        verbose: bool = True
+        verbose: bool = True,
+        use_stablemax: bool = False  # Add this parameter
     ):
         super().__init__()
         
@@ -126,81 +188,125 @@ class SMILESDecoder(nn.Module):
         self.memory_dim = memory_dim
         self.verbose = verbose
         self.max_seq_length = max_seq_length
+        self.max_nmr_length = max_nmr_length
+        self.max_memory_length = max_memory_length
         
-        # Embeddings
-        self.embed = nn.Embedding(vocab_size, embed_dim)
+        # Separate embeddings with different vocabulary sizes
+        self.smiles_embed = nn.Embedding(smiles_vocab_size, embed_dim)
+        self.nmr_embed = nn.Embedding(nmr_vocab_size, embed_dim)
         
         # Add input projection for memory if dimensions don't match
-        # original:
-        # self.memory_proj = nn.Linear(memory_dim, memory_dim)
         self.memory_proj = nn.Linear(memory_dim, embed_dim) if memory_dim != embed_dim else nn.Identity()
         
-        # Create decoder layers with updated memory dimension
+        # Create decoder layers with stablemax option
         self.layers = nn.ModuleList([
-            # DecoderLayer(
             DecoderPromptLayer(
                 d_model=embed_dim,
                 memory_dim=memory_dim,
                 nhead=num_heads,
                 d_ffn=embed_dim * 4,
                 dropout=dropout,
-                use_rope=True
+                use_rope=True,
+                use_stablemax=use_stablemax  # Pass the stablemax option
             ) for _ in range(num_layers)
         ])
         
-        # Output projection
-        self.out = nn.Linear(embed_dim, vocab_size)
+        # Add final layer norm
+        self.final_norm = nn.LayerNorm(embed_dim)
         
-    def forward(self, tgt: th.Tensor, memory: th.Tensor):
+        # Output projection to SMILES vocabulary
+        self.out = nn.Linear(embed_dim, smiles_vocab_size)
+        
+    def forward(self, tgt: th.Tensor, memory: th.Tensor, nmr_tokens: th.Tensor = None):
         """ inputs:
             tgt: target sequence tensor, shape (B, T)
-            memory: memory tensor, shape (B, D) or (B, S, D)
+            memory: memory tensor from IR encoder, shape (B, S, D)
+            nmr_tokens: tokenized NMR data, shape (B, N)
         """
-        B, T, = tgt.shape
+        B, T = tgt.shape
         if self.verbose:
             print(f"\nDecoder Input Shapes:")
             print(f"Target sequence: {tgt.shape}")
             print(f"Memory: {memory.shape}")
+            if nmr_tokens is not None:
+                print(f"NMR tokens: {nmr_tokens.shape}")
 
-        # Check sequence length
-        if tgt.size(1) > self.max_seq_length + 256:
-            raise ValueError(f"Input sequence length {tgt.size(1)} exceeds maximum length {self.max_seq_length}")
+        # Check and enforce sequence length limits
+        if memory.size(1) > self.max_memory_length:
+            if self.verbose:
+                print(f"Warning: Truncating memory from {memory.size(1)} to {self.max_memory_length}")
+            memory = memory[:, :self.max_memory_length]
+
+        if nmr_tokens is not None and nmr_tokens.size(1) > self.max_nmr_length:
+            if self.verbose:
+                print(f"Warning: Truncating NMR tokens from {nmr_tokens.size(1)} to {self.max_nmr_length}")
+            nmr_tokens = nmr_tokens[:, :self.max_nmr_length]
+
+        # Calculate total prompt length (memory + NMR)
+        total_prompt_length = memory.size(1) + (nmr_tokens.size(1) if nmr_tokens is not None else 0)
         
-        # (B, T) -> (B, T, D) token embeddings
-        x = self.embed(tgt)
-        if self.verbose:
-            print(f"After embedding: {x.shape}")
+        # Check if target sequence + prompt length exceeds maximum
+        if T + total_prompt_length > self.max_seq_length + 256:
+            raise ValueError(
+                f"Combined sequence length ({T} + {total_prompt_length} = {T + total_prompt_length}) "
+                f"exceeds maximum length ({self.max_seq_length + 256})"
+            )
 
-        # Project memory to correct dimensions
+        # Embed target sequence using SMILES embeddings
+        x = self.smiles_embed(tgt)
+        
+        # Project memory to full embedding dimension
         memory = self.memory_proj(memory)
-        if self.verbose:
-            print(f"After memory projection: {memory.shape}")
         
-        # Ensure memory has sequence dimension
-        if memory.dim() == 2:
-            print(f"memory.shape: {memory.shape}")
-            memory = memory.unsqueeze(1)
+        # Embed NMR tokens if provided and handle concatenation
+        if nmr_tokens is not None:
+            # Add dimension checks
+            if self.verbose:
+                print(f"Memory shape after projection: {memory.shape}")
+                print(f"NMR tokens device: {nmr_tokens.device}, Memory device: {memory.device}")
+                print(f"NMR tokens dtype: {nmr_tokens.dtype}, Memory dtype: {memory.dtype}")
+            
+            # Ensure NMR tokens are on the same device as memory
+            nmr_tokens = nmr_tokens.to(memory.device)
+            # Use NMR-specific embeddings
+            nmr_embeddings = self.nmr_embed(nmr_tokens)  # (B, N, D)
+            
+            if self.verbose:
+                print(f"NMR embeddings shape: {nmr_embeddings.shape}")
+            
+            # Check that dimensions match before concatenation
+            assert memory.size(0) == nmr_embeddings.size(0), "Batch sizes don't match"
+            assert memory.size(2) == nmr_embeddings.size(2), "Embedding dimensions don't match"
+            
+            # Concatenate memory (IR) and NMR embeddings
+            prompt = th.cat([memory, nmr_embeddings], dim=1)  # (B, S+N, D)
+        else:
+            prompt = memory
 
-        # Expand memory batch dimension if needed
-        # if memory.size(0) == 1 and x.size(0) > 1:
-        #    memory = memory.expand(x.size(0), -1, -1)
+        if self.verbose:
+            print(f"Prompt shape after concatenation: {prompt.shape}")
+            print(f"Target embeddings shape: {x.shape}")
 
-        # mix `memory` and `x` as prompt + answer, and add causal mask
-        M = memory.shape[-2]
-        x = th.cat([memory, x], dim=1)
+        # Concatenate prompt and target embeddings
+        M = prompt.shape[1]  # Total prompt length (IR + NMR)
+        x = th.cat([prompt, x], dim=1)  # (B, S+N+T, D)
 
-        mask = th.ones(B, T+M, T+M, device=x.device).tril().bool()
-        # memory can attend to all of itself. Unlike causal decoding
+        # Create mask: prompt tokens can attend to each other, target is causal
+        mask = th.ones(B, M+T, M+T, device=x.device).tril().bool()
+        # Allow full attention within prompt
         mask[:, :M, :M] = True
         mask = mask[:, None].repeat(1, self.num_heads, 1, 1)
 
-
+        # Process through decoder layers
         for layer in self.layers:
             x = layer(x, mask)
-            
+        
+        # Only project the target sequence portion to vocabulary
+        x_target = x[:, M:]  # Extract only the target sequence part
+        x_target = self.final_norm(x_target)  # Apply final layer normalization
+        out = self.out(x_target)  # (B, T, vocab_size)
+        
         if self.verbose:
-            print(f"Final output shape: {x.shape}")
+            print(f"Target sequence output shape: {out.shape}")
 
-        # remove memory prompt from output tokens
-        out = self.out(x[:, M:])
         return out

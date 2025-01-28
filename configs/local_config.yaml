@@ -1,32 +1,45 @@
 # Model Architecture
 model:
   use_concat: True
-  max_seq_length: 80
-  embed_dim: 2048
+  max_seq_length: 95
+  max_nmr_length: 190
+  max_memory_length: 32
+  embed_dim: 1600
   num_heads: 16
   num_layers: 8
-  dropout: 0.1
-  # dropout: 0.0
+  dropout: 0.0
   resample_size: 1000
+  use_stablemax: True
 
 # Training Parameters
 training:
-  batch_size: 64
-  # batch_size: 32
+  batch_size: 32
   test_batch_size: 1
-  num_epochs: 5
-  learning_rate: 1.0e-4  # for BS64
-  # learning_rate: 3.0e-5
+  num_epochs: 10
+  learning_rate: 1.0e-4
   min_learning_rate: 1.0e-5
-  validation_frequency: 100
+  validation_frequency: 50
   logging_frequency: 10
-  save_frequency: 5_000
+  save_frequency: 1000
+  greedy_decode_frequency: 100
+
+# Optimizer Configuration
+optimizer:
+  type: ortho_adamw  # Use orthogonal gradient optimization
+  adamw:  # Base optimizer settings
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.01
+    caution: false
+  ortho:  # Orthogonal gradient settings
+    eps: 1.0e-8
+    rescale: true
 
 # Scheduler
 scheduler:
+  type: cosine
   warmup_steps: 100
-  T0: 5
-  T_mult: 2
+
 
 # Data
 data:
