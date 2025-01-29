@@ -4,28 +4,41 @@ model:
   max_seq_length: 95
   max_nmr_length: 190
   max_memory_length: 32
-  embed_dim: 128
-  num_heads: 2
-  num_layers: 3
+  width_factor: 32  # Will be multiplied by 47 for embed_dim
+  num_heads: 4
+  num_layers: 2
   dropout: 0.0
   resample_size: 1000
+  use_stablemax: True
 
 # Training Parameters
 training:
   batch_size: 32
   test_batch_size: 1
-  num_epochs: 1
-  learning_rate: [1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3]  # List of LRs to try
-  min_learning_rate: 1.0e-5
+  num_epochs: 1  # Kept at 1 for sweep
+  learning_rate: [0.005, 0.0001, 0.001, 0.00001, 0.0005, 0.00005, 0.0025, 0.00025, 0.00075, 0.000075, 0.01, 0.025]  # List of LRs to try
+  min_learning_rate: 0.000001  # Matched with test_config
   validation_frequency: 50
   logging_frequency: 10
   save_frequency: 1000
+  greedy_decode_frequency: 100
+
+# Optimizer Configuration
+optimizer:
+  type: ortho_adamw
+  adamw:
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.01
+    caution: false
+  ortho:
+    eps: 1.0e-8
+    rescale: true
 
 # Scheduler
 scheduler:
   type: cosine
   warmup_steps: 100
-
 
 # Data
 data:
@@ -35,9 +48,11 @@ data:
   test_size: 20
   val_size: 0.001
   preprocessed: False
+  tokenized_dir: "tokenized_baseline/data"  # Directory containing tokenized text files
+  num_workers: 0
 
 # Logging
 wandb:
-  project: "smiles-generation-sweep"  # Changed project name for sweep
-  base_run_name: "lr_sweep"           # Changed run name for sweep
+  project: "smiles-generation-sweep"
+  base_run_name: "lr_sweep"
   log_examples: true 
