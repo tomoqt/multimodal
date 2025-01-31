@@ -18,9 +18,11 @@ training:
   num_epochs: 10
   learning_rate: 1.0e-4
   min_learning_rate: 1.0e-5
+  weight_decay: 0.01
   validation_frequency: 50
   logging_frequency: 10
   save_frequency: 1000
+  save_model_frequency: 500  # How often to save model to wandb (in steps)
   greedy_decode_frequency: 100
 
 # Optimizer Configuration

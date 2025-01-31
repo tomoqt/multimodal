@@ -534,7 +534,8 @@ def load_config(config_path=None):
             'save_frequency': 1000,
             'generate_during_training': False,
             'save_local': False,
-            'greedy_decode_frequency': 1000
+            'greedy_decode_frequency': 1000,
+            'weight_decay': 0.01
         },
         'scheduler': {
             'type': 'constant',  # or 'cosine'
@@ -554,7 +555,7 @@ def load_config(config_path=None):
             'adamw': {
                 'betas': (0.9, 0.999),
                 'eps': 1e-8,
-                'weight_decay': 0.01,
+                'weight_decay': 0.1,
                 'caution': False
             },
             'foreachadopt': {
@@ -687,7 +688,7 @@ def main():
         base_args = {
             'lr': config['training']['learning_rate'],
             'betas': config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
-            'weight_decay': config['optimizer']['adamw'].get('weight_decay', 0.01)
+            'weight_decay': config['training']['weight_decay']  # Use weight decay from training config
         }
         # Only pass eps to base optimizer if not using ortho's eps
         if not config['optimizer'].get('ortho', {}).get('eps'):
@@ -709,7 +710,7 @@ def main():
                 lr=config['training']['learning_rate'],
                 betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
                 eps=config['optimizer']['adamw'].get('eps', 1e-8),
-                weight_decay=config['optimizer']['adamw'].get('weight_decay', 0.01),
+                weight_decay=config['training']['weight_decay'],  # Use weight decay from training config
                 caution=True
             )
         else:
@@ -718,7 +719,7 @@ def main():
                 lr=config['training']['learning_rate'],
                 betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
                 eps=config['optimizer']['adamw'].get('eps', 1e-8),
-                weight_decay=config['optimizer']['adamw'].get('weight_decay', 0.01)
+                weight_decay=config['training']['weight_decay']  # Use weight decay from training config
             )
 
     print(f"[Main] Using optimizer: {optimizer_type}")
@@ -961,25 +962,30 @@ def main():
                 if val_metrics['val_loss'] < best_val_loss:
                     best_val_loss = val_metrics['val_loss']
                     print(f"New best validation loss: {best_val_loss:.4f}")
-                    checkpoint = {
-                        'epoch': epoch,
-                        'global_step': global_step,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'val_loss': val_metrics['val_loss'],
-                    }
-                    if config['training'].get('save_local', False):
-                        torch.save(checkpoint, save_dir / 'best_model.pt')
-                        print(f"Saved checkpoint locally at {save_dir}/best_model.pt")
 
-                    # Save to W&B as an artifact
-                    artifact = wandb.Artifact(
-                        "model", 
-                        type="model",
-                        description=f"Checkpoint at step {global_step}, val_loss {best_val_loss:.4f}"
-                    )
-                    wandb.log_artifact(artifact, aliases=["latest", f"step_{global_step}"])
-                    print("[Main] Checkpoint artifact saved to W&B.")
+            # Save model to wandb periodically (outside validation check)
+            if global_step % config['training']['save_model_frequency'] == 0:
+                print(f"\nSaving model checkpoint at step {global_step}...")
+                checkpoint = {
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_loss': val_metrics['val_loss'] if 'val_metrics' in locals() else None,
+                }
+                
+                # Save checkpoint directly to wandb
+                checkpoint_name = f"checkpoint-{global_step}.pth"
+                torch.save(checkpoint, checkpoint_name)
+                wandb.save(checkpoint_name)
+                
+                # Clean up local checkpoint file
+                try:
+                    os.remove(checkpoint_name)
+                except:
+                    pass
+                
+                print(f"[Main] Model checkpoint saved to W&B at step {global_step}")
 
             # Periodic greedy decode evaluation
             if global_step % greedy_decode_frequency == 0:
