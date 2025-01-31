@@ -91,3 +91,4 @@ nmr_statistics/
 plots/
 pretrain_data/
 smiles_statistics/
+sweep_results/
