@@ -1089,29 +1089,10 @@ def main():
                 
                 print(f"[Val] Loss: {val_metrics['val_loss']:.4f}")
 
-                # Save model periodically (outside validation check)
-                if global_step % config['training']['save_model_frequency'] == 0:
-                    print(f"\nSaving model checkpoint at step {global_step}...")
-                    
-                    # Get current validation metrics if available
-                    current_val_loss = val_metrics['val_loss'] if 'val_metrics' in locals() else float('inf')
-                    
-                    # Save checkpoint and manage storage
-                    is_best = current_val_loss < best_val_loss
-                    if is_best:
-                        best_val_loss = current_val_loss
-                        print(f"New best validation loss: {best_val_loss:.4f}")
-                    
-                    save_checkpoint(
-                        model=model,
-                        optimizer=optimizer,
-                        epoch=epoch,
-                        global_step=global_step,
-                        val_loss=current_val_loss,
-                        is_best=is_best
-                    )
-                    
-                    print(f"[Main] Model checkpoint saved at step {global_step}")
+                # Update best validation loss for checkpoint saving
+                if val_metrics['val_loss'] < best_val_loss:
+                    best_val_loss = val_metrics['val_loss']
+                    print(f"New best validation loss: {best_val_loss:.4f}")
 
             # Periodic greedy decode evaluation
             if global_step % greedy_decode_frequency == 0:
