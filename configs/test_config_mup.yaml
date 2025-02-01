@@ -4,44 +4,42 @@ model:
   max_seq_length: 95
   max_nmr_length: 190
   max_memory_length: 32
-  embed_dim: 768
+  embed_dim: 768         # Direct embedding dimension
+  width_basis: 13        # Base width for muP scaling calculations
   num_heads: 4
   num_layers: 8
   dropout: 0.0
   resample_size: 1000
   use_stablemax: True
 
-# Training Parameters
+# Training Parameters with muP settings
 training:
   batch_size: 32
   test_batch_size: 1
   num_epochs: 10
-  learning_rate: 1.0e-4
+  d1_horizon: 1000        # Original horizon where best LR was found
+  best_d1_lr: 7.5e-4      # Best learning rate at d1 horizon
   min_learning_rate: 1.0e-5
   weight_decay: 0.1
   validation_frequency: 100
   logging_frequency: 10
   save_frequency: 1000
-  save_model_frequency: 10  # How often to save model to wandb (in steps)
+  save_model_frequency: 1000
   greedy_decode_frequency: 100
 
 # Optimizer Configuration
 optimizer:
-  type: ortho_adamw  # Use orthogonal gradient optimization
-  adamw:  # Base optimizer settings
+  type: adamw            # Using standard AdamW with muP
+  adamw:
     betas: [0.9, 0.999]
     eps: 1.0e-8
     weight_decay: 0.01
     caution: false
-  ortho:  # Orthogonal gradient settings
-    eps: 1.0e-30
-    rescale: true
 
 # Scheduler
 scheduler:
   type: cosine
   warmup_steps: 100
-
 
 # Data
 data:
@@ -54,6 +52,6 @@ data:
 
 # Logging
 wandb:
-  project: "smiles-generation"
-  base_run_name: "smiles_gen"
+  project: "smiles-generation-mup"
+  base_run_name: "smiles_gen_mup"
   log_examples: true 

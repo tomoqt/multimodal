@@ -411,7 +411,7 @@ def main():
     columns = ["step", "learning_rate", "prediction", "target", "exact_match", "tanimoto"]
     examples_table = wandb.Table(columns=columns)
 
-    def quick_train_eval(learning_rate, n_steps=100):
+    def quick_train_eval(learning_rate, n_steps=1000):
         """
         Does short training and evaluation with a given LR.
         Note the changes for ezmup (muP).
@@ -466,7 +466,7 @@ def main():
             warmup_steps=config['scheduler']['warmup_steps'],
             total_steps=n_steps,
             decay_type=config['scheduler']['type'],
-            min_lr=config['training'].get('min_learning_rate', 1e-6)
+            min_lr=learning_rate/10  # Set minimum LR to learning_rate/10
         )
         # -- ezmup changes END --
 
@@ -567,7 +567,7 @@ def main():
     best_lr = None
 
     for lr in tqdm(config['training']['learning_rate'], desc="LR Sweep"):
-        train_loss, val_loss, metrics = quick_train_eval(lr, n_steps=100)
+        train_loss, val_loss, metrics = quick_train_eval(lr, n_steps=1000)
 
         wandb.log({
             'train_loss': train_loss,

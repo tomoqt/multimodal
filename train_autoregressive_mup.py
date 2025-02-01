@@ -138,9 +138,48 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
     all_predictions = []
     all_targets = []
     
+    # Collect all examples first
+    all_data = []
     with torch.no_grad():
-        for target_tokens, ir_data, nmr_tokens, _ in tqdm(test_loader, desc="Greedy decoding"):
+        for batch in test_loader:
+            all_data.append(batch)
+    
+    # Randomly sample batches and indices if num_examples is specified
+    if num_examples is not None:
+        import random
+        random.seed()  # Use system time as seed for true randomness
+        
+        total_examples = sum(batch[0].size(0) for batch in all_data)  # batch[0] is target_tokens
+        indices_needed = num_examples
+        sampled_data = []
+        
+        while indices_needed > 0:
+            # Randomly select a batch
+            batch = random.choice(all_data)
+            batch_size = batch[0].size(0)
+            
+            # Randomly select indices from this batch
+            num_to_take = min(indices_needed, batch_size)
+            batch_indices = random.sample(range(batch_size), num_to_take)
+            
+            # Extract selected examples from the batch
+            target_tokens, ir_data, nmr_tokens, _ = batch
+            sampled_batch = (
+                target_tokens[batch_indices],
+                ir_data[batch_indices] if ir_data is not None else None,
+                nmr_tokens[batch_indices] if nmr_tokens is not None else None,
+                None
+            )
+            sampled_data.append(sampled_batch)
+            indices_needed -= num_to_take
+    else:
+        sampled_data = all_data
+    
+    # Process the sampled examples
+    with torch.no_grad():
+        for target_tokens, ir_data, nmr_tokens, _ in sampled_data:
             # Move data to device
+            target_tokens = target_tokens.to(device)
             if ir_data is not None:
                 ir_data = ir_data.to(device)
             if nmr_tokens is not None:
@@ -171,9 +210,6 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
             
             all_predictions.extend(predictions)
             all_targets.extend(targets)
-            
-            if num_examples and len(all_predictions) >= num_examples:
-                break
     
     # Calculate metrics
     detailed_results = evaluate_predictions(all_predictions, all_targets)
@@ -515,7 +551,8 @@ def load_config(config_path=None):
             'max_seq_length': 512,      # Max SMILES sequence length
             'max_nmr_length': 128,      # Max NMR sequence length
             'max_memory_length': 128,   # Max memory/IR sequence length
-            'embed_dim': 768,
+            'width_factor': 8,          # Width multiplier relative to base width
+            'width_basis': 13,          # Base width for muP scaling
             'num_heads': 8,
             'num_layers': 6,
             'dropout': 0.1,
@@ -527,7 +564,8 @@ def load_config(config_path=None):
             'batch_size': 32,
             'test_batch_size': 1,
             'num_epochs': 1,
-            'learning_rate': 1.0e-4,
+            'd1_horizon': 1000,         # Original horizon (steps) where best_lr was found
+            'best_d1_lr': 1.0e-4,       # Best learning rate found at horizon d1
             'min_learning_rate': 1.0e-6,
             'validation_frequency': 500,
             'logging_frequency': 100,
@@ -580,6 +618,10 @@ def load_config(config_path=None):
                 return d
             update_dict(default_config, custom_config)
 
+    # Calculate d2 (new horizon) based on total training steps
+    batches_per_epoch = None  # Will be set later when we know dataset size
+    total_steps = None        # Will be set later when we know dataset size
+    
     return default_config
 
 
@@ -587,6 +629,37 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train SMILES generation model')
     parser.add_argument('--config', type=str, help='Path to config file')
     return parser.parse_args()
+
+
+# Add a new function to calculate the scaled learning rate
+def calculate_scaled_lr(config, total_steps):
+    """
+    Calculate the scaled learning rate based on the horizon ratio using muP's scaling law:
+    lr_2 = lr_1 * (d_2/d_1)^(-0.32)
+    
+    Args:
+        config: The configuration dictionary
+        total_steps: Total number of training steps (d2)
+        
+    Returns:
+        float: The scaled learning rate
+    """
+    d1 = config['training']['d1_horizon']
+    d2 = total_steps
+    lr1 = config['training']['best_d1_lr']
+    
+    # Apply muP's learning rate scaling law
+    horizon_ratio = d2 / d1
+    lr2 = lr1 * (horizon_ratio ** (-0.32))
+    
+    print(f"\n[muP] Learning rate scaling:")
+    print(f"     d1 (original horizon): {d1}")
+    print(f"     d2 (new horizon): {d2}")
+    print(f"     lr1 (original lr): {lr1:.2e}")
+    print(f"     lr2 (scaled lr): {lr2:.2e}")
+    print(f"     horizon ratio (d2/d1): {horizon_ratio:.2f}")
+    
+    return lr2
 
 
 # -------------------------------------------------------------------------
@@ -614,14 +687,28 @@ def main():
         print("[Main] No CUDA devices found, using CPU.")
     print(f"[Main] Using device: {device}")
 
-    print("\n[Main] Initializing model...")
+    print("\n[Main] Creating data loaders...")
+    train_loader, val_loader, test_loader = create_data_loaders(
+        smiles_tokenizer=tokenizer,
+        nmr_tokenizer=nmr_tokenizer,
+        config=config
+    )
+
+    # Calculate total training steps for horizon scaling
+    batches_per_epoch = len(train_loader)
+    total_steps = batches_per_epoch * config['training']['num_epochs']
+    
+    # Calculate the scaled learning rate based on the new horizon
+    scaled_lr = calculate_scaled_lr(config, total_steps)
+
+    print("\n[Main] Initializing model with muP...")
     model = MultiModalToSMILESModel(
         smiles_vocab_size=smiles_vocab_size,
         nmr_vocab_size=nmr_vocab_size,
         max_seq_length=config['model']['max_seq_length'],
         max_nmr_length=config['model']['max_nmr_length'],
         max_memory_length=config['model']['max_memory_length'],
-        embed_dim=config['model']['embed_dim'],
+        embed_dim=config['model']['embed_dim'],   # Direct embedding dimension
         num_heads=config['model']['num_heads'],
         num_layers=config['model']['num_layers'],
         dropout=config['model']['dropout'],
@@ -629,12 +716,15 @@ def main():
         use_stablemax=config['model'].get('use_stablemax', False)
     ).to(device)
 
-    print("\n[Main] Creating data loaders...")
-    train_loader, val_loader, test_loader = create_data_loaders(
-        smiles_tokenizer=tokenizer,
-        nmr_tokenizer=nmr_tokenizer,  # Pass the loaded tokenizer
-        config=config
+    # Initialize muP engine
+    print("[Main] Initializing muP engine...")
+    from utils.ezmup import Ezmup
+    mup_engine = Ezmup(
+        width_basis=config['model']['width_basis'],
+        model=model
     )
+    
+    # Note: We don't need change_width_as() since we're using the final width directly
 
     print("\n[Main] Initializing wandb...")
     run_name = (
@@ -643,7 +733,7 @@ def main():
         f"h{config['model']['num_heads']}_"
         f"l{config['model']['num_layers']}_"
         f"bs{config['training']['batch_size']}_"
-        f"lr{config['training']['learning_rate']}_"
+        f"lr{scaled_lr:.2e}_"
         f"warm{config['scheduler']['warmup_steps']}_"
         f"{datetime.now().strftime('%m%d_%H%M')}"
     )
@@ -662,7 +752,10 @@ def main():
     wandb.run.summary.update({
         "total_parameters": total_params,
         "trainable_parameters": trainable_params,
-        "model_size_mb": param_size_mb
+        "model_size_mb": param_size_mb,
+        "scaled_learning_rate": scaled_lr,
+        "total_steps": total_steps,
+        "batches_per_epoch": batches_per_epoch
     })
     print(f"[Main] Total parameters: {total_params:,}")
     print(f"[Main] Trainable parameters: {trainable_params:,}")
@@ -673,79 +766,29 @@ def main():
         ignore_index=tokenizer.pad_token_id
     )
 
-    # Initialize optimizer based on config
-    optimizer_type = config.get('optimizer', {}).get('type', 'adamw')
-    
-    if optimizer_type == 'foreachadopt':
-        optimizer = heavyball.ForeachADOPT(
-            model.parameters(), 
-            lr=config['training']['learning_rate'],
-            caution=config['optimizer']['foreachadopt'].get('caution', True)
-        )
-    elif optimizer_type == 'ortho_adamw':
-        # Use our orthogonal gradient wrapper with AdamW
-        # Separate base optimizer args from ortho args
-        base_args = {
-            'lr': config['training']['learning_rate'],
-            'betas': config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
-            'weight_decay': config['training']['weight_decay']  # Use weight decay from training config
-        }
-        # Only pass eps to base optimizer if not using ortho's eps
-        if not config['optimizer'].get('ortho', {}).get('eps'):
-            base_args['eps'] = config['optimizer']['adamw'].get('eps', 1e-8)
-            
-        # Create optimizer with proper parameter separation
-        optimizer = OrthoGrad(
-            model.parameters(),
-            base_optimizer_cls=optim.AdamW,
-            eps=config['optimizer']['ortho'].get('eps', 1e-30),
-            rescale=config['optimizer']['ortho'].get('rescale', True),
-            **base_args
-        )
-    else:  # AdamW variants
-        use_caution = config['optimizer']['adamw'].get('caution', False)
-        if use_caution:
-            optimizer = heavyball.AdamW(
-                model.parameters(),
-                lr=config['training']['learning_rate'],
-                betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
-                eps=config['optimizer']['adamw'].get('eps', 1e-8),
-                weight_decay=config['training']['weight_decay'],  # Use weight decay from training config
-                caution=True
-            )
-        else:
-            optimizer = optim.AdamW(
-                model.parameters(),
-                lr=config['training']['learning_rate'],
-                betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
-                eps=config['optimizer']['adamw'].get('eps', 1e-8),
-                weight_decay=config['training']['weight_decay']  # Use weight decay from training config
-            )
+    # Initialize optimizer using muP
+    print(f"[Main] Initializing optimizer with scaled learning rate: {scaled_lr:.2e}")
+    optimizer = mup_engine.get_optimizer(
+        optimizer_class=optim.AdamW,
+        lr=scaled_lr,
+        betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
+        weight_decay=config['training']['weight_decay']
+    )
 
-    print(f"[Main] Using optimizer: {optimizer_type}")
-    if optimizer_type == 'ortho_adamw':
-        print(f"      - Base optimizer: AdamW")
-        print(f"      - Orthogonalization eps: {config['optimizer']['ortho'].get('eps', 1e-30)}")
-        print(f"      - Rescale gradients: {config['optimizer']['ortho'].get('rescale', True)}")
-
-    # Calculate total training steps (batches per epoch * num epochs)
-    total_training_steps = len(train_loader) * config['training']['num_epochs']
-    print(f"[Main] Total training steps: {total_training_steps:,}")
-    
-    # Initialize scheduler
+    # Initialize scheduler with scaled learning rate
     scheduler = LinearWarmupCosineDecay(
         optimizer,
         warmup_steps=config['scheduler']['warmup_steps'],
-        total_steps=total_training_steps,
+        total_steps=total_steps,
         decay_type=config['scheduler'].get('type', 'constant'),
-        min_lr=config['training'].get('min_learning_rate', 1e-6)
+        min_lr=config['training'].get('min_learning_rate', scaled_lr/10)
     )
     
     print(f"[Main] Using {config['scheduler'].get('type', 'constant')} scheduler with:")
     print(f"      - Warmup steps: {config['scheduler']['warmup_steps']}")
-    print(f"      - Total steps: {total_training_steps}")
+    print(f"      - Total steps: {total_steps}")
     if config['scheduler'].get('type') == 'cosine':
-        print(f"      - Min LR: {config['training'].get('min_learning_rate', 1e-6)}")
+        print(f"      - Min LR: {config['training'].get('min_learning_rate', scaled_lr/10):.2e}")
 
     print("\n[Main] Creating checkpoint directory...")
     save_dir = Path('checkpoints') / datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -875,33 +918,49 @@ def main():
                 loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
                 # Get predictions and immediately move to CPU
-                pred_tokens = logits.argmax(dim=-1).cpu().tolist()
-                tgt_tokens = target_tokens[:, 1:].cpu().tolist()
+                pred_tokens = logits.argmax(dim=-1).cpu()  # Shape: [batch_size, seq_len]
+                tgt_tokens = target_tokens[:, 1:].cpu()    # Shape: [batch_size, seq_len], skip BOS token
                 
-                # Decode predictions, including SEP token as sequence end marker
-                for pred_seq in pred_tokens:
-                    # Find the first occurrence of SEP token if it exists
+                # Process each sequence in the batch
+                for i in range(pred_tokens.size(0)):
+                    # Handle prediction sequence
+                    pred_seq = pred_tokens[i].tolist()
+                    
+                    # Find EOS token in prediction if present
                     try:
-                        sep_idx = pred_seq.index(tokenizer.sep_token_id)
-                        # Include SEP token in sequence but don't decode it
-                        pred_seq = pred_seq[:sep_idx]  # Don't include SEP in final string
+                        eos_idx = pred_seq.index(tokenizer.sep_token_id)
+                        pred_seq = pred_seq[:eos_idx]  # Truncate at EOS (exclusive)
                     except ValueError:
-                        # No SEP token found, use full sequence
-                        pass
-                        
-                    # Decode the sequence (SEP was used to mark end but isn't included)
-                    decoded = tokenizer.decode(pred_seq).strip()
-                    predictions.append(decoded)
-
-                # Decode targets similarly
-                for tgt_seq in tgt_tokens:
+                        # No EOS found, use full sequence but remove padding
+                        try:
+                            pad_idx = pred_seq.index(tokenizer.pad_token_id)
+                            pred_seq = pred_seq[:pad_idx]
+                        except ValueError:
+                            # No padding found, use full sequence
+                            pass
+                    
+                    # Handle target sequence
+                    tgt_seq = tgt_tokens[i].tolist()
+                    
+                    # Find EOS token in target if present
                     try:
-                        sep_idx = tgt_seq.index(tokenizer.sep_token_id)
-                        tgt_seq = tgt_seq[:sep_idx]  # Don't include SEP in final string
+                        eos_idx = tgt_seq.index(tokenizer.sep_token_id)
+                        tgt_seq = tgt_seq[:eos_idx]  # Truncate at EOS (exclusive)
                     except ValueError:
-                        pass
-                    decoded = tokenizer.decode(tgt_seq).strip()
-                    targets.append(decoded)
+                        # No EOS found, use full sequence but remove padding
+                        try:
+                            pad_idx = tgt_seq.index(tokenizer.pad_token_id)
+                            tgt_seq = tgt_seq[:pad_idx]
+                        except ValueError:
+                            # No padding found, use full sequence
+                            pass
+                    
+                    # Decode sequences
+                    pred_smiles = tokenizer.decode(pred_seq).strip()
+                    tgt_smiles = tokenizer.decode(tgt_seq).strip()
+                    
+                    predictions.append(pred_smiles)
+                    targets.append(tgt_smiles)
                 
                 # Clear GPU tensors we don't need anymore
                 del logits, mask
@@ -996,7 +1055,7 @@ def main():
                     "learning_rate": current_lr,
                     "epoch": epoch + 1,
                     "global_step": global_step,
-                    "progress": global_step / total_training_steps  # Add progress tracking
+                    "progress": global_step / total_steps  # Add progress tracking
                 }, step=global_step)
 
             # Periodic validation
@@ -1079,7 +1138,7 @@ def main():
                     test_loader=test_loader,
                     tokenizer=tokenizer,
                     device=device,
-                    num_examples=10  # Evaluate on 100 examples for speed
+                    num_examples=100  # Evaluate on 100 examples for speed
                 )
                 
                 # Create a new table for greedy decode examples
