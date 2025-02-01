@@ -821,28 +821,26 @@ def main():
         latest_model_path = save_dir / "latest_checkpoint.pt"
         torch.save(checkpoint, latest_model_path)
         
-        # Save metadata for latest checkpoint
-        latest_meta = {
+        # Create metadata
+        meta = {
             'epoch': epoch,
             'global_step': global_step,
             'val_loss': val_loss,
             'timestamp': checkpoint['timestamp']
         }
-        latest_meta_path = save_dir / 'latest_meta.json'
-        with open(latest_meta_path, 'w') as f:
-            json.dump(latest_meta, f, indent=2)
         
-        # Create latest artifact and add all files before logging
-        latest_artifact = wandb.Artifact(
-            name=f"{wandb.run.name}-latest",
-            type="model",
-            metadata=latest_meta
-        )
-        latest_artifact.add_file(str(latest_model_path))
-        latest_artifact.add_file(str(latest_meta_path))
+        # Log artifacts based on save_model_frequency from config
+        should_log_artifact = (global_step % config['training']['save_model_frequency'] == 0)
         
-        # Log latest artifact
-        wandb.log_artifact(latest_artifact, aliases=["latest"])
+        if should_log_artifact:
+            # Create and log latest artifact
+            latest_artifact = wandb.Artifact(
+                name=f"{wandb.run.name}-latest",
+                type="model",
+                metadata=meta
+            )
+            latest_artifact.add_file(str(latest_model_path))
+            wandb.log_artifact(latest_artifact, aliases=["latest"])
         
         # If this is the best model, save it separately
         if is_best:
@@ -852,27 +850,13 @@ def main():
             best_model_path = save_dir / "best_model.pt"
             torch.save(checkpoint, best_model_path)
             
-            # Save metadata for best model
-            best_meta = {
-                'epoch': epoch,
-                'global_step': global_step,
-                'val_loss': val_loss,
-                'timestamp': checkpoint['timestamp']
-            }
-            best_meta_path = save_dir / 'best_model_meta.json'
-            with open(best_meta_path, 'w') as f:
-                json.dump(best_meta, f, indent=2)
-            
-            # Create best artifact and add all files before logging
+            # Always log best model artifact since it's important
             best_artifact = wandb.Artifact(
                 name=f"{wandb.run.name}-best",
                 type="model",
-                metadata=best_meta
+                metadata=meta
             )
             best_artifact.add_file(str(best_model_path))
-            best_artifact.add_file(str(best_meta_path))
-            
-            # Log best artifact
             wandb.log_artifact(best_artifact, aliases=["best"])
             
             # Log best model metrics to wandb
@@ -882,11 +866,6 @@ def main():
                 "best_model_epoch": epoch,
                 "best_model_timestamp": checkpoint['timestamp']
             })
-        
-        # Clean up old artifacts to save space
-        for artifact in wandb.run.logged_artifacts():
-            if artifact.aliases == []:  # No aliases means it's an old version
-                artifact.delete()
 
     NUM_EPOCHS = config['training']['num_epochs']
     validation_frequency = config['training']['validation_frequency']
