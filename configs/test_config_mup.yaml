@@ -25,7 +25,7 @@ training:
   logging_frequency: 10
   save_frequency: 1000
   save_model_frequency: 1000
-  greedy_decode_frequency: 100
+  greedy_decode_frequency: 500
 
 # Optimizer Configuration
 optimizer:
