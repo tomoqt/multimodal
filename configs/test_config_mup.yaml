@@ -4,7 +4,7 @@ model:
   max_seq_length: 95
   max_nmr_length: 190
   max_memory_length: 32
-  embed_dim: 768         # Direct embedding dimension
+  embed_dim: 512         # Direct embedding dimension
   width_basis: 13        # Base width for muP scaling calculations
   num_heads: 4
   num_layers: 8
