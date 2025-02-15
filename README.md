@@ -20,16 +20,47 @@ Current TODOs:
 
 ### Installation
 
+* install and download data
 ```bash
 # install packages and download
 pip install -r requirements.txt
 python3 download_data.py  
 # OR [if want faster, at your own risk] python3 download_data_parallel.py 
-
-# now process the files
-python3 binaries_big_file.py
-
-# now train the model
-CUDA_VISIBLE_DEVICES=0 python3 train_autoregressive.py --config configs/local_config.yaml
-CUDA_VISIBLE_DEVICES=1 python3 train_autoregressive.py --config configs/local_config_nocat.yaml
 ```
+* Tokenize data (or skip if you're not in development, not needed to actually train):
+```bash
+pip install rxn-chem-utils
+# test: 
+python3 create_tokenized_dataset_smallram.py --analytical_data "data_extraction/multimodal_spectroscopic_dataset" --out_path "tokenized_baseline" --h_nmr --c_nmr --ir --formula
+# real
+python3 create_tokenized_dataset_faster.py --analytical_data "data_extraction/multimodal_spectroscopic_dataset" --out_path "tokenized_baseline" --h_nmr --c_nmr --ir --formula
+```
+* Download the data: 
+```bash
+python3 download_tokenized_dataset.py
+python3 build_vocab.py
+
+# train the model
+CUDA_VISIBLE_DEVICES=0 python3 train_autoregressive.py --config configs/local_config.yaml
+CUDA_VISIBLE_DEVICES=2 python3 train_autoregressive.py --config configs/real_config.yaml
+
+# MUP
+CUDA_VISIBLE_DEVICES=1 python3 train_autoregressive_mup.py --config configs/real_config.yaml
+
+
+```
+
+
+### Paper Notes: 
+
+
+#### Ablations
+
+To investigate the effect of molecular (in) validity of model outputs, we train a model to produce the SELFIES encoding of molecules instead of SMILES. The results are provided in Table 4. 
+
+
+
+
+
+
+

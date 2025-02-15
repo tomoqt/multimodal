@@ -756,11 +756,11 @@ def main():
     best_val_loss = float('inf')
     best_model_path = None
     latest_model_path = None
-    
+
     def save_checkpoint(model, optimizer, epoch, global_step, val_loss, is_best=False):
         """Helper function to save checkpoints and manage storage"""
         nonlocal best_model_path, latest_model_path
-        
+
         # Create checkpoint
         checkpoint = {
             'epoch': epoch,
@@ -770,50 +770,52 @@ def main():
             'val_loss': val_loss,
             'timestamp': datetime.now().isoformat()
         }
-        
+
         # Save as latest checkpoint locally
         if latest_model_path and os.path.exists(latest_model_path):
             os.remove(latest_model_path)  # Remove old latest checkpoint
-        
+
         latest_model_path = save_dir / "latest_checkpoint.pt"
         torch.save(checkpoint, latest_model_path)
-        
-        # Create and save latest checkpoint artifact
-        latest_artifact = wandb.Artifact(
-            name=f"{wandb.run.name}-latest",
-            type="model",
-            metadata={
-                "epoch": epoch,
-                "global_step": global_step,
-                "val_loss": val_loss,
-                "timestamp": checkpoint['timestamp']
-            }
-        )
-        latest_artifact.add_file(str(latest_model_path))
-        wandb.log_artifact(latest_artifact, aliases=["latest"])
-        
+
+        # Create metadata
+        meta = {
+            'epoch': epoch,
+            'global_step': global_step,
+            'val_loss': val_loss,
+            'timestamp': checkpoint['timestamp']
+        }
+
+        # Log artifacts based on save_model_frequency from config
+        should_log_artifact = (global_step % config['training']['save_model_frequency'] == 0)
+
+        if should_log_artifact:
+            # Create and log latest artifact
+            latest_artifact = wandb.Artifact(
+                name=f"{wandb.run.name}-latest",
+                type="model",
+                metadata=meta
+            )
+            latest_artifact.add_file(str(latest_model_path))
+            wandb.log_artifact(latest_artifact, aliases=["latest"])
+
         # If this is the best model, save it separately
         if is_best:
             if best_model_path and os.path.exists(best_model_path):
                 os.remove(best_model_path)  # Remove old best checkpoint
-            
+
             best_model_path = save_dir / "best_model.pt"
             torch.save(checkpoint, best_model_path)
-            
-            # Create and save best model artifact
+
+            # Always log best model artifact since it's important
             best_artifact = wandb.Artifact(
                 name=f"{wandb.run.name}-best",
                 type="model",
-                metadata={
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "val_loss": val_loss,
-                    "timestamp": checkpoint['timestamp']
-                }
+                metadata=meta
             )
             best_artifact.add_file(str(best_model_path))
             wandb.log_artifact(best_artifact, aliases=["best"])
-            
+
             # Log best model metrics to wandb
             wandb.run.summary.update({
                 "best_val_loss": val_loss,
@@ -821,25 +823,6 @@ def main():
                 "best_model_epoch": epoch,
                 "best_model_timestamp": checkpoint['timestamp']
             })
-            
-            # Also save a small metadata file with best model info
-            meta_info = {
-                'val_loss': val_loss,
-                'global_step': global_step,
-                'epoch': epoch,
-                'timestamp': checkpoint['timestamp']
-            }
-            meta_path = save_dir / 'best_model_meta.json'
-            with open(meta_path, 'w') as f:
-                json.dump(meta_info, f, indent=2)
-            
-            # Add metadata to best model artifact
-            best_artifact.add_file(str(meta_path))
-            
-        # Clean up old artifacts to save space
-        for artifact in wandb.run.logged_artifacts():
-            if artifact.aliases == []:  # No aliases means it's an old version
-                artifact.delete()
 
     NUM_EPOCHS = config['training']['num_epochs']
     validation_frequency = config['training']['validation_frequency']

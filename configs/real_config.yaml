@@ -13,16 +13,19 @@ model:
 
 # Training Parameters
 training:
-  batch_size: 32
+  # batch_size: 32
+  # batch_size: 256
+  batch_size: 128
   test_batch_size: 1
-  num_epochs: 10
-  learning_rate: 5.0e-5
+  num_epochs: 50
+  learning_rate: 1.0e-4
   min_learning_rate: 5.0e-6
   weight_decay: 0.01
+  # weight_decay: 0.1
   validation_frequency: 50
   logging_frequency: 10
-  save_frequency: 1000
-  save_model_frequency: 500  # How often to save model to wandb (in steps)
+  save_frequency: 10_000
+  save_model_frequency: 10_000  # How often to save model to wandb (in steps)
   greedy_decode_frequency: 100
 
 # Optimizer Configuration

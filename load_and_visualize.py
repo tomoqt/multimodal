@@ -230,4 +230,4 @@ def main():
         print("3. The metadata file exists at 'data_extraction/multimodal_spectroscopic_dataset/meta_data/meta_data_dict.json'")
 
 if __name__ == "__main__":
-    main() 
+    main()
