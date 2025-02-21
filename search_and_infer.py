@@ -221,6 +221,44 @@ class SimpleSpectralSmilesDataset:
         return target_tokens, (ir_tensor, None), nmr_tokens, None
 
 
+# Added helper functions for raw spectra processing
+
+def load_raw_spectrum_tokens(file_path, spectral_tokenizer, max_len):
+    tokens_list = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                try:
+                    intensity = float(parts[1])
+                    # Round intensity to 2 decimals and convert to string token
+                    token = str(round(intensity, 2))
+                    tokens_list.append(token)
+                except:
+                    continue
+    token_str = " ".join(tokens_list)
+    tokens = token_str.split()
+    token_ids = [spectral_tokenizer.get(t, spectral_tokenizer.get("<UNK>")) for t in tokens]
+    if len(token_ids) > max_len:
+        token_ids = token_ids[:max_len]
+    import torch
+    return torch.tensor(token_ids, dtype=torch.long)
+
+
+def load_raw_ir(file_path):
+    intensities = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                try:
+                    intensities.append(float(parts[1]))
+                except:
+                    continue
+    import torch
+    return torch.tensor(intensities, dtype=torch.float32)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Search dataset for nearest SMILES and run inference on spectra')
     parser.add_argument('--query', type=str, help='Query SMILES string (ignored if use_candidates is enabled)')
@@ -232,15 +270,15 @@ def main():
     parser.add_argument('--no-use_candidates', dest='use_candidates', action='store_false', help='Do not use candidate SMILES')
     parser.set_defaults(use_candidates=True)
     parser.add_argument('--use_all', action='store_true', help='Use entire dataset (train+val+test) instead of a single split')
+    
+    # New options for raw spectra inference
+    parser.add_argument('--raw_nmr', type=str, default=None, help='Path to raw NMR spectrum text file (expected format: two columns with domain and intensities)')
+    parser.add_argument('--raw_ir', type=str, default=None, help='Path to raw IR spectrum text file (expected format: two columns with domain and intensities)')
+
     args = parser.parse_args()
 
-    # Determine which split to load
-    split_to_use = "all" if args.use_all else args.split
-
-    # Load configuration
+    # Load configuration and tokenizers
     config = load_config(args.config)
-
-    # Load tokenizers
     current_dir = os.path.dirname(os.path.realpath(__file__))
     vocab_path = os.path.join(current_dir, 'vocab.txt')
     tokenizer = SmilesTokenizer(vocab_file=vocab_path)
@@ -250,16 +288,6 @@ def main():
         raise FileNotFoundError(f"NMR vocabulary not found at {nmr_vocab_path}")
     with open(nmr_vocab_path) as f:
         nmr_tokenizer = json.load(f)
-
-    # Create dataset
-    dataset = SimpleSpectralSmilesDataset(
-        data_dir=config['data']['tokenized_dir'],
-        split=split_to_use,
-        smiles_tokenizer=tokenizer,
-        spectral_tokenizer=nmr_tokenizer,
-        max_smiles_len=config['model']['max_seq_length'],
-        max_nmr_len=config['model']['max_nmr_length']
-    )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     smiles_vocab_size = len(tokenizer)
@@ -283,6 +311,42 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
+
+    # If raw spectra files are provided, run direct inference and skip search/dataset loading
+    if args.raw_nmr or args.raw_ir:
+        nmr_tokens = load_raw_spectrum_tokens(args.raw_nmr, nmr_tokenizer, config['model']['max_nmr_length']) if args.raw_nmr else None
+        ir_tensor = load_raw_ir(args.raw_ir) if args.raw_ir else None
+        prediction = greedy_decode(model, nmr_tokens, ir_tensor, tokenizer, max_len=config['model']['max_seq_length'], device=device)
+        print("Predicted SMILES from raw spectra:")
+        print(prediction[0])
+        return
+
+    # Determine which split to load (only used if not in raw inference mode)
+    split_to_use = "all" if args.use_all else args.split
+
+    # The rest of the existing code for candidate search inference follows...
+    # Load tokenizers and create dataset
+    nmr_vocab_path = Path(config['data']['tokenized_dir']).parent / 'vocab.json'
+    if not nmr_vocab_path.exists():
+        raise FileNotFoundError(f"NMR vocabulary not found at {nmr_vocab_path}")
+    with open(nmr_vocab_path) as f:
+        nmr_tokenizer = json.load(f)
+
+    from search_and_infer import SimpleSpectralSmilesDataset  # Assuming the dataset class is defined in this file
+
+    dataset = SimpleSpectralSmilesDataset(
+        data_dir=config['data']['tokenized_dir'],
+        split=split_to_use,
+        smiles_tokenizer=tokenizer,
+        spectral_tokenizer=nmr_tokenizer,
+        max_smiles_len=config['model']['max_seq_length'],
+        max_nmr_len=config['model']['max_nmr_length']
+    )
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    smiles_vocab_size = len(tokenizer)
+    token_ids = list(nmr_tokenizer.values())
+    nmr_vocab_size = max(token_ids) + 1
 
     if args.use_candidates:
         candidates = [

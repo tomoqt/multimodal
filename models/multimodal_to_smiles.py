@@ -25,7 +25,8 @@ class MultiModalToSMILESModel(nn.Module):
         num_layers: int = 6,
         dropout: float = 0.1,
         verbose: bool = False,
-        use_stablemax: bool = False
+        use_stablemax: bool = False,
+        ir_encoder_type: str = "regular"
     ):
         """
         Args:
@@ -40,6 +41,7 @@ class MultiModalToSMILESModel(nn.Module):
             dropout:    Dropout probability in the decoder.
             verbose:    If True, print debugging shapes in forward pass.
             use_stablemax: If True, use stablemax instead of softmax in the decoder.
+            ir_encoder_type: Type of IR encoder to use.
         """
         super().__init__()
         self.verbose = verbose
@@ -47,7 +49,8 @@ class MultiModalToSMILESModel(nn.Module):
         # The spectral encoder always concatenates IR/H-NMR/C-NMR => final dim = embed_dim
         self.encoder = MultimodalSpectralEncoder(
             embed_dim=embed_dim,
-            verbose=verbose
+            verbose=verbose,
+            encoder_type=ir_encoder_type
         )
 
         # The decoder expects memory_dim == encoder's output dim.

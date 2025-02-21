@@ -39,6 +39,7 @@ from ortho_grad import OrthoGrad  # Import our new optimizer wrapper
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
 from models.multimodal_to_smiles import MultiModalToSMILESModel
+import subprocess
 
 # Disable RDKit logging
 RDLogger.DisableLog("rdApp.*")
@@ -81,6 +82,15 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
         
         # Encode spectral data - pass as positional args
         memory = model.encoder(None, ir_data, None)  # NMR tokens not needed here
+        
+        if memory is None:
+            if nmr_tokens is not None:
+                batch_size = nmr_tokens.size(0)
+            elif ir_data is not None:
+                batch_size = ir_data.size(0)
+            else:
+                batch_size = 1
+            memory = torch.zeros(batch_size, model.decoder.max_memory_length, model.decoder.memory_dim, device=device)
         
         # Initialize storage for generated tokens
         generated_sequences = [[] for _ in range(batch_size)]
@@ -132,21 +142,26 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
         return decoded_sequences
 
 
-def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examples=None):
-    """Evaluate model using greedy decoding"""
+def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examples=None, block_ir=False, block_nmr=False):
+    """Evaluate model using greedy decoding with optional IR/NMR blocking"""
     model.eval()
     all_predictions = []
     all_targets = []
-    
+
     with torch.no_grad():
         for target_tokens, ir_data, nmr_tokens, _ in tqdm(test_loader, desc="Greedy decoding"):
+            # Block modalities if flags are set
+            if block_ir:
+                ir_data = None
+            if block_nmr:
+                nmr_tokens = None
+
             # Move data to device
             if ir_data is not None:
                 ir_data = ir_data.to(device)
             if nmr_tokens is not None:
                 nmr_tokens = nmr_tokens.to(device)
-            
-            # Generate predictions
+
             predictions = greedy_decode(
                 model=model,
                 nmr_tokens=nmr_tokens,
@@ -154,36 +169,28 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
                 tokenizer=tokenizer,
                 device=device
             )
-            
-            # Get target sequences
+
             targets = []
             for tgt in target_tokens:
-                # Find EOS token if present
                 try:
                     eos_idx = tgt.tolist().index(tokenizer.sep_token_id)
                     tgt = tgt[:eos_idx]
                 except ValueError:
                     pass
-                
-                # Decode target sequence
-                decoded = tokenizer.decode(tgt[1:])  # Skip BOS token
+                decoded = tokenizer.decode(tgt[1:])
                 targets.append(decoded)
-            
+
             all_predictions.extend(predictions)
             all_targets.extend(targets)
-            
+
             if num_examples and len(all_predictions) >= num_examples:
                 break
-    
-    # Calculate metrics
+
     detailed_results = evaluate_predictions(all_predictions, all_targets)
     metrics = aggregate_metrics(detailed_results)
-    
-    # Add predictions and targets to metrics
-    metrics['predictions'] = all_predictions[:10]  # Store first 10 examples
+    metrics['predictions'] = all_predictions[:10]
     metrics['targets'] = all_targets[:10]
     metrics['num_samples'] = len(all_predictions)
-    
     return metrics
 
 
@@ -521,7 +528,8 @@ def load_config(config_path=None):
             'dropout': 0.1,
             'resample_size': 1000,
             'use_concat': True,
-            'use_stablemax': False
+            'use_stablemax': False,
+            'ir_encoder_type': 'regular'
         },
         'training': {
             'batch_size': 32,
@@ -586,7 +594,23 @@ def load_config(config_path=None):
 def parse_args():
     parser = argparse.ArgumentParser(description='Train SMILES generation model')
     parser.add_argument('--config', type=str, help='Path to config file')
+    parser.add_argument('--block-ir', action='store_true', help='Block IR signals in the model inputs')
+    parser.add_argument('--block-nmr', action='store_true', help='Block NMR signals in the model inputs')
     return parser.parse_args()
+
+
+def cleanup_wandb_cache():
+    """Clean up wandb cache to prevent disk space issues"""
+    try:
+        # Clean files older than 24 hours and don't include online runs
+        subprocess.run(['wandb', 'sync', '--clean-old-hours', '24', '--no-include-online'], 
+                      capture_output=True, text=True)
+        # Clean artifact cache over 5GB
+        subprocess.run(['wandb', 'artifact', 'cache', 'cleanup', '1GB'],
+                      capture_output=True, text=True)
+        print("[wandb] Cache cleaned successfully")
+    except Exception as e:
+        print(f"[wandb] Cache cleanup failed: {e}")
 
 
 # -------------------------------------------------------------------------
@@ -595,10 +619,16 @@ def parse_args():
 def main():
     print("\n[Main] Starting training script...")
     args = parse_args()
+    block_ir = args.block_ir
+    block_nmr = args.block_nmr
 
     print("[Main] Loading configuration...")
     config = load_config(args.config)
     print("[Main] Configuration loaded.")
+
+    # Clean wandb cache before starting
+    print("\n[Main] Cleaning wandb cache...")
+    cleanup_wandb_cache()
 
     # Load vocabularies first
     print("\n[Main] Loading vocabularies...")
@@ -626,7 +656,8 @@ def main():
         num_layers=config['model']['num_layers'],
         dropout=config['model']['dropout'],
         verbose=False,
-        use_stablemax=config['model'].get('use_stablemax', False)
+        use_stablemax=config['model'].get('use_stablemax', False),
+        ir_encoder_type=config['model'].get('ir_encoder_type', 'regular')
     ).to(device)
 
     print("\n[Main] Creating data loaders...")
@@ -747,8 +778,8 @@ def main():
     if config['scheduler'].get('type') == 'cosine':
         print(f"      - Min LR: {config['training'].get('min_learning_rate', 1e-6)}")
 
-    print("\n[Main] Creating checkpoint directory...")
-    save_dir = Path('checkpoints') / datetime.now().strftime('%Y%m%d_%H%M%S')
+    print("\n[Main] Creating checkpoint directory (overwriting previous checkpoints)...")
+    save_dir = Path('checkpoints')
     save_dir.mkdir(parents=True, exist_ok=True)
     print(f"[Main] Checkpoint directory: {save_dir}")
 
@@ -776,7 +807,7 @@ def main():
             os.remove(latest_model_path)  # Remove old latest checkpoint
 
         latest_model_path = save_dir / "latest_checkpoint.pt"
-        torch.save(checkpoint, latest_model_path)
+        torch.save(checkpoint, latest_model_path, _use_new_zipfile_serialization=False)
 
         # Create metadata
         meta = {
@@ -805,7 +836,7 @@ def main():
                 os.remove(best_model_path)  # Remove old best checkpoint
 
             best_model_path = save_dir / "best_model.pt"
-            torch.save(checkpoint, best_model_path)
+            torch.save(checkpoint, best_model_path, _use_new_zipfile_serialization=False)
 
             # Always log best model artifact since it's important
             best_artifact = wandb.Artifact(
@@ -831,7 +862,7 @@ def main():
     global_step = 0
 
     # Helper for validation
-    def validate(model, loader, criterion, tokenizer, device):
+    def validate(model, loader, criterion, tokenizer, device, block_ir=False, block_nmr=False):
         model.eval()
         total_loss = 0.0
         total_batches = 0
@@ -840,6 +871,11 @@ def main():
         
         with torch.no_grad():
             for target_tokens, ir_data, nmr_tokens, _ in loader:
+                if block_ir:
+                    ir_data = None
+                if block_nmr:
+                    nmr_tokens = None
+
                 target_tokens = target_tokens.to(device)
                 if ir_data is not None:
                     ir_data = ir_data.to(device)
@@ -857,55 +893,35 @@ def main():
                 )
                 loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
-                # Get predictions and immediately move to CPU
                 pred_tokens = logits.argmax(dim=-1).cpu().tolist()
                 tgt_tokens = target_tokens[:, 1:].cpu().tolist()
                 
-                # Decode predictions, including SEP token as sequence end marker
                 for pred_seq in pred_tokens:
-                    # Find the first occurrence of SEP token if it exists
                     try:
                         sep_idx = pred_seq.index(tokenizer.sep_token_id)
-                        # Include SEP token in sequence but don't decode it
-                        pred_seq = pred_seq[:sep_idx]  # Don't include SEP in final string
+                        pred_seq = pred_seq[:sep_idx]
                     except ValueError:
-                        # No SEP token found, use full sequence
                         pass
-                        
-                    # Decode the sequence (SEP was used to mark end but isn't included)
                     decoded = tokenizer.decode(pred_seq).strip()
                     predictions.append(decoded)
 
-                # Decode targets similarly
                 for tgt_seq in tgt_tokens:
                     try:
                         sep_idx = tgt_seq.index(tokenizer.sep_token_id)
-                        tgt_seq = tgt_seq[:sep_idx]  # Don't include SEP in final string
+                        tgt_seq = tgt_seq[:sep_idx]
                     except ValueError:
                         pass
                     decoded = tokenizer.decode(tgt_seq).strip()
                     targets.append(decoded)
                 
-                # Clear GPU tensors we don't need anymore
-                del logits, mask
-                if ir_data is not None:
-                    del ir_data
-                if nmr_tokens is not None:
-                    del nmr_tokens
-                
                 total_loss += loss.item()
                 total_batches += 1
-
-                # Clear some memory
                 torch.cuda.empty_cache()
         
         val_loss = total_loss / max(total_batches, 1)
         
-        # Calculate molecular metrics using logging_utils
         detailed_results = evaluate_predictions(predictions, targets)
         metrics = aggregate_metrics(detailed_results)
-        
-        # Store all examples, not just the first 10
         combined_metrics = {
             'val_loss': val_loss,
             'valid_smiles_rate': metrics['valid_smiles'],
@@ -914,11 +930,10 @@ def main():
             'tanimoto_similarity': metrics['avg_tanimoto'],
             'mcs_ratio': metrics['avg_#mcs/#target'],
             'ecfp6_iou': metrics['avg_ecfp6_iou'],
-            'predictions': predictions[:10],  # Store first 10 predictions
-            'targets': targets[:10],         # Store first 10 targets
+            'predictions': predictions[:10],
+            'targets': targets[:10],
             'num_samples': len(predictions)
         }
-        
         return combined_metrics
 
     # Initialize wandb table outside the validation loop
@@ -985,7 +1000,11 @@ def main():
             # Periodic validation
             if global_step % validation_frequency == 0:
                 print(f"\nRunning validation at step {global_step}...")
-                val_metrics = validate(model, val_loader, criterion, tokenizer, device)
+                val_metrics = validate(model, val_loader, criterion, tokenizer, device, block_ir, block_nmr)
+                
+                # Clean wandb cache periodically (every 5 validation steps)
+                if (global_step // validation_frequency) % 5 == 0:
+                    cleanup_wandb_cache()
                 
                 # Create a new table for each validation step
                 examples_table = wandb.Table(columns=columns)
@@ -1062,7 +1081,9 @@ def main():
                     test_loader=test_loader,
                     tokenizer=tokenizer,
                     device=device,
-                    num_examples=10  # Evaluate on 100 examples for speed
+                    num_examples=100,
+                    block_ir=block_ir,
+                    block_nmr=block_nmr
                 )
                 
                 # Create a new table for greedy decode examples
@@ -1071,6 +1092,7 @@ def main():
                 # Log sample results
                 for pred, tgt in zip(greedy_metrics['predictions'], greedy_metrics['targets']):
                     # Calculate metrics for this pair
+                    pair_results = evaluate_predictions([pred], [tgt])[0]
                     pair_results = evaluate_predictions([pred], [tgt])[0]
                     greedy_table.add_data(
                         global_step,
@@ -1103,7 +1125,7 @@ def main():
 
     # Final test set evaluation
     print("\n[Main] Evaluating on test set...")
-    final_test_loss = validate(model, test_loader, criterion, tokenizer, device)
+    final_test_loss = validate(model, test_loader, criterion, tokenizer, device, block_ir, block_nmr)
     wandb.log({"test_loss": final_test_loss['val_loss']}, step=global_step)
     print(f"[Test] Loss: {final_test_loss['val_loss']:.4f}")
 
@@ -1113,7 +1135,9 @@ def main():
         model=model,
         test_loader=test_loader,
         tokenizer=tokenizer,
-        device=device
+        device=device,
+        block_ir=block_ir,
+        block_nmr=block_nmr
     )
     wandb.log({
         "final_greedy_valid_smiles": final_greedy_metrics['valid_smiles'],
