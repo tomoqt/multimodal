@@ -10,7 +10,7 @@ model:
   dropout: 0.0
   resample_size: 1000
   use_stablemax: True
-  ir_encoder_type: convnext
+  ir_encoder_type: convnext #regular, convnext
 
 # Training Parameters
 training:
@@ -52,6 +52,8 @@ data:
   test_size: 20
   val_size: 0.001
   preprocessed: False
+  ir_as_prompt: True
+  ir_tokenizer_path: "tokenized_baseline/ir_processed/ir_vocab.json"
 
 # Logging
 wandb:

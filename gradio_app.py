@@ -7,12 +7,13 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem import Draw
 import py3Dmol
+import random
 
 # Global test mode flag
 TEST_MODE = True
 
 # Import necessary functions from search_and_infer.py
-from search_and_infer import load_config, load_raw_spectrum_tokens, load_raw_ir, greedy_decode
+from search_and_infer import load_config, load_raw_spectrum_tokens, load_raw_ir, SimpleSpectralSmilesDataset
 
 # Import model and tokenizer classes
 from models.multimodal_to_smiles import MultiModalToSMILESModel
@@ -62,6 +63,16 @@ checkpoint = torch.load(checkpoint_path, map_location=device)
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
+# Load test dataset for random sampling in test mode
+test_dataset = SimpleSpectralSmilesDataset(
+    data_dir=config['data']['tokenized_dir'],
+    split='test',
+    smiles_tokenizer=tokenizer,
+    spectral_tokenizer=spectral_tokenizer,
+    max_smiles_len=config['model']['max_seq_length'],
+    max_nmr_len=config['model']['max_nmr_length']
+)
+
 # Function to create 2D molecule visualization
 def visualize_smiles(smiles):
     try:
@@ -71,19 +82,7 @@ def visualize_smiles(smiles):
         # Try to create molecule from cleaned SMILES
         mol = Chem.MolFromSmiles(clean_smiles)
         if mol is None:
-            if TEST_MODE:
-                smiles = "CCO"  # fallback to a valid SMILES (ethanol)
-                mol = Chem.MolFromSmiles(smiles)
-            else:
-                return "<p>Invalid molecule</p>"
-
-        # Validate SMILES: if the molecule has only 1 atom but input is longer than one character, consider it invalid
-        if mol.GetNumAtoms() == 1 and len(clean_smiles) > 1:
-            if TEST_MODE:
-                smiles = "CCO"  # fallback to a valid SMILES (ethanol)
-                mol = Chem.MolFromSmiles(smiles)
-            else:
-                return "<p>Invalid SMILES provided.</p>"
+            return "<p>Invalid molecule</p>"
 
         # Compute 2D coordinates for the molecule
         AllChem.Compute2DCoords(mol)
@@ -107,46 +106,64 @@ def visualize_smiles(smiles):
 
 # Gradio prediction function
 def predict_molecule(c_nmr_file, h_nmr_file, ir_file):
-    # Ensure all files are uploaded
-    if c_nmr_file is None or h_nmr_file is None or ir_file is None:
-         return "Please upload all three spectra files", "<p>No visualization available</p>"
-    
-    # Extract file paths. Gradio file uploads may be objects with a 'name' attribute
-    c_nmr_path = c_nmr_file.name if hasattr(c_nmr_file, "name") else c_nmr_file
-    h_nmr_path = h_nmr_file.name if hasattr(h_nmr_file, "name") else h_nmr_file
-    ir_path = ir_file.name if hasattr(ir_file, "name") else ir_file
+    if TEST_MODE:
+        # Randomly select a sample from test dataset
+        idx = random.randint(0, len(test_dataset) - 1)
+        _, (ir_data, _), nmr_tokens, _ = test_dataset[idx]
+        
+        # Move tensors to device
+        if ir_data is not None:
+            ir_data = ir_data.to(device)
+        nmr_tokens = nmr_tokens.to(device)
+        
+        # Add batch dimension if needed
+        if len(nmr_tokens.shape) == 1:
+            nmr_tokens = nmr_tokens.unsqueeze(0)
+        if ir_data is not None and len(ir_data.shape) == 1:
+            ir_data = ir_data.unsqueeze(0)
+        
+        print(f"\nUsing random test sample {idx}")
+    else:
+        # Ensure all files are uploaded
+        if c_nmr_file is None or h_nmr_file is None or ir_file is None:
+             return "Please upload all three spectra files", "<p>No visualization available</p>"
+        
+        # Extract file paths. Gradio file uploads may be objects with a 'name' attribute
+        c_nmr_path = c_nmr_file.name if hasattr(c_nmr_file, "name") else c_nmr_file
+        h_nmr_path = h_nmr_file.name if hasattr(h_nmr_file, "name") else h_nmr_file
+        ir_path = ir_file.name if hasattr(ir_file, "name") else ir_file
 
-    # Load raw spectrum tokens for C-NMR and H-NMR
-    max_nmr_len = config['model']['max_nmr_length']
-    try:
-        c_tokens = load_raw_spectrum_tokens(c_nmr_path, spectral_tokenizer, max_nmr_len)
-        h_tokens = load_raw_spectrum_tokens(h_nmr_path, spectral_tokenizer, max_nmr_len)
-    except Exception as e:
-        return f"Error processing NMR files: {str(e)}", "<p>Error in visualization</p>"
+        # Load raw spectrum tokens for C-NMR and H-NMR
+        max_nmr_len = config['model']['max_nmr_length']
+        try:
+            c_tokens = load_raw_spectrum_tokens(c_nmr_path, spectral_tokenizer, max_nmr_len)
+            h_tokens = load_raw_spectrum_tokens(h_nmr_path, spectral_tokenizer, max_nmr_len)
+        except Exception as e:
+            return f"Error processing NMR files: {str(e)}", "<p>Error in visualization</p>"
 
-    # Combine the tokens from both NMR files
-    combined_tokens = torch.cat([c_tokens, h_tokens])
-    
-    # Load IR spectrum
-    try:
-        ir_tensor = load_raw_ir(ir_path)
-    except Exception as e:
-        return f"Error processing IR file: {str(e)}", "<p>Error in visualization</p>"
+        # Combine the tokens from both NMR files
+        nmr_tokens = torch.cat([c_tokens, h_tokens])
+        
+        # Load IR spectrum
+        try:
+            ir_data = load_raw_ir(ir_path)
+        except Exception as e:
+            return f"Error processing IR file: {str(e)}", "<p>Error in visualization</p>"
 
-    combined_tokens = combined_tokens.to(device)
-    ir_tensor = ir_tensor.to(device)
+        nmr_tokens = nmr_tokens.to(device)
+        ir_data = ir_data.to(device)
 
-    # Add batch dimension if needed
-    if len(combined_tokens.shape) == 1:
-        combined_tokens = combined_tokens.unsqueeze(0)
-    if len(ir_tensor.shape) == 1:
-        ir_tensor = ir_tensor.unsqueeze(0)
+        # Add batch dimension if needed
+        if len(nmr_tokens.shape) == 1:
+            nmr_tokens = nmr_tokens.unsqueeze(0)
+        if len(ir_data.shape) == 1:
+            ir_data = ir_data.unsqueeze(0)
 
     # Run the model's greedy decoding to predict SMILES
     predicted_smiles = greedy_decode(
         model=model,
-        nmr_tokens=combined_tokens,
-        ir_data=ir_tensor,
+        nmr_tokens=nmr_tokens,
+        ir_data=ir_data,
         tokenizer=tokenizer,
         max_len=config['model']['max_seq_length'],
         device=device
@@ -155,15 +172,12 @@ def predict_molecule(c_nmr_file, h_nmr_file, ir_file):
     # Remove any spaces from the predicted SMILES
     predicted_smiles = predicted_smiles.replace(" ", "")
 
-    # Validate and visualize the predicted SMILES
+    # Try to create visualization, but always return the predicted SMILES
     try:
         mol = Chem.MolFromSmiles(predicted_smiles)
         if mol is None:
-            if TEST_MODE:
-                predicted_smiles = "CCO"  # fallback to ethanol
-                mol = Chem.MolFromSmiles(predicted_smiles)
-            else:
-                return "Invalid SMILES generated", "<p>Invalid molecule</p>"
+            print(f"Invalid SMILES generated: {predicted_smiles}")
+            return predicted_smiles, "<p>Invalid SMILES - cannot visualize molecule</p>"
         
         # Generate 2D coordinates
         AllChem.Compute2DCoords(mol)
@@ -182,7 +196,7 @@ def predict_molecule(c_nmr_file, h_nmr_file, ir_file):
         return predicted_smiles, html
     except Exception as e:
         print(f"Error in visualization: {e}")
-        return str(e), "<p>Error generating visualization</p>"
+        return predicted_smiles, "<p>Error generating visualization</p>"
 
 # Inserting custom CSS for font fallback
 custom_css = '''
@@ -218,6 +232,9 @@ with gr.Blocks(css=custom_css) as demo:
         outputs=[smiles_out, vis_out],
         api_name="predict"
     )
+
+# Add the local greedy_decode function (identical to the one in train_autoregressive.py)
+from train_autoregressive import greedy_decode
 
 if __name__ == "__main__":
     # Configure launch parameters

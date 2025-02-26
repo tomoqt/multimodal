@@ -178,7 +178,8 @@ class SMILESDecoder(nn.Module):
         num_layers: int = 6,
         dropout: int = 0.1,
         verbose: bool = True,
-        use_stablemax: bool = False  # Add this parameter
+        use_stablemax: bool = False,  # Add this parameter
+        ir_as_prompt: bool = False
     ):
         super().__init__()
         
@@ -190,13 +191,14 @@ class SMILESDecoder(nn.Module):
         self.max_seq_length = max_seq_length
         self.max_nmr_length = max_nmr_length
         self.max_memory_length = max_memory_length
+        self.ir_as_prompt = ir_as_prompt
         
         # Separate embeddings with different vocabulary sizes
         self.smiles_embed = nn.Embedding(smiles_vocab_size, embed_dim)
         self.nmr_embed = nn.Embedding(nmr_vocab_size, embed_dim)
         
         # Add input projection for memory if dimensions don't match
-        self.memory_proj = nn.Linear(memory_dim, embed_dim) if memory_dim != embed_dim else nn.Identity()
+        self.memory_proj = nn.Identity() if ir_as_prompt else (nn.Linear(memory_dim, embed_dim) if memory_dim != embed_dim else nn.Identity())
         
         # Create decoder layers with stablemax option
         self.layers = nn.ModuleList([
@@ -231,8 +233,15 @@ class SMILESDecoder(nn.Module):
             if nmr_tokens is not None:
                 print(f"NMR tokens: {nmr_tokens.shape}")
 
-        # Check and enforce sequence length limits
-        if memory.size(1) > self.max_memory_length:
+        # Check and enforce target sequence length limits
+        if T > self.max_seq_length:
+            if self.verbose:
+                print(f"Warning: Truncating target sequence from {T} to {self.max_seq_length}")
+            tgt = tgt[:, :self.max_seq_length]
+            T = self.max_seq_length
+                
+        # Check and enforce sequence length limits only for non-IR prompt mode
+        if not self.ir_as_prompt and memory.size(1) > self.max_memory_length:
             if self.verbose:
                 print(f"Warning: Truncating memory from {memory.size(1)} to {self.max_memory_length}")
             memory = memory[:, :self.max_memory_length]
@@ -246,17 +255,22 @@ class SMILESDecoder(nn.Module):
         total_prompt_length = memory.size(1) + (nmr_tokens.size(1) if nmr_tokens is not None else 0)
         
         # Check if target sequence + prompt length exceeds maximum
-        if T + total_prompt_length > self.max_seq_length + 256:
+        # Note: Individual components (target, memory, nmr) are already checked separately above
+        # This is just to ensure the total sequence length doesn't exceed transformer architecture limits
+        max_transformer_length = 1024  # Standard upper bound for transformer architectures
+        if T + total_prompt_length > max_transformer_length:
             raise ValueError(
                 f"Combined sequence length ({T} + {total_prompt_length} = {T + total_prompt_length}) "
-                f"exceeds maximum length ({self.max_seq_length + 256})"
+                f"exceeds maximum transformer architecture limit ({max_transformer_length})"
             )
 
         # Embed target sequence using SMILES embeddings
         x = self.smiles_embed(tgt)
         
-        # Project memory to full embedding dimension
-        memory = self.memory_proj(memory)
+        # Project memory to full embedding dimension only if not using ir_as_prompt
+        if not self.ir_as_prompt:
+            memory = self.memory_proj(memory)
+        # In ir_as_prompt mode, the memory is already correctly dimensioned from the embedding table
         
         # Embed NMR tokens if provided and handle concatenation
         if nmr_tokens is not None:
@@ -265,6 +279,8 @@ class SMILESDecoder(nn.Module):
                 print(f"Memory shape after projection: {memory.shape}")
                 print(f"NMR tokens device: {nmr_tokens.device}, Memory device: {memory.device}")
                 print(f"NMR tokens dtype: {nmr_tokens.dtype}, Memory dtype: {memory.dtype}")
+            
+                print(f"Debug: NMR tokens shape: {nmr_tokens.shape}, Memory shape: {memory.shape}")
             
             # Ensure NMR tokens are on the same device as memory
             nmr_tokens = nmr_tokens.to(memory.device)
@@ -280,8 +296,12 @@ class SMILESDecoder(nn.Module):
             
             # Concatenate memory (IR) and NMR embeddings
             prompt = th.cat([memory, nmr_embeddings], dim=1)  # (B, S+N, D)
+            if self.verbose:
+                print(f"Debug: After concatenation - prompt shape: {prompt.shape} (IR + NMR)")
         else:
             prompt = memory
+            if self.verbose:
+                print(f"Debug: No NMR tokens provided, using only memory: {memory.shape}")
 
         if self.verbose:
             print(f"Prompt shape after concatenation: {prompt.shape}")

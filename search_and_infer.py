@@ -14,6 +14,7 @@ from rdkit.Chem import rdFingerprintGenerator
 # Import model and tokenizer
 from models.multimodal_to_smiles import MultiModalToSMILESModel
 from models.smiles_tokenizer import SmilesTokenizer
+from inference import ModelInference, DecodingStrategy
 
 
 def load_config(config_path=None):
@@ -275,6 +276,15 @@ def main():
     parser.add_argument('--raw_nmr', type=str, default=None, help='Path to raw NMR spectrum text file (expected format: two columns with domain and intensities)')
     parser.add_argument('--raw_ir', type=str, default=None, help='Path to raw IR spectrum text file (expected format: two columns with domain and intensities)')
 
+    # Add new arguments for decoding strategies
+    parser.add_argument('--strategy', type=str, default='greedy', choices=['greedy', 'beam', 'sampling', 'nucleus'],
+                        help='Decoding strategy to use for generation')
+    parser.add_argument('--beam_width', type=int, default=5, help='Beam width for beam search')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Temperature for sampling')
+    parser.add_argument('--top_k', type=int, default=0, help='Top-k sampling parameter (0 = disabled)')
+    parser.add_argument('--top_p', type=float, default=0.0, help='Top-p (nucleus) sampling parameter (0 = disabled)')
+    parser.add_argument('--length_penalty', type=float, default=1.0, help='Length penalty for beam search')
+
     args = parser.parse_args()
 
     # Load configuration and tokenizers
@@ -312,13 +322,40 @@ def main():
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
+    # Create the inference wrapper
+    inference = ModelInference(model, tokenizer, device)
+    try:
+        strategy = DecodingStrategy(args.strategy)
+    except ValueError:
+        print(f"Invalid strategy: {args.strategy}. Using greedy decoding instead.")
+        strategy = DecodingStrategy.GREEDY
+
     # If raw spectra files are provided, run direct inference and skip search/dataset loading
     if args.raw_nmr or args.raw_ir:
         nmr_tokens = load_raw_spectrum_tokens(args.raw_nmr, nmr_tokenizer, config['model']['max_nmr_length']) if args.raw_nmr else None
         ir_tensor = load_raw_ir(args.raw_ir) if args.raw_ir else None
-        prediction = greedy_decode(model, nmr_tokens, ir_tensor, tokenizer, max_len=config['model']['max_seq_length'], device=device)
-        print("Predicted SMILES from raw spectra:")
-        print(prediction[0])
+        
+        if nmr_tokens is not None:
+            nmr_tokens = nmr_tokens.to(device)
+        if ir_tensor is not None:
+            ir_tensor = ir_tensor.to(device)
+            
+        # Use the new inference mechanism
+        prediction = inference.decode(
+            nmr_tokens=nmr_tokens,
+            ir_data=ir_tensor,
+            strategy=strategy,
+            max_len=config['model']['max_seq_length'],
+            beam_width=args.beam_width,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            length_penalty=args.length_penalty
+        )
+        
+        print(f"Predicted SMILES from raw spectra using {args.strategy} decoding:")
+        for i, pred in enumerate(prediction):
+            print(f"{i+1}. {pred}")
         return
 
     # Determine which split to load (only used if not in raw inference mode)
@@ -332,8 +369,6 @@ def main():
     with open(nmr_vocab_path) as f:
         nmr_tokenizer = json.load(f)
 
-    from search_and_infer import SimpleSpectralSmilesDataset  # Assuming the dataset class is defined in this file
-
     dataset = SimpleSpectralSmilesDataset(
         data_dir=config['data']['tokenized_dir'],
         split=split_to_use,
@@ -342,11 +377,6 @@ def main():
         max_smiles_len=config['model']['max_seq_length'],
         max_nmr_len=config['model']['max_nmr_length']
     )
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    smiles_vocab_size = len(tokenizer)
-    token_ids = list(nmr_tokenizer.values())
-    nmr_vocab_size = max(token_ids) + 1
 
     if args.use_candidates:
         candidates = [
@@ -374,13 +404,26 @@ def main():
             print(f"Top {args.k} entries similar to candidate {name}:")
             for idx, sim in top_k:
                 print(f"Index: {idx}, SMILES: {dataset.targets[idx]}, Tanimoto: {sim:.4f}")
-            print(f"\nRunning inference for candidate {name}:")
+            print(f"\nRunning inference for candidate {name} using {args.strategy} decoding:")
             for idx, sim in top_k:
                 target_tokens, (ir_data, _), nmr_tokens, _ = dataset[idx]
                 if ir_data is not None:
                     ir_data = ir_data.to(device)
                 nmr_tokens = nmr_tokens.to(device)
-                prediction = greedy_decode(model, nmr_tokens, ir_data, tokenizer, device=device)
+                
+                # Use the new inference mechanism
+                prediction = inference.decode(
+                    nmr_tokens=nmr_tokens,
+                    ir_data=ir_data,
+                    strategy=strategy,
+                    max_len=config['model']['max_seq_length'],
+                    beam_width=args.beam_width,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    length_penalty=args.length_penalty
+                )
+                
                 print(f"Index: {idx}")
                 print(f"Dataset SMILES: {dataset.targets[idx]}")
                 print(f"Tanimoto similarity: {sim:.4f}")
@@ -410,13 +453,26 @@ def main():
         for idx, sim in top_k:
             print(f"Index: {idx}, SMILES: {dataset.targets[idx]}, Tanimoto: {sim:.4f}")
 
-        print("\nRunning inference on selected entries:")
+        print(f"\nRunning inference on selected entries using {args.strategy} decoding:")
         for idx, sim in top_k:
             target_tokens, (ir_data, _), nmr_tokens, _ = dataset[idx]
             if ir_data is not None:
                 ir_data = ir_data.to(device)
             nmr_tokens = nmr_tokens.to(device)
-            prediction = greedy_decode(model, nmr_tokens, ir_data, tokenizer, device=device)
+            
+            # Use the new inference mechanism
+            prediction = inference.decode(
+                nmr_tokens=nmr_tokens,
+                ir_data=ir_data,
+                strategy=strategy,
+                max_len=config['model']['max_seq_length'],
+                beam_width=args.beam_width,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                length_penalty=args.length_penalty
+            )
+            
             print(f"Index: {idx}")
             print(f"Dataset SMILES: {dataset.targets[idx]}")
             print(f"Tanimoto similarity: {sim:.4f}")

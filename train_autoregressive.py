@@ -250,7 +250,9 @@ class SpectralSmilesDataset(Dataset):
         spectral_tokenizer, 
         split='train', 
         max_smiles_len=512,  # Separate length limit for SMILES
-        max_nmr_len=128      # Separate length limit for NMR
+        max_nmr_len=128,      # Separate length limit for NMR
+        ir_as_prompt=False,   # NEW: flag to indicate IR should be processed as prompt tokens
+        ir_tokenizer=None     # NEW: IR vocabulary mapping for tokenization
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -259,6 +261,8 @@ class SpectralSmilesDataset(Dataset):
         self.max_smiles_len = max_smiles_len
         self.max_nmr_len = max_nmr_len
         self.split = split
+        self.ir_as_prompt = ir_as_prompt
+        self.ir_tokenizer = ir_tokenizer
 
         # Load source (NMR) and target sequences
         with open(self.data_dir / f"src-{split}.txt") as f:
@@ -267,31 +271,41 @@ class SpectralSmilesDataset(Dataset):
             # Remove spaces when loading SMILES sequences
             self.targets = [line.strip().replace(" ", "") for line in f]
 
-        # Load IR data using numpy.memmap instead of pickle
-        ir_path = self.data_dir / f"ir-{split}.npy"
-        self.ir_data = None
-        if ir_path.exists():
-            try:
-                # Use memmap to load the IR data
-                self.ir_data = np.memmap(
-                    ir_path,
-                    dtype='float32',
-                    mode='r',
-                    shape=None  # Let numpy figure out the shape
+        # Load IR data - either from pre-tokenized text file or memory-mapped binary
+        if self.ir_as_prompt:
+            # Load pre-tokenized IR data from text file
+            ir_text_path = self.data_dir.parent / "ir_processed" / f"ir-{split}.txt"
+            if not ir_text_path.exists():
+                raise FileNotFoundError(
+                    f"IR text file not found at {ir_text_path}. "
+                    "Please run build_ir_vocab.py first to generate tokenized IR data."
                 )
-                # Get the actual shape from the memmap
-                array_shape = self.ir_data.shape
-                # Reshape if needed (should be 2D: [num_samples, features])
-                if len(array_shape) == 1:
-                    # Calculate number of samples based on total size and feature dimension
-                    num_samples = len(self.sources)
-                    feature_dim = array_shape[0] // num_samples
-                    self.ir_data = self.ir_data.reshape(num_samples, feature_dim)
-                
-                print(f"[Dataset] Loaded IR data with shape: {self.ir_data.shape}")
-            except Exception as e:
-                print(f"[Warning] Failed to load IR data: {e}")
-                self.ir_data = None
+            with open(ir_text_path) as f:
+                self.ir_sources = [line.strip() for line in f]
+            print(f"[Dataset] Loaded tokenized IR data from {ir_text_path}")
+            self.ir_data = None  # Not needed when using pre-tokenized data
+        else:
+            # Load raw IR data using memory-mapped binary
+            self.ir_sources = None
+            ir_path = self.data_dir / f"ir-{split}.npy"
+            self.ir_data = None
+            if ir_path.exists():
+                try:
+                    self.ir_data = np.memmap(
+                        ir_path,
+                        dtype='float32',
+                        mode='r',
+                        shape=None
+                    )
+                    array_shape = self.ir_data.shape
+                    if len(array_shape) == 1:
+                        num_samples = len(self.sources)
+                        feature_dim = array_shape[0] // num_samples
+                        self.ir_data = self.ir_data.reshape(num_samples, feature_dim)
+                    print(f"[Dataset] Loaded IR data with shape: {self.ir_data.shape}")
+                except Exception as e:
+                    print(f"[Warning] Failed to load IR data: {e}")
+                    self.ir_data = None
 
         print(f"[Dataset] SpectralSmilesDataset initialized for {split}:")
         print(f"          Found {len(self.sources)} samples")
@@ -354,10 +368,17 @@ class SpectralSmilesDataset(Dataset):
             nmr_token_ids = nmr_token_ids[:self.max_nmr_len]
         nmr_tokens = torch.tensor(nmr_token_ids, dtype=torch.long)
 
-        # Get IR data if available - modify to handle memmap
+        # Get IR data - either from pre-tokenized text or raw data
         ir_data = None
-        if self.ir_data is not None:
-            # Copy the data from memmap to a regular tensor
+        if self.ir_as_prompt and self.ir_sources is not None:
+            # Use pre-tokenized IR data
+            ir_seq = self.ir_sources[idx]
+            ir_tokens = ir_seq.split()
+            ir_token_ids = [self.ir_tokenizer.get(token, self.ir_tokenizer["<UNK>"]) 
+                          for token in ir_tokens]
+            ir_data = torch.tensor(ir_token_ids, dtype=torch.long)
+        elif self.ir_data is not None:
+            # Use raw IR data
             ir_data = torch.tensor(self.ir_data[idx].copy(), dtype=torch.float32)
 
         return (
@@ -448,17 +469,30 @@ def load_vocabularies(config):
 def create_data_loaders(smiles_tokenizer, nmr_tokenizer, config):
     print("\n[DataLoader] Creating data loaders...")
 
+    # Load IR tokenizer if IR as prompt is enabled
+    ir_tokenizer = None
+    ir_vocab_size = None
+    if config['data'].get('ir_as_prompt', False):
+        ir_vocab_path = config['data'].get('ir_tokenizer_path')
+        if not ir_vocab_path:
+            raise ValueError("IR as prompt is enabled but 'ir_tokenizer_path' is not provided in config.")
+        with open(ir_vocab_path, 'r') as f:
+            ir_tokenizer = json.load(f)
+            ir_vocab_size = len(ir_tokenizer)  # Get vocabulary size for model initialization
+
     # Create a collate function with the spectral tokenizer
     collate_with_tokenizer = lambda batch: collate_fn(batch, nmr_tokenizer)
 
-    # Create datasets for each split with separate length limits
+    # Create datasets for each split with separate length limits, passing the new IR prompt parameters
     train_dataset = SpectralSmilesDataset(
         data_dir=config['data']['tokenized_dir'],
         smiles_tokenizer=smiles_tokenizer,
         spectral_tokenizer=nmr_tokenizer,
         split='train',
         max_smiles_len=config['model']['max_seq_length'],
-        max_nmr_len=config['model']['max_nmr_length']
+        max_nmr_len=config['model']['max_nmr_length'],
+        ir_as_prompt=config['data'].get('ir_as_prompt', False),
+        ir_tokenizer=ir_tokenizer
     )
 
     val_dataset = SpectralSmilesDataset(
@@ -467,7 +501,9 @@ def create_data_loaders(smiles_tokenizer, nmr_tokenizer, config):
         spectral_tokenizer=nmr_tokenizer,
         split='val',
         max_smiles_len=config['model']['max_seq_length'],
-        max_nmr_len=config['model']['max_nmr_length']
+        max_nmr_len=config['model']['max_nmr_length'],
+        ir_as_prompt=config['data'].get('ir_as_prompt', False),
+        ir_tokenizer=ir_tokenizer
     )
 
     test_dataset = SpectralSmilesDataset(
@@ -476,7 +512,9 @@ def create_data_loaders(smiles_tokenizer, nmr_tokenizer, config):
         spectral_tokenizer=nmr_tokenizer,
         split='test',
         max_smiles_len=config['model']['max_seq_length'],
-        max_nmr_len=config['model']['max_nmr_length']
+        max_nmr_len=config['model']['max_nmr_length'],
+        ir_as_prompt=config['data'].get('ir_as_prompt', False),
+        ir_tokenizer=ir_tokenizer
     )
 
     print(f"[DataLoader] Dataset sizes:")
@@ -645,6 +683,14 @@ def main():
     print(f"[Main] Using device: {device}")
 
     print("\n[Main] Initializing model...")
+    ir_vocab_size = None
+    if config['data'].get('ir_as_prompt', False):
+        ir_vocab_path = config['data'].get('ir_tokenizer_path')
+        if not ir_vocab_path:
+            raise ValueError("IR as prompt is enabled but 'ir_tokenizer_path' is not provided in config.")
+        with open(ir_vocab_path, 'r') as f:
+            ir_vocab = json.load(f)
+            ir_vocab_size = len(ir_vocab)
     model = MultiModalToSMILESModel(
         smiles_vocab_size=smiles_vocab_size,
         nmr_vocab_size=nmr_vocab_size,
@@ -657,7 +703,9 @@ def main():
         dropout=config['model']['dropout'],
         verbose=False,
         use_stablemax=config['model'].get('use_stablemax', False),
-        ir_encoder_type=config['model'].get('ir_encoder_type', 'regular')
+        ir_encoder_type=config['model'].get('ir_encoder_type', 'regular'),
+        ir_as_prompt=config['data'].get('ir_as_prompt', False),
+        ir_vocab_size=ir_vocab_size
     ).to(device)
 
     print("\n[Main] Creating data loaders...")
