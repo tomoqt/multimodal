@@ -179,7 +179,8 @@ class SMILESDecoder(nn.Module):
         dropout: int = 0.1,
         verbose: bool = True,
         use_stablemax: bool = False,  # Add this parameter
-        ir_as_prompt: bool = False
+        ir_as_prompt: bool = False,
+        max_loops: int = 1  # Maximum number of times to loop the middle layer
     ):
         super().__init__()
         
@@ -192,6 +193,8 @@ class SMILESDecoder(nn.Module):
         self.max_nmr_length = max_nmr_length
         self.max_memory_length = max_memory_length
         self.ir_as_prompt = ir_as_prompt
+        self.max_loops = max_loops
+        self.num_layers = num_layers
         
         # Separate embeddings with different vocabulary sizes
         self.smiles_embed = nn.Embedding(smiles_vocab_size, embed_dim)
@@ -219,11 +222,12 @@ class SMILESDecoder(nn.Module):
         # Output projection to SMILES vocabulary
         self.out = nn.Linear(embed_dim, smiles_vocab_size)
         
-    def forward(self, tgt: th.Tensor, memory: th.Tensor, nmr_tokens: th.Tensor = None):
+    def forward(self, tgt: th.Tensor, memory: th.Tensor, nmr_tokens: th.Tensor = None, num_loops: int = None):
         """ inputs:
             tgt: target sequence tensor, shape (B, T)
             memory: memory tensor from IR encoder, shape (B, S, D)
             nmr_tokens: tokenized NMR data, shape (B, N)
+            num_loops: number of times to loop the middle layer (defaults to self.max_loops)
         """
         B, T = tgt.shape
         if self.verbose:
@@ -232,6 +236,13 @@ class SMILESDecoder(nn.Module):
             print(f"Memory: {memory.shape}")
             if nmr_tokens is not None:
                 print(f"NMR tokens: {nmr_tokens.shape}")
+
+        # Use default num_loops if not specified
+        if num_loops is None:
+            num_loops = 1  # Default is 1 (no extra looping)
+        
+        # Ensure num_loops doesn't exceed max_loops
+        num_loops = min(num_loops, self.max_loops)
 
         # Check and enforce target sequence length limits
         if T > self.max_seq_length:
@@ -317,9 +328,22 @@ class SMILESDecoder(nn.Module):
         mask[:, :M, :M] = True
         mask = mask[:, None].repeat(1, self.num_heads, 1, 1)
 
-        # Process through decoder layers
-        for layer in self.layers:
-            x = layer(x, mask)
+        # Identify the middle layer (using integer division)
+        middle_idx = self.num_layers // 2
+        
+        # Process through decoder layers with looping for the middle layer
+        for i, layer in enumerate(self.layers):
+            # For the middle layer, loop num_loops times
+            if i == middle_idx and num_loops > 1:
+                if self.verbose:
+                    print(f"Looping middle layer (layer {middle_idx}) {num_loops} times")
+                
+                # Loop through the middle layer num_loops times
+                for _ in range(num_loops):
+                    x = layer(x, mask)
+            else:
+                # Normal processing for non-middle layers
+                x = layer(x, mask)
         
         # Only project the target sequence portion to vocabulary
         x_target = x[:, M:]  # Extract only the target sequence part

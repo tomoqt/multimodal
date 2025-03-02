@@ -17,26 +17,28 @@ training:
   batch_size: 32
   test_batch_size: 1
   num_epochs: 10
-  learning_rate: 1.0e-4
+  learning_rate: 1.0e-4  # This will be used for AdamW components
   min_learning_rate: 1.0e-5
   weight_decay: 0.1
   validation_frequency: 100
   logging_frequency: 10
   save_frequency: 1000
-  save_model_frequency: 10  # How often to save model to wandb (in steps)
-  greedy_decode_frequency: 100
+  save_model_frequency: 1000 # How often to save model to wandb (in steps)
+  greedy_decode_frequency: 500
 
 # Optimizer Configuration
 optimizer:
-  type: ortho_adamw  # Use orthogonal gradient optimization
-  adamw:  # Base optimizer settings
+  type: muon_mix  # Use Muon for matrices and AdamW for vectors/scalars
+  adamw:  # Settings for vector parameters (< 2D)
     betas: [0.9, 0.999]
     eps: 1.0e-8
     weight_decay: 0.1
     caution: false
-  ortho:  # Orthogonal gradient settings
-    eps: 1.0e-30
-    rescale: true
+  muon:  # Settings for matrix parameters (≥ 2D)
+    lr: 1.0e-3
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
 
 # Scheduler
 scheduler:
@@ -52,11 +54,11 @@ data:
   test_size: 20
   val_size: 0.001
   preprocessed: False
-  ir_as_prompt: True
+  ir_as_prompt: False
   ir_tokenizer_path: "tokenized_baseline/ir_processed/ir_vocab.json"
 
 # Logging
 wandb:
   project: "smiles-generation"
-  base_run_name: "smiles_gen"
+  base_run_name: "muon_mix"  # Changed to reflect the optimizer being used
   log_examples: true 

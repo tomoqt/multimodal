@@ -29,7 +29,8 @@ class MultiModalToSMILESModel(nn.Module):
         use_stablemax: bool = False,
         ir_encoder_type: str = "regular",
         ir_as_prompt: bool = False,
-        ir_vocab_size: int = None
+        ir_vocab_size: int = None,
+        max_loops: int = 1
     ):
         """
         Args:
@@ -47,11 +48,13 @@ class MultiModalToSMILESModel(nn.Module):
             ir_encoder_type: Type of IR encoder to use.
             ir_as_prompt: If True, use IR as prompt tokens.
             ir_vocab_size: Number of tokens in the IR vocabulary if IR is used as prompt.
+            max_loops: Maximum number of times to loop the middle layer in the decoder.
         """
         super().__init__()
         self.verbose = verbose
         self.ir_as_prompt = ir_as_prompt
         self.max_memory_length = max_memory_length
+        self.max_loops = max_loops
 
         # Initialize spectral encoder; pass the flag so that it bypasses encoding if IR is prompt
         self.encoder = MultimodalSpectralEncoder(
@@ -83,7 +86,8 @@ class MultiModalToSMILESModel(nn.Module):
             dropout=dropout,
             verbose=verbose,
             use_stablemax=use_stablemax,
-            ir_as_prompt=ir_as_prompt
+            ir_as_prompt=ir_as_prompt,
+            max_loops=max_loops
         )
 
     def forward(
@@ -91,7 +95,8 @@ class MultiModalToSMILESModel(nn.Module):
         nmr_tokens: th.Tensor | None,
         ir_data: th.Tensor | None,
         target_seq: th.Tensor | None = None,
-        target_mask: th.Tensor | None = None
+        target_mask: th.Tensor | None = None,
+        num_loops: int = None
     ):
         """
         Args:
@@ -99,6 +104,7 @@ class MultiModalToSMILESModel(nn.Module):
             ir_data:    IR data, shape (B, L).
             target_seq: Token IDs for SMILES, shape (B, T).
             target_mask: Optional causal mask for the target sequence.
+            num_loops: Number of times to loop the middle layer in the decoder.
 
         Returns:
             logits: (B, T, vocab_size), the decoder output for each token.
@@ -114,6 +120,7 @@ class MultiModalToSMILESModel(nn.Module):
             print(f"NMR Tokens: {shape_str(nmr_tokens)}")
             print(f"IR Data:    {shape_str(ir_data)}")
             print(f"Target sequence shape: {shape_str(target_seq)}")
+            print(f"Number of middle layer loops: {num_loops if num_loops is not None else 1}")
 
         # Handle memory creation based on mode
         memory = None
@@ -151,7 +158,7 @@ class MultiModalToSMILESModel(nn.Module):
             print(f"Encoder Output (memory) shape: {memory.shape}")
 
         # 2) Decode to SMILES: target_seq => shape (B, T)
-        logits = self.decoder(target_seq, memory, nmr_tokens)
+        logits = self.decoder(target_seq, memory, nmr_tokens, num_loops=num_loops)
 
         if self.verbose:
             print("\n=== Forward Pass Complete ===")

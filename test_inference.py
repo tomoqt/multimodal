@@ -7,10 +7,137 @@ from pathlib import Path
 import yaml
 import numpy as np
 from scipy.interpolate import interp1d  # Added for IR processing
+import pandas as pd
+from tabulate import tabulate
+import time
+from tqdm import tqdm
 
 from models.multimodal_to_smiles import MultiModalToSMILESModel
 from models.smiles_tokenizer import SmilesTokenizer
 from inference import ModelInference, DecodingStrategy
+
+# Import evaluation metrics functions from logging_utils
+try:
+    from logging_utils import evaluate_predictions, aggregate_metrics
+except ImportError:
+    print("Warning: Could not import logging_utils. Using local implementation.")
+    import rdkit
+    from rdkit import Chem
+    from rdkit import DataStructs
+    from rdkit.Chem import AllChem
+    from rdkit.Chem import rdFMCS
+    import numpy as np
+    
+    def evaluate_predictions(predictions, targets):
+        """Evaluate SMILES prediction quality with RDKit metrics"""
+        results = []
+        for pred, target in zip(predictions, targets):
+            # Process to handle spaces/clean up
+            pred = pred.replace(" ", "")
+            target = target.replace(" ", "")
+            
+            mol_pred = Chem.MolFromSmiles(pred) if pred else None
+            mol_target = Chem.MolFromSmiles(target) if target else None
+            
+            # Initialize metrics
+            result = {
+                'prediction': pred,
+                'target': target,
+                'valid_pred': mol_pred is not None,
+                'valid_target': mol_target is not None,
+                'exact_match': pred == target,
+                'tanimoto': 0.0,
+                '#mcs/#target': 0.0,
+                'ecfp6_iou': 0.0
+            }
+            
+            # Skip detailed metrics if either molecule is invalid
+            if not mol_pred or not mol_target:
+                results.append(result)
+                continue
+                
+            # Calculate Tanimoto similarity with Morgan fingerprints
+            fp_pred = AllChem.GetMorganFingerprintAsBitVect(mol_pred, 2)
+            fp_target = AllChem.GetMorganFingerprintAsBitVect(mol_target, 2)
+            tanimoto = DataStructs.TanimotoSimilarity(fp_pred, fp_target)
+            result['tanimoto'] = tanimoto
+            
+            # Calculate Maximum Common Substructure (MCS) size ratio
+            try:
+                mcs = rdFMCS.FindMCS([mol_pred, mol_target], timeout=1)
+                if mcs and mcs.numAtoms > 0:
+                    mcs_mol = Chem.MolFromSmarts(mcs.smartsString)
+                    result['#mcs/#target'] = mcs.numAtoms / mol_target.GetNumAtoms()
+                else:
+                    result['#mcs/#target'] = 0.0
+            except:
+                result['#mcs/#target'] = 0.0
+            
+            # Calculate ECFP6 (Morgan r=3) Intersection-over-Union
+            fp_pred = AllChem.GetMorganFingerprintAsBitVect(mol_pred, 3, nBits=2048)
+            fp_target = AllChem.GetMorganFingerprintAsBitVect(mol_target, 3, nBits=2048)
+            
+            # Convert fingerprints to numpy arrays for set operations
+            arr_pred = np.zeros((1,))
+            arr_target = np.zeros((1,))
+            DataStructs.ConvertToNumpyArray(fp_pred, arr_pred)
+            DataStructs.ConvertToNumpyArray(fp_target, arr_target)
+            
+            intersection = np.logical_and(arr_pred, arr_target).sum()
+            union = np.logical_or(arr_pred, arr_target).sum()
+            if union > 0:
+                result['ecfp6_iou'] = intersection / union
+            
+            results.append(result)
+        return results
+
+    def aggregate_metrics(results):
+        """Aggregate individual result metrics into summary statistics"""
+        n_samples = len(results)
+        if n_samples == 0:
+            return {
+                'valid_smiles': 0.0,
+                'exact_match': 0.0,
+                'exact_match_all': 0.0,
+                'avg_tanimoto': 0.0,
+                'avg_#mcs/#target': 0.0,
+                'avg_ecfp6_iou': 0.0
+            }
+        
+        # Count valid predictions
+        n_valid_pred = sum(1 for r in results if r['valid_pred'])
+        n_valid_target = sum(1 for r in results if r['valid_target'])
+        
+        # Count exact matches (only consider if target is valid)
+        n_exact_match = sum(1 for r in results if r['exact_match'] and r['valid_target'])
+        
+        # Filter for valid molecules to calculate chemical similarities
+        valid_results = [r for r in results if r['valid_pred'] and r['valid_target']]
+        n_valid_pairs = len(valid_results)
+        
+        if n_valid_pairs == 0:
+            return {
+                'valid_smiles': n_valid_pred / n_samples if n_samples > 0 else 0.0,
+                'exact_match': n_exact_match / n_valid_target if n_valid_target > 0 else 0.0,
+                'exact_match_all': n_exact_match / n_samples if n_samples > 0 else 0.0,
+                'avg_tanimoto': 0.0,
+                'avg_#mcs/#target': 0.0,
+                'avg_ecfp6_iou': 0.0
+            }
+        
+        # Calculate averages for similarity metrics
+        avg_tanimoto = sum(r['tanimoto'] for r in valid_results) / n_valid_pairs
+        avg_mcs_ratio = sum(r['#mcs/#target'] for r in valid_results) / n_valid_pairs
+        avg_ecfp6_iou = sum(r['ecfp6_iou'] for r in valid_results) / n_valid_pairs
+        
+        return {
+            'valid_smiles': n_valid_pred / n_samples if n_samples > 0 else 0.0,
+            'exact_match': n_exact_match / n_valid_target if n_valid_target > 0 else 0.0,
+            'exact_match_all': n_exact_match / n_samples if n_samples > 0 else 0.0,
+            'avg_tanimoto': avg_tanimoto,
+            'avg_#mcs/#target': avg_mcs_ratio,
+            'avg_ecfp6_iou': avg_ecfp6_iou
+        }
 
 
 def load_config(config_path=None):
@@ -362,6 +489,90 @@ def get_ir_tokenizer(config):
     return token_to_id
 
 
+def evaluate_similarity(predictions, target, method_name=""):
+    """
+    Evaluate similarity metrics between generated SMILES and target.
+    
+    Args:
+        predictions: List of predicted SMILES strings
+        target: Target SMILES string (ground truth)
+        method_name: Name of the decoding method
+        
+    Returns:
+        Dictionary of metrics
+    """
+    # Create a list of the same target for each prediction
+    targets = [target] * len(predictions)
+    
+    # Evaluate predictions using functions from logging_utils
+    detailed_results = evaluate_predictions(predictions, targets)
+    metrics = aggregate_metrics(detailed_results)
+    
+    # Print metrics for this method
+    print(f"\n----- Similarity Metrics for {method_name} -----")
+    print(f"Valid SMILES Rate: {metrics['valid_smiles']:.2%}")
+    print(f"Exact Match Rate: {metrics['exact_match']:.2%}")
+    print(f"Tanimoto Similarity: {metrics['avg_tanimoto']:.4f}")
+    print(f"MCS Ratio: {metrics['avg_#mcs/#target']:.4f}")
+    print(f"ECFP6 IoU: {metrics['avg_ecfp6_iou']:.4f}")
+    
+    # Add method name to metrics
+    metrics['method'] = method_name
+    
+    return metrics
+
+
+def combine_metrics(metrics_list):
+    """
+    Combine metrics from multiple test examples into one aggregate result.
+    
+    Args:
+        metrics_list: List of metrics dictionaries
+        
+    Returns:
+        Dictionary of combined metrics
+    """
+    # Skip empty list
+    if not metrics_list:
+        return None
+    
+    # Initialize result with keys from the first metrics dict
+    keys = metrics_list[0].keys()
+    combined = {k: [] for k in keys if not k == 'method'}
+    
+    # Add method name if it exists in the first metrics dict
+    if 'method' in metrics_list[0]:
+        combined['method'] = metrics_list[0]['method']
+    
+    # Collect all values
+    for metrics in metrics_list:
+        for k, v in metrics.items():
+            if k != 'method':
+                combined[k].append(v)
+    
+    # Calculate averages - handle non-numeric values correctly
+    result = {}
+    for k, v in combined.items():
+        # Skip empty lists
+        if not v:
+            continue
+            
+        # Check if values are numeric or strings
+        if all(isinstance(x, (int, float, bool, np.number)) for x in v):
+            # For numeric values, calculate mean
+            result[k] = np.mean([x for x in v if x is not None])
+        else:
+            # For non-numeric values (like strings), use the first value
+            # This assumes these values should be the same across all metrics
+            result[k] = v[0]
+    
+    # Add method name back if it exists
+    if 'method' in combined:
+        result['method'] = combined['method']
+    
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description='Test different inference mechanisms')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
@@ -369,10 +580,17 @@ def main():
     parser.add_argument('--raw_nmr', type=str, default=None, help='Path to raw NMR spectrum file')
     parser.add_argument('--raw_ir', type=str, default=None, help='Path to raw IR spectrum file')
     parser.add_argument('--dataset_test', action='store_true', help='Test on a dataset sample instead of raw files')
-    parser.add_argument('--split', type=str, default='test', help='Dataset split to use (only if --dataset_test)')
+    parser.add_argument('--full_dataset_test', action='store_true', help='Test on the entire dataset and report aggregate metrics')
+    parser.add_argument('--split', type=str, default='test', help='Dataset split to use (only if --dataset_test or --full_dataset_test)')
     parser.add_argument('--index', type=int, default=0, help='Index in dataset to test (only if --dataset_test)')
+    parser.add_argument('--batch_size', type=int, default=1, help='Number of examples to process in parallel (only with --full_dataset_test)')
+    parser.add_argument('--max_examples', type=int, default=None, help='Maximum number of test examples to process (only with --full_dataset_test)')
+    parser.add_argument('--strategies', type=str, default='all', help='Comma-separated list of decoding strategies to test (greedy,beam,sampling,nucleus,entropix)')
     parser.add_argument('--ir_as_prompt', action='store_true', help='Use IR as prompt tokens')
     parser.add_argument('--no_ir_as_prompt', action='store_true', help='Do not use IR as prompt tokens')
+    parser.add_argument('--entropy_threshold', type=float, default=0.6939, help='Entropy threshold for Entropix decoding')
+    parser.add_argument('--varentropy_threshold', type=float, default=1.3781, help='Varentropy threshold for Entropix decoding')
+    parser.add_argument('--max_loops', type=int, default=10, help='Maximum number of middle layer loops for high entropy states')
     args = parser.parse_args()
 
     # Load configuration
@@ -438,6 +656,9 @@ def main():
         'use_stablemax': config['model'].get('use_stablemax', False),
         'ir_as_prompt': ir_as_prompt
     }
+    # Added to ensure the correct IR encoder type and max_loops are used
+    model_kwargs['ir_encoder_type'] = config['model'].get('ir_encoder_type', 'regular')
+    model_kwargs['max_loops'] = args.max_loops
     
     # Add ir_vocab_size if needed
     if ir_as_prompt:
@@ -459,9 +680,209 @@ def main():
     
     model.eval()
     
+    # Determine which strategies to use based on args.strategies
+    if args.strategies.lower() == 'all':
+        strategies = ["greedy", "beam", "sampling", "nucleus", "entropix"]
+    else:
+        strategies = [s.strip().lower() for s in args.strategies.split(',')]
+        valid_strategies = ["greedy", "beam", "sampling", "nucleus", "entropix"]
+        for s in strategies:
+            if s not in valid_strategies:
+                raise ValueError(f"Invalid strategy '{s}'. Valid options are: {', '.join(valid_strategies)}")
+    
+    print(f"Testing strategies: {', '.join(strategies)}")
+    
+    # Create inference wrapper
+    inference = ModelInference(model, tokenizer, device, ir_as_prompt=ir_as_prompt)
+    
+    # Test on full dataset
+    if args.full_dataset_test:
+        print(f"\n===== Testing on full dataset (split={args.split}) =====")
+        
+        # Create dataset
+        dataset = SimpleSpectralSmilesDataset(
+            data_dir=config['data']['tokenized_dir'],
+            split=args.split,
+            smiles_tokenizer=tokenizer,
+            spectral_tokenizer=nmr_tokenizer,
+            max_smiles_len=config['model']['max_seq_length'],
+            max_nmr_len=config['model']['max_nmr_length'],
+            ir_as_prompt=ir_as_prompt,
+            ir_tokenizer=ir_tokenizer
+        )
+        
+        # Determine number of examples to process
+        num_examples = len(dataset)
+        if args.max_examples is not None:
+            num_examples = min(num_examples, args.max_examples)
+        
+        print(f"Processing {num_examples} examples from dataset")
+        
+        # Dictionary to collect metrics for each strategy
+        all_strategy_metrics = {strategy: [] for strategy in strategies}
+        
+        # Process examples in batches
+        batch_size = args.batch_size
+        total_batches = (num_examples + batch_size - 1) // batch_size
+        
+        # Track time
+        start_time = time.time()
+        
+        # Process each batch
+        for batch_idx in tqdm(range(total_batches)):
+            batch_start = batch_idx * batch_size
+            batch_end = min(batch_start + batch_size, num_examples)
+            batch_size_actual = batch_end - batch_start
+            
+            # Process each example in the batch
+            for i in range(batch_start, batch_end):
+                target_tokens, (ir_tensor, _), nmr_tokens, _ = dataset[i]
+                if ir_tensor is not None:
+                    ir_data = ir_tensor.to(device)
+                else:
+                    ir_data = None
+                nmr_tokens = nmr_tokens.to(device)
+                
+                target_smiles = dataset.targets[i]
+                
+                # Process each strategy for this example
+                for strategy in strategies:
+                    if strategy == "greedy":
+                        results = inference.decode(
+                            nmr_tokens=nmr_tokens,
+                            ir_data=ir_data,
+                            strategy=DecodingStrategy.GREEDY,
+                            max_len=config['model']['max_seq_length']
+                        )
+                        metrics = evaluate_similarity(results, target_smiles, "Greedy Decoding")
+                        all_strategy_metrics[strategy].append(metrics)
+                    
+                    elif strategy == "beam":
+                        results = inference.decode(
+                            nmr_tokens=nmr_tokens,
+                            ir_data=ir_data,
+                            strategy=DecodingStrategy.BEAM,
+                            max_len=config['model']['max_seq_length'],
+                            beam_width=5
+                        )
+                        metrics = evaluate_similarity(results, target_smiles, "Beam Search")
+                        all_strategy_metrics[strategy].append(metrics)
+                    
+                    elif strategy == "sampling":
+                        results = inference.decode(
+                            nmr_tokens=nmr_tokens,
+                            ir_data=ir_data,
+                            strategy=DecodingStrategy.SAMPLING,
+                            max_len=config['model']['max_seq_length'],
+                            temperature=1.0
+                        )
+                        metrics = evaluate_similarity(results, target_smiles, "Sampling")
+                        all_strategy_metrics[strategy].append(metrics)
+                    
+                    elif strategy == "nucleus":
+                        results = inference.decode(
+                            nmr_tokens=nmr_tokens,
+                            ir_data=ir_data,
+                            strategy=DecodingStrategy.NUCLEUS,
+                            max_len=config['model']['max_seq_length'],
+                            temperature=1.0,
+                            top_p=0.9
+                        )
+                        metrics = evaluate_similarity(results, target_smiles, "Nucleus Sampling")
+                        all_strategy_metrics[strategy].append(metrics)
+                    
+                    elif strategy == "entropix":
+                        results = inference.decode(
+                            nmr_tokens=nmr_tokens,
+                            ir_data=ir_data,
+                            strategy=DecodingStrategy.ENTROPIX,
+                            max_len=config['model']['max_seq_length'],
+                            top_k=5,
+                            entropy_threshold=args.entropy_threshold,
+                            varentropy_threshold=args.varentropy_threshold,
+                            max_loops=args.max_loops
+                        )
+                        metrics = evaluate_similarity(results, target_smiles, "Entropix")
+                        all_strategy_metrics[strategy].append(metrics)
+            
+            # Show progress after each batch
+            elapsed_time = time.time() - start_time
+            examples_processed = batch_end
+            examples_remaining = num_examples - batch_end
+            examples_per_second = examples_processed / elapsed_time if elapsed_time > 0 else 0
+            
+            # Estimate time remaining
+            if examples_per_second > 0:
+                time_remaining = examples_remaining / examples_per_second
+                time_remaining_str = f"{int(time_remaining // 60)}m {int(time_remaining % 60)}s"
+            else:
+                time_remaining_str = "Unknown"
+            
+            # Print progress
+            print(f"\rProcessed {examples_processed}/{num_examples} examples. "
+                  f"Speed: {examples_per_second:.2f} ex/s. Est. time remaining: {time_remaining_str}", 
+                  end="")
+        
+        # Calculate aggregate metrics for each strategy
+        aggregate_metrics = {}
+        for strategy, metrics_list in all_strategy_metrics.items():
+            aggregate_metrics[strategy] = combine_metrics(metrics_list)
+        
+        # Print aggregate metrics
+        print("\n\n===== Aggregate Metrics =====")
+        metrics_rows = []
+        for strategy, metrics in aggregate_metrics.items():
+            if metrics:
+                metrics_rows.append({
+                    'Method': strategy.capitalize(),
+                    'Valid SMILES': f"{metrics['valid_smiles']:.2%}",
+                    'Exact Match': f"{metrics['exact_match']:.2%}",
+                    'Tanimoto': f"{metrics['avg_tanimoto']:.4f}",
+                    'MCS Ratio': f"{metrics['avg_#mcs/#target']:.4f}",
+                    'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f}"
+                })
+        
+        # Convert to DataFrame for nice printing
+        metrics_df = pd.DataFrame(metrics_rows)
+        
+        # Print table
+        print(tabulate(metrics_df, headers='keys', tablefmt='psql', showindex=False))
+        
+        # Save metrics to file
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        results_file = f"inference_results_{timestamp}.csv"
+        metrics_df.to_csv(results_file, index=False)
+        print(f"\nSaved results to {results_file}")
+        
+        # Also save raw metrics (numbers only) for further analysis
+        raw_metrics = {}
+        for strategy, metrics in aggregate_metrics.items():
+            if metrics:
+                raw_metrics[strategy] = {
+                    'valid_smiles': metrics['valid_smiles'],
+                    'exact_match': metrics['exact_match'],
+                    'avg_tanimoto': metrics['avg_tanimoto'],
+                    'avg_#mcs/#target': metrics['avg_#mcs/#target'],
+                    'avg_ecfp6_iou': metrics['avg_ecfp6_iou']
+                }
+        
+        raw_file = f"inference_raw_metrics_{timestamp}.json"
+        with open(raw_file, 'w') as f:
+            json.dump(raw_metrics, f, indent=2)
+        print(f"Saved raw metrics to {raw_file}")
+        
+        # Print total time
+        total_time = time.time() - start_time
+        print(f"\nTotal time: {int(total_time // 60)} minutes {int(total_time % 60)} seconds")
+        print(f"Average time per example: {total_time / num_examples:.2f} seconds")
+        
+        # Done with full dataset test
+        return
+                
     # Load spectral data - use the same approach as search_and_infer.py
     nmr_tokens = None
     ir_data = None
+    target_smiles = None
     
     # Either use dataset or raw files
     if args.dataset_test:
@@ -486,7 +907,8 @@ def main():
             ir_data = ir_tensor.to(device)
         nmr_tokens = nmr_tokens.to(device)
         
-        print(f"Target SMILES: {dataset.targets[args.index]}")
+        target_smiles = dataset.targets[args.index]
+        print(f"Target SMILES: {target_smiles}")
         
     else:
         # Use raw spectral files
@@ -505,70 +927,149 @@ def main():
                 ir_as_prompt=ir_as_prompt,
                 ir_tokenizer=ir_tokenizer
             ).to(device)
+        
+        # Target SMILES is unknown when using raw files
+        target_smiles = None
     
     if nmr_tokens is None and ir_data is None:
         print("Warning: No input spectral data provided. Results may not be meaningful.")
     
-    # Create inference wrapper (pass ir_as_prompt to ensure consistent handling)
-    inference = ModelInference(model, tokenizer, device, ir_as_prompt=ir_as_prompt)
+    # Dictionary to store metrics for all methods
+    all_metrics = {}
     
     # Test different decoding strategies
     print("\n===== Testing Different Decoding Strategies =====")
     
-    # 1. Greedy decoding
-    print("\n1. Greedy Decoding")
-    greedy_results = inference.decode(
-        nmr_tokens=nmr_tokens,
-        ir_data=ir_data,
-        strategy=DecodingStrategy.GREEDY,
-        max_len=config['model']['max_seq_length']
-    )
-    for i, result in enumerate(greedy_results):
-        print(f"  Result {i+1}: {result}")
+    # Apply selected strategies
+    if "greedy" in strategies:
+        # 1. Greedy decoding
+        print("\n1. Greedy Decoding")
+        greedy_results = inference.decode(
+            nmr_tokens=nmr_tokens,
+            ir_data=ir_data,
+            strategy=DecodingStrategy.GREEDY,
+            max_len=config['model']['max_seq_length']
+        )
+        for i, result in enumerate(greedy_results):
+            print(f"  Result {i+1}: {result}")
+        
+        # Evaluate greedy results if we have a target
+        if target_smiles:
+            greedy_metrics = evaluate_similarity(greedy_results, target_smiles, "Greedy Decoding")
+            all_metrics["Greedy"] = greedy_metrics
     
-    # 2. Beam search
-    print("\n2. Beam Search (width=5)")
-    beam_results = inference.decode(
-        nmr_tokens=nmr_tokens,
-        ir_data=ir_data,
-        strategy=DecodingStrategy.BEAM,
-        max_len=config['model']['max_seq_length'],
-        beam_width=5
-    )
-    for i, result in enumerate(beam_results):
-        print(f"  Result {i+1}: {result}")
+    if "beam" in strategies:
+        # 2. Beam search
+        print("\n2. Beam Search (width=5)")
+        beam_results = inference.decode(
+            nmr_tokens=nmr_tokens,
+            ir_data=ir_data,
+            strategy=DecodingStrategy.BEAM,
+            max_len=config['model']['max_seq_length'],
+            beam_width=5
+        )
+        for i, result in enumerate(beam_results):
+            print(f"  Result {i+1}: {result}")
+        
+        # Evaluate beam search results if we have a target
+        if target_smiles:
+            beam_metrics = evaluate_similarity(beam_results, target_smiles, "Beam Search")
+            all_metrics["Beam"] = beam_metrics
     
-    # 3. Sampling with temperature
-    print("\n3. Sampling (temperature=1.0)")
-    sampling_results = inference.decode(
-        nmr_tokens=nmr_tokens,
-        ir_data=ir_data,
-        strategy=DecodingStrategy.SAMPLING,
-        max_len=config['model']['max_seq_length'],
-        temperature=1.0
-    )
-    for i, result in enumerate(sampling_results):
-        print(f"  Result {i+1}: {result}")
+    if "sampling" in strategies:
+        # 3. Sampling with temperature
+        print("\n3. Sampling (temperature=1.0)")
+        sampling_results = inference.decode(
+            nmr_tokens=nmr_tokens,
+            ir_data=ir_data,
+            strategy=DecodingStrategy.SAMPLING,
+            max_len=config['model']['max_seq_length'],
+            temperature=1.0
+        )
+        for i, result in enumerate(sampling_results):
+            print(f"  Result {i+1}: {result}")
+        
+        # Evaluate sampling results if we have a target
+        if target_smiles:
+            sampling_metrics = evaluate_similarity(sampling_results, target_smiles, "Sampling")
+            all_metrics["Sampling"] = sampling_metrics
     
-    # 4. Nucleus sampling (top-p)
-    print("\n4. Nucleus Sampling (top-p=0.9)")
-    nucleus_results = inference.decode(
-        nmr_tokens=nmr_tokens,
-        ir_data=ir_data,
-        strategy=DecodingStrategy.NUCLEUS,
-        max_len=config['model']['max_seq_length'],
-        temperature=1.0,
-        top_p=0.9
-    )
-    for i, result in enumerate(nucleus_results):
-        print(f"  Result {i+1}: {result}")
+    if "nucleus" in strategies:
+        # 4. Nucleus sampling (top-p)
+        print("\n4. Nucleus Sampling (top-p=0.9)")
+        nucleus_results = inference.decode(
+            nmr_tokens=nmr_tokens,
+            ir_data=ir_data,
+            strategy=DecodingStrategy.NUCLEUS,
+            max_len=config['model']['max_seq_length'],
+            temperature=1.0,
+            top_p=0.9
+        )
+        for i, result in enumerate(nucleus_results):
+            print(f"  Result {i+1}: {result}")
+        
+        # Evaluate nucleus sampling results if we have a target
+        if target_smiles:
+            nucleus_metrics = evaluate_similarity(nucleus_results, target_smiles, "Nucleus Sampling")
+            all_metrics["Nucleus"] = nucleus_metrics
+    
+    if "entropix" in strategies:
+        # 5. Entropix tree search
+        print(f"\n5. Entropix Tree Search (entropy_threshold={args.entropy_threshold}, varentropy_threshold={args.varentropy_threshold}, max_loops={args.max_loops})")
+        entropix_results = inference.decode(
+            nmr_tokens=nmr_tokens,
+            ir_data=ir_data,
+            strategy=DecodingStrategy.ENTROPIX,
+            max_len=config['model']['max_seq_length'],
+            top_k=5,
+            entropy_threshold=args.entropy_threshold,
+            varentropy_threshold=args.varentropy_threshold,
+            max_loops=args.max_loops
+        )
+        for i, result in enumerate(entropix_results):
+            print(f"  Result {i+1}: {result}")
+        
+        # Evaluate entropix results if we have a target
+        if target_smiles:
+            entropix_metrics = evaluate_similarity(entropix_results, target_smiles, "Entropix")
+            all_metrics["Entropix"] = entropix_metrics
     
     # Compare results
     print("\n===== Results Comparison =====")
-    print(f"Greedy: {greedy_results[0]}")
-    print(f"Beam search: {beam_results[0]}")
-    print(f"Sampling: {sampling_results[0]}")
-    print(f"Nucleus: {nucleus_results[0]}")
+    all_results = {}
+    if "greedy" in strategies:
+        all_results["Greedy"] = greedy_results[0]
+    if "beam" in strategies:
+        all_results["Beam"] = beam_results[0]
+    if "sampling" in strategies:
+        all_results["Sampling"] = sampling_results[0]
+    if "nucleus" in strategies:
+        all_results["Nucleus"] = nucleus_results[0]
+    if "entropix" in strategies:
+        all_results["Entropix"] = entropix_results[0]
+    
+    for method, result in all_results.items():
+        print(f"{method}: {result}")
+    
+    # Compare metrics in a table if we have a target
+    if target_smiles and all_metrics:
+        print("\n===== Metrics Comparison =====")
+        
+        # Convert metrics to DataFrame for nice printing
+        metrics_df = pd.DataFrame([
+            {
+                'Method': method,
+                'Valid SMILES': f"{metrics['valid_smiles']:.2%}",
+                'Exact Match': f"{metrics['exact_match']:.2%}",
+                'Tanimoto': f"{metrics['avg_tanimoto']:.4f}",
+                'MCS Ratio': f"{metrics['avg_#mcs/#target']:.4f}",
+                'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f}"
+            }
+            for method, metrics in all_metrics.items()
+        ])
+        
+        # Print table
+        print(tabulate(metrics_df, headers='keys', tablefmt='psql', showindex=False))
 
 
 if __name__ == '__main__':

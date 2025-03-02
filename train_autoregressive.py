@@ -40,9 +40,17 @@ from ortho_grad import OrthoGrad  # Import our new optimizer wrapper
 from models.smiles_tokenizer import SmilesTokenizer
 from models.multimodal_to_smiles import MultiModalToSMILESModel
 import subprocess
+from muon import Muon  # Import Muon optimizer from the local file
 
 # Disable RDKit logging
 RDLogger.DisableLog("rdApp.*")
+
+try:
+    import torch._dynamo
+    torch._dynamo.config.backend = "aot_eager"
+    print("[TorchDynamo] Set backend to aot_eager to avoid inductor backend issues.")
+except Exception as e:
+    print(f"[TorchDynamo] Warning: could not set backend: {e}")
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
 vocab_path = os.path.join(current_dir, 'vocab.txt')
@@ -597,7 +605,7 @@ def load_config(config_path=None):
             'log_examples': True
         },
         'optimizer': {
-            'type': 'adamw',  # Options: 'adamw', 'foreachadopt', 'ortho_adamw'
+            'type': 'adamw',  # Options: 'adamw', 'foreachadopt', 'ortho_adamw', 'foreachmuon', 'muon_mix'
             'adamw': {
                 'betas': (0.9, 0.999),
                 'eps': 1e-8,
@@ -610,6 +618,24 @@ def load_config(config_path=None):
             'ortho': {
                 'eps': 1e-30,
                 'rescale': True
+            },
+            'foreachmuon': {
+                'betas': (0.9, 0.99),
+                'eps': 1e-8,
+                'weight_decay': 0.01,
+                'warmup_steps': 0,
+                'beta2_scale': 0.8,
+                'nesterov': True,
+                'mars': False,
+                'mars_gamma': 0.0025,
+                'caution': False
+            },
+            'muon': {
+                'lr': 0.02,
+                'weight_decay': 0.01,
+                'momentum': 0.95,
+                'nesterov': True,
+                'ns_steps': 5
             }
         }
     }
@@ -659,6 +685,23 @@ def main():
     args = parse_args()
     block_ir = args.block_ir
     block_nmr = args.block_nmr
+
+    # Initialize distributed training if running with torchrun
+    rank = 0
+    world_size = 1
+    if "LOCAL_RANK" in os.environ:
+        print("[Main] Detected distributed environment (torchrun)")
+        torch.distributed.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        print(f"[Main] Process rank: {rank}, world size: {world_size}")
+    else:
+        print("[Main] Running in non-distributed mode")
+        
+    # Helper function for wandb logging that only logs on rank 0
+    def log_wandb(metrics, step=None):
+        if rank == 0 and wandb.run is not None:
+            wandb.log(metrics, step=step)
 
     print("[Main] Loading configuration...")
     config = load_config(args.config)
@@ -727,25 +770,27 @@ def main():
         f"{datetime.now().strftime('%m%d_%H%M')}"
     )
 
-    wandb.init(
-        project=config['wandb']['project'],
-        name=run_name,
-        config=config
-    )
+    # Only initialize wandb on the main process (rank 0) in distributed mode
+    if rank == 0:
+        wandb.init(
+            project=config['wandb']['project'],
+            name=run_name,
+            config=config
+        )
+        
+        print("[Main] Calculating model size...")
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        param_size_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 * 1024)
 
-    print("[Main] Calculating model size...")
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    param_size_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 * 1024)
-
-    wandb.run.summary.update({
-        "total_parameters": total_params,
-        "trainable_parameters": trainable_params,
-        "model_size_mb": param_size_mb
-    })
-    print(f"[Main] Total parameters: {total_params:,}")
-    print(f"[Main] Trainable parameters: {trainable_params:,}")
-    print(f"[Main] Model size: {param_size_mb:.2f} MB")
+        wandb.run.summary.update({
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params,
+            "model_size_mb": param_size_mb
+        })
+        print(f"[Main] Total parameters: {total_params:,}")
+        print(f"[Main] Trainable parameters: {trainable_params:,}")
+        print(f"[Main] Model size: {param_size_mb:.2f} MB")
 
     print("\n[Main] Setting up training components...")
     criterion = nn.CrossEntropyLoss(
@@ -761,6 +806,76 @@ def main():
             lr=config['training']['learning_rate'],
             caution=config['optimizer']['foreachadopt'].get('caution', True)
         )
+        optimizers = [optimizer]
+    elif optimizer_type == 'foreachmuon':
+        optimizer = heavyball.ForeachMuon(
+            model.parameters(),
+            lr=config['training']['learning_rate'],
+            betas=config['optimizer']['foreachmuon'].get('betas', (0.9, 0.99)),
+            eps=config['optimizer']['foreachmuon'].get('eps', 1e-8),
+            weight_decay=config['training']['weight_decay'],  # Use weight decay from training config
+            warmup_steps=config['optimizer']['foreachmuon'].get('warmup_steps', 0),
+            beta2_scale=config['optimizer']['foreachmuon'].get('beta2_scale', 0.8),
+            nesterov=config['optimizer']['foreachmuon'].get('nesterov', True),
+        )
+        optimizers = [optimizer]
+    elif optimizer_type == 'muon_mix':
+        # Directly use the approach from the Muon repository
+        # Filter parameters by dimensionality
+        matrix_params = [p for p in model.parameters() if p.ndim >= 2]
+        vector_params = [p for p in model.parameters() if p.ndim < 2]
+        
+        # Print parameter counts for each optimizer
+        matrix_param_count = sum(p.numel() for p in matrix_params)
+        vector_param_count = sum(p.numel() for p in vector_params)
+        total_params = matrix_param_count + vector_param_count
+        
+        print(f"[Optimizer] Parameter distribution:")
+        print(f"  - Muon (≥2D): {matrix_param_count:,} parameters ({matrix_param_count/total_params:.1%})")
+        print(f"  - AdamW (<2D): {vector_param_count:,} parameters ({vector_param_count/total_params:.1%})")
+        
+        # Get distributed training info from torch.distributed if available
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+            
+        # Create separate optimizers in a list
+        muon_opt = Muon(
+            matrix_params,
+            lr=config['optimizer'].get('muon', {}).get('lr', 0.02),
+            weight_decay=config['training']['weight_decay'],
+            momentum=config['optimizer'].get('muon', {}).get('momentum', 0.95),
+            nesterov=config['optimizer'].get('muon', {}).get('nesterov', True),
+            ns_steps=config['optimizer'].get('muon', {}).get('ns_steps', 5),
+            rank=rank,
+            world_size=world_size
+        ) if matrix_params else None
+        
+        adamw_opt = optim.AdamW(
+            vector_params,
+            lr=config['training']['learning_rate'],
+            betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
+            eps=config['optimizer']['adamw'].get('eps', 1e-8),
+            weight_decay=config['training']['weight_decay']
+        ) if vector_params else None
+        
+        # Create list of optimizers (filtering out None)
+        optimizers = [opt for opt in [muon_opt, adamw_opt] if opt is not None]
+        
+        # For scheduler compatibility, we'll use the first optimizer
+        # The learning rate scheduler will only apply to this optimizer
+        optimizer = optimizers[0] if optimizers else None
+        
+        # Debug: print learning rates for optimizers
+        if muon_opt is not None:
+            for i, group in enumerate(muon_opt.param_groups):
+                print(f"[Muon Optimizer] Group {i} lr: {group['lr']}")
+        if adamw_opt is not None:
+            for i, group in enumerate(adamw_opt.param_groups):
+                print(f"[AdamW Optimizer] Group {i} lr: {group['lr']}")
     elif optimizer_type == 'ortho_adamw':
         # Use our orthogonal gradient wrapper with AdamW
         # Separate base optimizer args from ortho args
@@ -781,6 +896,7 @@ def main():
             rescale=config['optimizer']['ortho'].get('rescale', True),
             **base_args
         )
+        optimizers = [optimizer]
     else:  # AdamW variants
         use_caution = config['optimizer']['adamw'].get('caution', False)
         if use_caution:
@@ -800,12 +916,30 @@ def main():
                 eps=config['optimizer']['adamw'].get('eps', 1e-8),
                 weight_decay=config['training']['weight_decay']  # Use weight decay from training config
             )
+        optimizers = [optimizer]
 
     print(f"[Main] Using optimizer: {optimizer_type}")
     if optimizer_type == 'ortho_adamw':
         print(f"      - Base optimizer: AdamW")
         print(f"      - Orthogonalization eps: {config['optimizer']['ortho'].get('eps', 1e-30)}")
         print(f"      - Rescale gradients: {config['optimizer']['ortho'].get('rescale', True)}")
+    elif optimizer_type == 'foreachmuon':
+        print(f"      - Betas: {config['optimizer']['foreachmuon'].get('betas', (0.9, 0.99))}")
+        print(f"      - Weight decay: {config['training']['weight_decay']}")
+        print(f"      - Beta2 scale: {config['optimizer']['foreachmuon'].get('beta2_scale', 0.8)}")
+        print(f"      - Nesterov: {config['optimizer']['foreachmuon'].get('nesterov', True)}")
+        print(f"      - MARS: {config['optimizer']['foreachmuon'].get('mars', False)}")
+    elif optimizer_type == 'muon_mix':
+        print(f"      - Muon config:")
+        print(f"        - Learning rate: {config['optimizer'].get('muon', {}).get('lr', 0.02)}")
+        print(f"        - Weight decay: {config['training']['weight_decay']}")
+        print(f"        - Momentum: {config['optimizer'].get('muon', {}).get('momentum', 0.95)}")
+        print(f"        - Nesterov: {config['optimizer'].get('muon', {}).get('nesterov', True)}")
+        print(f"        - NS steps: {config['optimizer'].get('muon', {}).get('ns_steps', 5)}")
+        print(f"      - AdamW config:")
+        print(f"        - Learning rate: {config['training']['learning_rate']}")
+        print(f"        - Betas: {config['optimizer']['adamw'].get('betas', (0.9, 0.999))}")
+        print(f"        - Weight decay: {config['training']['weight_decay']}")
 
     # Calculate total training steps (batches per epoch * num epochs)
     total_training_steps = len(train_loader) * config['training']['num_epochs']
@@ -819,7 +953,6 @@ def main():
         decay_type=config['scheduler'].get('type', 'constant'),
         min_lr=config['training'].get('min_learning_rate', 1e-6)
     )
-    
     print(f"[Main] Using {config['scheduler'].get('type', 'constant')} scheduler with:")
     print(f"      - Warmup steps: {config['scheduler']['warmup_steps']}")
     print(f"      - Total steps: {total_training_steps}")
@@ -836,16 +969,16 @@ def main():
     best_model_path = None
     latest_model_path = None
 
-    def save_checkpoint(model, optimizer, epoch, global_step, val_loss, is_best=False):
+    def save_checkpoint(model, optimizers, epoch, global_step, val_loss, is_best=False):
         """Helper function to save checkpoints and manage storage"""
         nonlocal best_model_path, latest_model_path
 
-        # Create checkpoint
+        # Create checkpoint - adapted to handle multiple optimizers
         checkpoint = {
             'epoch': epoch,
             'global_step': global_step,
             'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
+            'optimizer_state_dicts': [opt.state_dict() for opt in optimizers],
             'val_loss': val_loss,
             'timestamp': datetime.now().isoformat()
         }
@@ -865,43 +998,50 @@ def main():
             'timestamp': checkpoint['timestamp']
         }
 
-        # Log artifacts based on save_model_frequency from config
-        should_log_artifact = (global_step % config['training']['save_model_frequency'] == 0)
+        # Only log artifacts on rank 0
+        if rank == 0 and wandb.run is not None:
+            # Log artifacts based on save_model_frequency from config
+            should_log_artifact = (global_step % config['training']['save_model_frequency'] == 0)
 
-        if should_log_artifact:
-            # Create and log latest artifact
-            latest_artifact = wandb.Artifact(
-                name=f"{wandb.run.name}-latest",
-                type="model",
-                metadata=meta
-            )
-            latest_artifact.add_file(str(latest_model_path))
-            wandb.log_artifact(latest_artifact, aliases=["latest"])
+            if should_log_artifact:
+                # Create and log latest artifact
+                latest_artifact = wandb.Artifact(
+                    name=f"{wandb.run.name}-latest",
+                    type="model",
+                    metadata=meta
+                )
+                latest_artifact.add_file(str(latest_model_path))
+                wandb.log_artifact(latest_artifact, aliases=["latest"])
 
-        # If this is the best model, save it separately
-        if is_best:
-            if best_model_path and os.path.exists(best_model_path):
-                os.remove(best_model_path)  # Remove old best checkpoint
+            # If this is the best model, save it separately
+            if is_best:
+                if best_model_path and os.path.exists(best_model_path):
+                    os.remove(best_model_path)  # Remove old best checkpoint
 
-            best_model_path = save_dir / "best_model.pt"
-            torch.save(checkpoint, best_model_path, _use_new_zipfile_serialization=False)
+                best_model_path = save_dir / "best_model.pt"
+                torch.save(checkpoint, best_model_path, _use_new_zipfile_serialization=False)
 
-            # Always log best model artifact since it's important
-            best_artifact = wandb.Artifact(
-                name=f"{wandb.run.name}-best",
-                type="model",
-                metadata=meta
-            )
-            best_artifact.add_file(str(best_model_path))
-            wandb.log_artifact(best_artifact, aliases=["best"])
+                # Always log best model artifact since it's important
+                best_artifact = wandb.Artifact(
+                    name=f"{wandb.run.name}-best",
+                    type="model",
+                    metadata=meta
+                )
+                best_artifact.add_file(str(best_model_path))
+                wandb.log_artifact(best_artifact, aliases=["best"])
 
-            # Log best model metrics to wandb
-            wandb.run.summary.update({
-                "best_val_loss": val_loss,
-                "best_model_step": global_step,
-                "best_model_epoch": epoch,
-                "best_model_timestamp": checkpoint['timestamp']
-            })
+                # Log best model metrics to wandb
+                wandb.run.summary.update({
+                    "best_val_loss": val_loss,
+                    "best_model_step": global_step,
+                    "best_model_epoch": epoch,
+                    "best_model_timestamp": checkpoint['timestamp']
+                })
+        else:
+            # For non-rank-0 processes, just save the model files without wandb
+            if is_best:
+                best_model_path = save_dir / "best_model.pt"
+                torch.save(checkpoint, best_model_path, _use_new_zipfile_serialization=False)
 
     NUM_EPOCHS = config['training']['num_epochs']
     validation_frequency = config['training']['validation_frequency']
@@ -1019,9 +1159,17 @@ def main():
             )
             loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
 
-            optimizer.zero_grad()
+            # Zero gradients for all optimizers
+            for opt in optimizers:
+                opt.zero_grad()
+                
             loss.backward()
-            optimizer.step()
+            
+            # Step all optimizers
+            for opt in optimizers:
+                opt.step()
+                
+            # Only step the scheduler for the main optimizer (which is optimizers[0])
             scheduler.step()  # Note: Scheduler steps every batch, not every epoch
             
             # Clear memory after backward pass
@@ -1037,7 +1185,7 @@ def main():
 
             if global_step % logging_frequency == 0:
                 current_lr = scheduler.get_lr()[0]  # Get current learning rate
-                wandb.log({
+                log_wandb({
                     "train_loss": loss.item(),
                     "learning_rate": current_lr,
                     "epoch": epoch + 1,
@@ -1083,7 +1231,7 @@ def main():
                         )
                 
                 # Log metrics
-                wandb.log({
+                log_wandb({
                     "val_loss": val_metrics['val_loss'],
                     "val_valid_smiles": val_metrics['valid_smiles_rate'],
                     "val_exact_matches": val_metrics['exact_match_rate'],
@@ -1112,7 +1260,7 @@ def main():
                     
                     save_checkpoint(
                         model=model,
-                        optimizer=optimizer,
+                        optimizers=optimizers,  # Pass all optimizers
                         epoch=epoch,
                         global_step=global_step,
                         val_loss=current_val_loss,
@@ -1153,7 +1301,7 @@ def main():
                     )
                 
                 # Log metrics
-                wandb.log({
+                log_wandb({
                     "greedy_valid_smiles": greedy_metrics['valid_smiles'],
                     "greedy_exact_matches": greedy_metrics['exact_match'],
                     "greedy_exact_matches_all": greedy_metrics['exact_match_all'],
@@ -1174,7 +1322,7 @@ def main():
     # Final test set evaluation
     print("\n[Main] Evaluating on test set...")
     final_test_loss = validate(model, test_loader, criterion, tokenizer, device, block_ir, block_nmr)
-    wandb.log({"test_loss": final_test_loss['val_loss']}, step=global_step)
+    log_wandb({"test_loss": final_test_loss['val_loss']}, step=global_step)
     print(f"[Test] Loss: {final_test_loss['val_loss']:.4f}")
 
     # Final greedy decode evaluation
@@ -1187,7 +1335,7 @@ def main():
         block_ir=block_ir,
         block_nmr=block_nmr
     )
-    wandb.log({
+    log_wandb({
         "final_greedy_valid_smiles": final_greedy_metrics['valid_smiles'],
         "final_greedy_exact_matches": final_greedy_metrics['exact_match'],
         "final_greedy_tanimoto": final_greedy_metrics['avg_tanimoto'],
@@ -1202,7 +1350,7 @@ def main():
     if config['training'].get('save_local', False):
         save_checkpoint(
             model=model,
-            optimizer=optimizer,
+            optimizers=optimizers,  # Pass all optimizers
             epoch=NUM_EPOCHS,
             global_step=global_step,
             val_loss=final_test_loss['val_loss'],
@@ -1211,7 +1359,8 @@ def main():
         print(f"Final checkpoint saved in {save_dir}")
 
     print("[Main] Training script completed.")
-    wandb.finish()
+    if rank == 0 and wandb.run is not None:
+        wandb.finish()
 
 
 if __name__ == '__main__':

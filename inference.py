@@ -11,6 +11,7 @@ class DecodingStrategy(Enum):
     BEAM = "beam"
     SAMPLING = "sampling"
     NUCLEUS = "nucleus"
+    ENTROPIX = "entropix"
 
 
 class BeamSearchNode:
@@ -85,6 +86,68 @@ class BeamSearchNode:
         return self.eval() > other.eval()
 
 
+class EntropixNode:
+    """
+    Node in the Entropix tree search process.
+    Each node represents a partial sequence with associated log probabilities
+    and metrics for decision-making.
+    """
+    def __init__(self, hidden_state, prev_node, token_id, log_prob, length, curr_loops=1):
+        """
+        Initialize an Entropix search node.
+        
+        Args:
+            hidden_state: The hidden state (not used in current implementation)
+            prev_node: The previous node in the sequence
+            token_id: The token ID for this node
+            log_prob: The cumulative log probability of the sequence so far
+            length: The length of the sequence so far
+            curr_loops: Current number of loops used for this node
+        """
+        self.hidden_state = hidden_state
+        self.prev_node = prev_node
+        self.token_id = token_id
+        self.log_prob = log_prob
+        self.length = length
+        self.curr_loops = curr_loops  # Track how many loops were used
+    
+    def eval(self):
+        """
+        Evaluate the node's score.
+        Simple evaluation based on log probability.
+        
+        Returns:
+            The score based on log probability
+        """
+        return self.log_prob
+    
+    def __lt__(self, other):
+        """
+        Compare nodes for sorting in priority queue.
+        Lower score means lower priority in the queue.
+        
+        Args:
+            other: Another EntropixNode to compare with
+            
+        Returns:
+            True if this node has lower score than other
+        """
+        return self.eval() < other.eval()
+    
+    def __gt__(self, other):
+        """
+        Compare nodes for sorting in reverse order.
+        Higher score means higher priority in the queue.
+        
+        Args:
+            other: Another EntropixNode to compare with
+            
+        Returns:
+            True if this node has higher score than other
+        """
+        return self.eval() > other.eval()
+
+
 class ModelInference:
     """
     A wrapper class for model inference that supports different decoding strategies.
@@ -123,6 +186,9 @@ class ModelInference:
         top_p: float = 0.0,
         length_penalty: float = 1.0,
         repetition_penalty: float = 1.0,
+        entropy_threshold: float = 1.0,
+        varentropy_threshold: float = 0.5,
+        max_loops: int = 3,
         **kwargs
     ) -> List[str]:
         """
@@ -140,6 +206,9 @@ class ModelInference:
             top_p: Top-p (nucleus) sampling parameter
             length_penalty: Length penalty for beam search
             repetition_penalty: Penalty for repeating tokens
+            entropy_threshold: Threshold for entropy in Entropix decoding
+            varentropy_threshold: Threshold for variance of logprobs in Entropix decoding
+            max_loops: Maximum number of times to loop the middle layer for high entropy states
             
         Returns:
             List of decoded sequences
@@ -150,6 +219,9 @@ class ModelInference:
             return self.beam_search(nmr_tokens, ir_data, mass_data, max_len, beam_width, length_penalty)
         elif strategy in [DecodingStrategy.SAMPLING, DecodingStrategy.NUCLEUS]:
             return self.sample_decode(nmr_tokens, ir_data, mass_data, max_len, temperature, top_k, top_p)
+        elif strategy == DecodingStrategy.ENTROPIX:
+            return self.entropix_decode(nmr_tokens, ir_data, mass_data, max_len, top_k,
+                                       entropy_threshold, varentropy_threshold, max_loops)
         else:
             raise ValueError(f"Unknown decoding strategy: {strategy}")
     
@@ -498,6 +570,313 @@ class ModelInference:
                 current_token = torch.cat([current_token, next_token], dim=1)
             
             return self.postprocess_sequences(generated_sequences)
+    
+    def calculate_entropy(self, logprobs):
+        """
+        Calculate the entropy of a probability distribution from log probabilities.
+        
+        Args:
+            logprobs: Tensor of log probabilities
+            
+        Returns:
+            Entropy value as a float
+        """
+        # Convert logprobs to probabilities
+        probs = torch.exp(logprobs)
+        # Calculate entropy: -sum(p * log(p))
+        entropy = -torch.sum(probs * logprobs)
+        return entropy.item()
+    
+    def calculate_varentropy(self, logprobs):
+        """
+        Calculate the varentropy (variance of log probabilities) of a distribution.
+        
+        Args:
+            logprobs: Tensor of log probabilities
+            
+        Returns:
+            Varentropy value as a float
+        """
+        # Convert logprobs to probabilities
+        probs = torch.exp(logprobs)
+        # Calculate mean logprob weighted by probabilities
+        mean_logprob = torch.sum(probs * logprobs)
+        # Calculate variance: sum(p * (logp - mean_logp)^2)
+        varentropy = torch.sum(probs * (logprobs - mean_logprob) ** 2)
+        return varentropy.item()
+    
+    def entropix_decode(self, nmr_tokens, ir_data, mass_data=None, max_len=128, top_k=5, 
+                       entropy_threshold=1.0, varentropy_threshold=0.5, max_loops=3):
+        """
+        Entropix tree search - uses entropy and varentropy to make branching decisions.
+        
+        Args:
+            nmr_tokens: Tokenized NMR data
+            ir_data: IR spectral data
+            mass_data: Mass spectrometry data
+            max_len: Maximum sequence length
+            top_k: Number of top candidates to consider for branching
+            entropy_threshold: Threshold for entropy (low/high decision boundary)
+            varentropy_threshold: Threshold for varentropy (low/high decision boundary)
+            max_loops: Maximum number of times to loop the middle layer
+            
+        Returns:
+            List of decoded sequences
+        """
+        self.model.eval()
+        with torch.no_grad():
+            # Prepare inputs (for simplicity, only handle batch size 1)
+            (nmr_tokens, ir_data, mass_data), batch_size = self.prepare_inputs(nmr_tokens, ir_data, mass_data)
+            if batch_size != 1:
+                raise ValueError("Entropix search currently only supports batch size 1")
+            
+            # Encode spectral data
+            memory = self.encode_inputs(nmr_tokens, ir_data, mass_data)
+            
+            # Start with BOS token
+            root = EntropixNode(None, None, self.bos_token_id, 0, 0, curr_loops=1)
+            current_token = torch.tensor([[self.bos_token_id]], device=self.device)
+            
+            # Initial step - get logits for the first token
+            logits = self.model.decoder(tgt=current_token, memory=memory, nmr_tokens=nmr_tokens)
+            logits = logits[0, -1, :]  # (vocab_size)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            
+            # Calculate entropy and varentropy for the first token distribution
+            entropy = self.calculate_entropy(log_probs)
+            varentropy = self.calculate_varentropy(log_probs)
+            
+            # Track if we're in a high entropy state from the previous node
+            # This helps determine when to increase loops
+            previous_high_entropy = False
+            
+            # Determine initial action based on entropy and varentropy
+            active_nodes = []
+            
+            # Low entropy, low varentropy: branch among top-k
+            if entropy < entropy_threshold and varentropy < varentropy_threshold:
+                # Branch among top-k
+                topk_log_probs, topk_indices = log_probs.topk(top_k)
+                for i in range(top_k):
+                    token_id = topk_indices[i].item()
+                    log_prob = topk_log_probs[i].item()
+                    active_nodes.append(EntropixNode(None, root, token_id, log_prob, 1, curr_loops=1))
+                
+                previous_high_entropy = False
+            
+            # Low entropy, high varentropy: argmax (greedy)
+            elif entropy < entropy_threshold and varentropy >= varentropy_threshold:
+                # Just take the best token
+                token_id = log_probs.argmax().item()
+                log_prob = log_probs[token_id].item()
+                active_nodes.append(EntropixNode(None, root, token_id, log_prob, 1, curr_loops=1))
+                
+                previous_high_entropy = False
+            
+            # High entropy cases - implement layer looping
+            else:
+                # For high entropy, use 1 loop initially
+                current_loops = 1
+                
+                # Get logits with layer looping
+                logits = self.model.decoder(tgt=current_token, memory=memory, nmr_tokens=nmr_tokens, num_loops=current_loops)
+                logits = logits[0, -1, :]  # (vocab_size)
+                log_probs = torch.log_softmax(logits, dim=-1)
+                
+                # Just take the best token
+                token_id = log_probs.argmax().item()
+                log_prob = log_probs[token_id].item()
+                active_nodes.append(EntropixNode(None, root, token_id, log_prob, 1, curr_loops=current_loops))
+                
+                previous_high_entropy = True
+            
+            # Keep track of completed sequences
+            completed_nodes = []
+            
+            # Entropix tree search
+            for step in range(2, max_len + 1):
+                next_active_nodes = []
+                
+                # Process each active node
+                for node in active_nodes:
+                    # If this node contains EOS token, add to completed nodes
+                    if node.token_id == self.eos_token_id:
+                        completed_nodes.append(node)
+                        continue
+                    
+                    # Create sequence for this node and get next token distribution
+                    seq = []
+                    n = node
+                    while n.prev_node:
+                        seq.append(n.token_id)
+                        n = n.prev_node
+                    seq.append(self.bos_token_id)
+                    seq.reverse()
+                    
+                    # Convert to tensor and get model predictions
+                    # Use the current loops value from the node
+                    seq_tensor = torch.tensor([seq], device=self.device)
+                    
+                    # Get the next token distribution (initially without looping)
+                    logits = self.model.decoder(tgt=seq_tensor, memory=memory, nmr_tokens=nmr_tokens)
+                    logits = logits[0, -1, :]  # (vocab_size)
+                    log_probs = torch.log_softmax(logits, dim=-1)
+                    
+                    # Calculate entropy and varentropy
+                    entropy = self.calculate_entropy(log_probs)
+                    varentropy = self.calculate_varentropy(log_probs)
+                    
+                    # Determine the number of loops to use
+                    current_loops = node.curr_loops
+                    
+                    # Low entropy, low varentropy: branch among top-k
+                    if entropy < entropy_threshold and varentropy < varentropy_threshold:
+                        # Reset loops to 1 since we're in a low entropy state
+                        current_loops = 1
+                        
+                        # Branch among top-k
+                        topk_log_probs, topk_indices = log_probs.topk(top_k)
+                        for i in range(top_k):
+                            token_id = topk_indices[i].item()
+                            log_prob = topk_log_probs[i].item()
+                            next_active_nodes.append(EntropixNode(
+                                hidden_state=None,
+                                prev_node=node,
+                                token_id=token_id,
+                                log_prob=node.log_prob + log_prob,
+                                length=node.length + 1,
+                                curr_loops=current_loops
+                            ))
+                        
+                        previous_high_entropy = False
+                    
+                    # Low entropy, high varentropy: argmax (greedy)
+                    elif entropy < entropy_threshold and varentropy >= varentropy_threshold:
+                        # Reset loops to 1 since we're in a low entropy state
+                        current_loops = 1
+                        
+                        # Just take the best token
+                        token_id = log_probs.argmax().item()
+                        log_prob = log_probs[token_id].item()
+                        next_active_nodes.append(EntropixNode(
+                            hidden_state=None,
+                            prev_node=node,
+                            token_id=token_id,
+                            log_prob=node.log_prob + log_prob,
+                            length=node.length + 1,
+                            curr_loops=current_loops
+                        ))
+                        
+                        previous_high_entropy = False
+                    
+                    # High entropy cases - implement layer looping
+                    else:
+                        # If we were in a high entropy state before, increase the loops
+                        if previous_high_entropy:
+                            if node.curr_loops >= max_loops:
+                                print(f"Hit maximum loops ({max_loops}) at sequence position {node.length}")
+                            current_loops = min(node.curr_loops + 1, max_loops)
+                        else:
+                            current_loops = node.curr_loops
+                        
+                        # Apply decoder with looping
+                        if current_loops > 1:
+                            # Get logits with layer looping
+                            logits = self.model.decoder(
+                                tgt=seq_tensor, 
+                                memory=memory, 
+                                nmr_tokens=nmr_tokens, 
+                                num_loops=current_loops
+                            )
+                            logits = logits[0, -1, :]  # (vocab_size)
+                            log_probs = torch.log_softmax(logits, dim=-1)
+                            
+                            # Recalculate entropy and varentropy after looping
+                            new_entropy = self.calculate_entropy(log_probs)
+                            new_varentropy = self.calculate_varentropy(log_probs)
+                            
+                            # Re-evaluate strategy based on the new entropy/varentropy values
+                            if new_entropy < entropy_threshold and new_varentropy < varentropy_threshold:
+                                # The looping helped! Now we have low entropy, low varentropy
+                                # So we should branch among top-k
+                                topk_log_probs, topk_indices = log_probs.topk(top_k)
+                                for i in range(top_k):
+                                    token_id = topk_indices[i].item()
+                                    log_prob = topk_log_probs[i].item()
+                                    next_active_nodes.append(EntropixNode(
+                                        hidden_state=None,
+                                        prev_node=node,
+                                        token_id=token_id,
+                                        log_prob=node.log_prob + log_prob,
+                                        length=node.length + 1,
+                                        curr_loops=current_loops
+                                    ))
+                                # We're no longer in a high entropy state
+                                previous_high_entropy = False
+                                continue  # Skip to next node in loop
+                            elif new_entropy < entropy_threshold and new_varentropy >= varentropy_threshold:
+                                # The looping helped! Now we have low entropy, high varentropy
+                                # So we should take the argmax
+                                token_id = log_probs.argmax().item()
+                                log_prob = log_probs[token_id].item()
+                                next_active_nodes.append(EntropixNode(
+                                    hidden_state=None,
+                                    prev_node=node,
+                                    token_id=token_id,
+                                    log_prob=node.log_prob + log_prob,
+                                    length=node.length + 1,
+                                    curr_loops=current_loops
+                                ))
+                                # We're no longer in a high entropy state
+                                previous_high_entropy = False
+                                continue  # Skip to next node in loop
+                            # Otherwise, we're still in high entropy, so fall through to default behavior
+                        
+                        # Still high entropy (either after looping or no looping applied)
+                        # Just take the best token
+                        token_id = log_probs.argmax().item()
+                        log_prob = log_probs[token_id].item()
+                        next_active_nodes.append(EntropixNode(
+                            hidden_state=None,
+                            prev_node=node,
+                            token_id=token_id,
+                            log_prob=node.log_prob + log_prob,
+                            length=node.length + 1,
+                            curr_loops=current_loops
+                        ))
+                        
+                        previous_high_entropy = True
+                
+                # Update active nodes (keep a reasonable number of nodes)
+                active_nodes = sorted(next_active_nodes, reverse=True)[:top_k]
+                
+                # Early stopping if all branches end or reach maximum length
+                if not active_nodes:
+                    break
+            
+            # Combine completed and active nodes
+            all_nodes = completed_nodes + active_nodes
+            
+            # Sort by log probability
+            all_nodes.sort(reverse=True)
+            
+            # Take the top sequences (up to top_k)
+            top_nodes = all_nodes[:top_k]
+            
+            # Reconstruct the sequences
+            sequences = []
+            for node in top_nodes:
+                seq = []
+                n = node
+                while n.prev_node:
+                    seq.append(n.token_id)
+                    n = n.prev_node
+                seq.append(self.bos_token_id)
+                seq.reverse()
+                sequences.append(seq)
+            
+            # Post-process and decode the sequences
+            return self.postprocess_sequences(sequences)
 
 
 # Simple usage example
