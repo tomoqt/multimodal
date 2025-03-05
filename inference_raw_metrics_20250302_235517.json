@@ -1,0 +1,37 @@
+{
+  "greedy": {
+    "valid_smiles": 0.878,
+    "exact_match": 0.128,
+    "avg_tanimoto": 0.4642035444176929,
+    "avg_#mcs/#target": 0.6484724688946584,
+    "avg_ecfp6_iou": 0.4001361254294604
+  },
+  "beam": {
+    "valid_smiles": 0.838,
+    "exact_match": 0.06696666666666667,
+    "avg_tanimoto": 0.4769565636982892,
+    "avg_#mcs/#target": 0.7122458300801127,
+    "avg_ecfp6_iou": 0.40053217109146294
+  },
+  "sampling": {
+    "valid_smiles": 0.764,
+    "exact_match": 0.082,
+    "avg_tanimoto": 0.34860535998037856,
+    "avg_#mcs/#target": 0.5327614771833765,
+    "avg_ecfp6_iou": 0.29567462288306057
+  },
+  "nucleus": {
+    "valid_smiles": 0.816,
+    "exact_match": 0.106,
+    "avg_tanimoto": 0.4060091491851423,
+    "avg_#mcs/#target": 0.5971244852951467,
+    "avg_ecfp6_iou": 0.34973438726297496
+  },
+  "entropix": {
+    "valid_smiles": 0.8332,
+    "exact_match": 0.05186666666666666,
+    "avg_tanimoto": 0.44535607155188506,
+    "avg_#mcs/#target": 0.6999526955197657,
+    "avg_ecfp6_iou": 0.369814231253186
+  }
+}

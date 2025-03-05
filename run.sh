@@ -1,1 +1,1 @@
-python train_autoregressive.py --config configs/default_config.yaml
+ torchrun --nproc_per_node=1 train_autoregressive.py --config configs/test_config.yaml 

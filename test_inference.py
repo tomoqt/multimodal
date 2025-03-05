@@ -45,7 +45,7 @@ except ImportError:
                 'target': target,
                 'valid_pred': mol_pred is not None,
                 'valid_target': mol_target is not None,
-                'exact_match': pred == target,
+                'exact_match': False,  # Initialize to False, will update if valid molecules
                 'tanimoto': 0.0,
                 '#mcs/#target': 0.0,
                 'ecfp6_iou': 0.0
@@ -55,6 +55,11 @@ except ImportError:
             if not mol_pred or not mol_target:
                 results.append(result)
                 continue
+                
+            # Generate canonical SMILES for exact match comparison
+            canon_pred = Chem.MolToSmiles(mol_pred, canonical=True)
+            canon_target = Chem.MolToSmiles(mol_target, canonical=True)
+            result['exact_match'] = canon_pred == canon_target
                 
             # Calculate Tanimoto similarity with Morgan fingerprints
             fp_pred = AllChem.GetMorganFingerprintAsBitVect(mol_pred, 2)
@@ -591,6 +596,7 @@ def main():
     parser.add_argument('--entropy_threshold', type=float, default=0.6939, help='Entropy threshold for Entropix decoding')
     parser.add_argument('--varentropy_threshold', type=float, default=1.3781, help='Varentropy threshold for Entropix decoding')
     parser.add_argument('--max_loops', type=int, default=10, help='Maximum number of middle layer loops for high entropy states')
+    parser.add_argument('--output_dir', type=str, default='inference_results', help='Directory to save inference results')
     args = parser.parse_args()
 
     # Load configuration
@@ -694,6 +700,10 @@ def main():
     
     # Create inference wrapper
     inference = ModelInference(model, tokenizer, device, ir_as_prompt=ir_as_prompt)
+    
+    # Create output directory if it doesn't exist
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     # Test on full dataset
     if args.full_dataset_test:
@@ -850,7 +860,7 @@ def main():
         
         # Save metrics to file
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        results_file = f"inference_results_{timestamp}.csv"
+        results_file = output_dir / f"inference_results_{timestamp}.csv"
         metrics_df.to_csv(results_file, index=False)
         print(f"\nSaved results to {results_file}")
         
@@ -866,7 +876,7 @@ def main():
                     'avg_ecfp6_iou': metrics['avg_ecfp6_iou']
                 }
         
-        raw_file = f"inference_raw_metrics_{timestamp}.json"
+        raw_file = output_dir / f"inference_raw_metrics_{timestamp}.json"
         with open(raw_file, 'w') as f:
             json.dump(raw_metrics, f, indent=2)
         print(f"Saved raw metrics to {raw_file}")

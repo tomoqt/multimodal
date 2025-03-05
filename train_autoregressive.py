@@ -41,6 +41,7 @@ from models.smiles_tokenizer import SmilesTokenizer
 from models.multimodal_to_smiles import MultiModalToSMILESModel
 import subprocess
 from muon import Muon  # Import Muon optimizer from the local file
+import torch.nn.functional as F
 
 # Disable RDKit logging
 RDLogger.DisableLog("rdApp.*")
@@ -57,9 +58,9 @@ vocab_path = os.path.join(current_dir, 'vocab.txt')
 tokenizer = SmilesTokenizer(vocab_file=vocab_path)
 
 
-def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=None):
+def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=None, temperature=1.0, sample=False):
     """
-    Simple greedy decoding for SMILES generation.
+    Decoding for SMILES generation with optional sampling.
     Args:
         model: The MultiModalToSMILESModel instance
         nmr_tokens: NMR token tensor or None
@@ -67,6 +68,8 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
         tokenizer: SmilesTokenizer instance
         max_len: Maximum sequence length for generation
         device: torch device to use
+        temperature: Temperature for sampling (higher = more random, lower = more deterministic)
+        sample: If True, sample from the distribution; if False, use greedy decoding (argmax)
     """
     if device is None:
         device = next(model.parameters()).device
@@ -117,7 +120,16 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
                 memory=memory,
                 nmr_tokens=nmr_tokens  # NMR tokens used here
             )
-            next_token = logits[:, -1:].argmax(dim=-1)
+            
+            # Get the next token - either sample or take argmax
+            if sample and temperature > 0:
+                # Apply temperature and convert to probabilities
+                probs = F.softmax(logits[:, -1] / temperature, dim=-1)
+                # Sample from the distribution
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                # Greedy decoding (argmax)
+                next_token = logits[:, -1:].argmax(dim=-1)
             
             # Update each sequence
             for i in range(batch_size):
@@ -150,6 +162,22 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
         return decoded_sequences
 
 
+# Updated helper function for canonicalizing SMILES using RDKit: remove spaces before canonicalization
+
+def canonicalize_smiles(smiles):
+    """Convert a SMILES string to its canonical form using RDKit. Removes extra spaces before conversion. Returns the canonical SMILES if possible, otherwise returns the cleaned string."""
+    # Remove spaces and strip leading/trailing whitespace
+    cleaned = smiles.replace(' ', '').strip()
+    from rdkit import Chem
+    try:
+        mol = Chem.MolFromSmiles(cleaned)
+        if mol is None:
+            return cleaned
+        return Chem.MolToSmiles(mol, canonical=True)
+    except Exception:
+        return cleaned
+
+
 def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examples=None, block_ir=False, block_nmr=False):
     """Evaluate model using greedy decoding with optional IR/NMR blocking"""
     model.eval()
@@ -175,7 +203,8 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
                 nmr_tokens=nmr_tokens,
                 ir_data=ir_data,
                 tokenizer=tokenizer,
-                device=device
+                device=device,
+                sample=False  # Ensure we're using greedy decoding (not sampling) for evaluation
             )
 
             targets = []
@@ -185,7 +214,7 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
                     tgt = tgt[:eos_idx]
                 except ValueError:
                     pass
-                decoded = tokenizer.decode(tgt[1:])
+                decoded = tokenizer.decode(tgt[1:]).strip()
                 targets.append(decoded)
 
             all_predictions.extend(predictions)
@@ -193,6 +222,10 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
 
             if num_examples and len(all_predictions) >= num_examples:
                 break
+
+    # Canonicalize predictions and targets before evaluation
+    all_predictions = [canonicalize_smiles(pred) for pred in all_predictions]
+    all_targets = [canonicalize_smiles(tgt) for tgt in all_targets]
 
     detailed_results = evaluate_predictions(all_predictions, all_targets)
     metrics = aggregate_metrics(detailed_results)
@@ -928,7 +961,6 @@ def main():
         print(f"      - Weight decay: {config['training']['weight_decay']}")
         print(f"      - Beta2 scale: {config['optimizer']['foreachmuon'].get('beta2_scale', 0.8)}")
         print(f"      - Nesterov: {config['optimizer']['foreachmuon'].get('nesterov', True)}")
-        print(f"      - MARS: {config['optimizer']['foreachmuon'].get('mars', False)}")
     elif optimizer_type == 'muon_mix':
         print(f"      - Muon config:")
         print(f"        - Learning rate: {config['optimizer'].get('muon', {}).get('lr', 0.02)}")
