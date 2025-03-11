@@ -58,7 +58,7 @@ vocab_path = os.path.join(current_dir, 'vocab.txt')
 tokenizer = SmilesTokenizer(vocab_file=vocab_path)
 
 
-def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=None, temperature=1.0, sample=False):
+def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=None, temperature=1.0, sample=False, precision='fp32'):
     """
     Decoding for SMILES generation with optional sampling.
     Args:
@@ -70,6 +70,7 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
         device: torch device to use
         temperature: Temperature for sampling (higher = more random, lower = more deterministic)
         sample: If True, sample from the distribution; if False, use greedy decoding (argmax)
+        precision: Precision type ('fp32', 'fp16', 'bf16')
     """
     if device is None:
         device = next(model.parameters()).device
@@ -91,8 +92,15 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
         # Start tokens for each sequence in the batch
         current_token = torch.tensor([[BOS_TOKEN_ID]] * batch_size, device=device)
         
-        # Encode spectral data - pass as positional args
-        memory = model.encoder(None, ir_data, None)  # NMR tokens not needed here
+        # Encode spectral data with appropriate precision
+        use_amp = (precision in ['fp16', 'bf16']) and torch.cuda.is_available()
+        
+        if use_amp:
+            amp_dtype = torch.bfloat16 if precision == 'bf16' else torch.float16
+            with torch.cuda.amp.autocast(dtype=amp_dtype):
+                memory = model.encoder(None, ir_data, None)  # NMR tokens not needed here
+        else:
+            memory = model.encoder(None, ir_data, None)  # NMR tokens not needed here
         
         if memory is None:
             if nmr_tokens is not None:
@@ -114,12 +122,20 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
         finished_sequences = [False] * batch_size
         
         for _ in range(max_len):
-            # Get next token predictions - pass nmr_tokens through
-            logits = model.decoder(
-                tgt=current_token,
-                memory=memory,
-                nmr_tokens=nmr_tokens  # NMR tokens used here
-            )
+            # Get next token predictions with appropriate precision
+            if use_amp:
+                with torch.cuda.amp.autocast(dtype=amp_dtype):
+                    logits = model.decoder(
+                        tgt=current_token,
+                        memory=memory,
+                        nmr_tokens=nmr_tokens  # NMR tokens used here
+                    )
+            else:
+                logits = model.decoder(
+                    tgt=current_token,
+                    memory=memory,
+                    nmr_tokens=nmr_tokens  # NMR tokens used here
+                )
             
             # Get the next token - either sample or take argmax
             if sample and temperature > 0:
@@ -183,6 +199,14 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
     model.eval()
     all_predictions = []
     all_targets = []
+    
+    # Get current precision setting from config if it exists
+    precision = 'fp32'  # Default
+    try:
+        # Access the global config if available
+        precision = config['training'].get('precision', 'fp32')
+    except (NameError, KeyError):
+        pass
 
     with torch.no_grad():
         for target_tokens, ir_data, nmr_tokens, _ in tqdm(test_loader, desc="Greedy decoding"):
@@ -204,7 +228,8 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
                 ir_data=ir_data,
                 tokenizer=tokenizer,
                 device=device,
-                sample=False  # Ensure we're using greedy decoding (not sampling) for evaluation
+                sample=False,  # Ensure we're using greedy decoding (not sampling) for evaluation
+                precision=precision  # Pass precision setting
             )
 
             targets = []
@@ -785,7 +810,27 @@ def main():
         ir_as_prompt=config['data'].get('ir_as_prompt', False),
         ir_vocab_size=ir_vocab_size,
         max_loops=max(config['model'].get('max_loops', 1), max(config['model'].get('loop_range', [0, 1])))
-    ).to(device)
+    )
+    
+    # Set precision for training based on configuration
+    precision = config['training'].get('precision', 'fp32')
+    print(f"[Main] Using {precision} precision for training")
+    
+    if precision == 'fp16' and torch.cuda.is_available():
+        print("[Main] Enabling automatic mixed precision (AMP) for FP16 training")
+        # Do NOT convert model to half precision - this causes issues with GradScaler
+        # The autocast context manager will handle precision conversion during forward pass
+    elif precision == 'bf16' and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        print("[Main] Enabling bfloat16 precision for training")
+        # For bf16, we can use either approach. We'll use autocast for consistency.
+    else:
+        # Default to fp32
+        if precision != 'fp32':
+            print(f"[Main] Warning: Requested precision {precision} not supported. Using fp32 instead.")
+        print("[Main] Using default full (FP32) precision")
+    
+    # Move model to device (always in default precision)
+    model = model.to(device)
 
     print("\n[Main] Creating data loaders...")
     train_loader, val_loader, test_loader = create_data_loaders(
@@ -1081,9 +1126,22 @@ def main():
     NUM_EPOCHS = config['training']['num_epochs']
     validation_frequency = config['training']['validation_frequency']
     logging_frequency = config['training']['logging_frequency']
-    greedy_decode_frequency = config['training'].get('greedy_decode_frequency', 1000)
+    save_frequency = config['training']['save_frequency']
+    greedy_decode_frequency = config['training']['greedy_decode_frequency']
+    
+    # Initialize gradient scaler for mixed precision training
+    scaler = None
+    precision = config['training'].get('precision', 'fp32')
+    use_amp = (precision in ['fp16', 'bf16']) and torch.cuda.is_available()
+    
+    # Only FP16 needs gradient scaling (BF16 has same dynamic range as FP32)
+    if precision == 'fp16' and torch.cuda.is_available():
+        scaler = torch.cuda.amp.GradScaler()
+        print("[Main] Initialized GradScaler for FP16 mixed precision training")
+    
     global_step = 0
-
+    start_time = time.time()
+    
     # Helper for validation
     def validate(model, loader, criterion, tokenizer, device, block_ir=False, block_nmr=False):
         model.eval()
@@ -1108,21 +1166,36 @@ def main():
                 T = target_tokens.size(1)
                 mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=target_tokens.device), 1)
                 
-                # Uniformly sample the number of loops for training if loop_range is set
+                # Uniformly sample the number of loops for validation if loop_range is set
                 loop_range = config['model'].get('loop_range', None)
                 num_loops = None
                 if loop_range and model.training:
                     min_loops, max_loops = loop_range
                     num_loops = torch.randint(min_loops, max_loops + 1, (1,)).item()
                 
-                logits = model(
-                    nmr_tokens=nmr_tokens,
-                    ir_data=ir_data,
-                    target_seq=target_tokens[:, :-1],
-                    target_mask=mask[:-1, :-1],
-                    num_loops=num_loops
-                )
-                loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
+                # Use mixed precision for validation too if enabled
+                precision = config['training'].get('precision', 'fp32')
+                use_amp = (precision in ['fp16', 'bf16']) and torch.cuda.is_available()
+                if use_amp:
+                    amp_dtype = torch.bfloat16 if precision == 'bf16' else torch.float16
+                    with torch.cuda.amp.autocast(dtype=amp_dtype):
+                        logits = model(
+                            nmr_tokens=nmr_tokens,
+                            ir_data=ir_data,
+                            target_seq=target_tokens[:, :-1],
+                            target_mask=mask[:-1, :-1],
+                            num_loops=num_loops
+                        )
+                        loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
+                else:
+                    logits = model(
+                        nmr_tokens=nmr_tokens,
+                        ir_data=ir_data,
+                        target_seq=target_tokens[:, :-1],
+                        target_mask=mask[:-1, :-1],
+                        num_loops=num_loops
+                    )
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
                 pred_tokens = logits.argmax(dim=-1).cpu().tolist()
                 tgt_tokens = target_tokens[:, 1:].cpu().tolist()
@@ -1170,11 +1243,12 @@ def main():
     # Initialize wandb table outside the validation loop
     columns = ["step", "prediction", "target", "exact_match", "tanimoto", "mcs_ratio", "ecfp6_iou"]
     examples_table = wandb.Table(columns=columns)
-
+    
     # -------------------------------------------------------------------------
     # Training Loop
     # -------------------------------------------------------------------------
     print("\n[Main] Starting training loop...")
+    
     for epoch in range(NUM_EPOCHS):
         print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
         model.train()
@@ -1201,27 +1275,60 @@ def main():
                 min_loops, max_loops = loop_range
                 num_loops = torch.randint(min_loops, max_loops + 1, (1,)).item()
             
-            logits = model(
-                nmr_tokens=nmr_tokens,
-                ir_data=ir_data,
-                target_seq=target_tokens[:, :-1],
-                target_mask=mask[:-1, :-1],
-                num_loops=num_loops
-            )
-            loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
-
             # Zero gradients for all optimizers
             for opt in optimizers:
                 opt.zero_grad()
-                
-            loss.backward()
             
-            # Step all optimizers
-            for opt in optimizers:
-                opt.step()
+            # Forward and backward pass with automatic mixed precision for fp16/bf16
+            if use_amp:
+                amp_dtype = torch.bfloat16 if precision == 'bf16' else torch.float16
+                with torch.cuda.amp.autocast(dtype=amp_dtype):
+                    logits = model(
+                        nmr_tokens=nmr_tokens,
+                        ir_data=ir_data,
+                        target_seq=target_tokens[:, :-1],
+                        target_mask=mask[:-1, :-1],
+                        num_loops=num_loops
+                    )
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
-            # Only step the scheduler for the main optimizer (which is optimizers[0])
-            scheduler.step()  # Note: Scheduler steps every batch, not every epoch
+                # For FP16, we need to use the scaler for numerical stability
+                if scaler is not None:
+                    # Scale loss and do backward pass
+                    scaler.scale(loss).backward()
+                    
+                    # Step optimizers with scaler
+                    for opt in optimizers:
+                        scaler.step(opt)
+                    
+                    # Update scaler
+                    scaler.update()
+                else:
+                    # For BF16, we don't need scaling since it has the same dynamic range as FP32
+                    loss.backward()
+                    
+                    # Step all optimizers
+                    for opt in optimizers:
+                        opt.step()
+            else:
+                # Regular forward and backward pass for fp32
+                logits = model(
+                    nmr_tokens=nmr_tokens,
+                    ir_data=ir_data,
+                    target_seq=target_tokens[:, :-1],
+                    target_mask=mask[:-1, :-1],
+                    num_loops=num_loops
+                )
+                loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
+                
+                loss.backward()
+                
+                # Step all optimizers
+                for opt in optimizers:
+                    opt.step()
+            
+            # Step the scheduler regardless of precision mode
+            scheduler.step()
             
             # Clear memory after backward pass
             del logits, mask
