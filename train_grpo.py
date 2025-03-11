@@ -22,7 +22,7 @@ from collections import defaultdict
 from pathlib import Path
 from copy import deepcopy
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, rdFMCS
 
 # Import from the base training script
 from train_autoregressive import (
@@ -63,8 +63,15 @@ class GRPO:
         epsilon=0.1,
         use_exact_match_reward=True,
         use_tanimoto_reward=False,
-        temperature=0.8,
-        device=None
+        use_ecfp6_reward=False,
+        use_valid_smiles_reward=False,
+        use_mcs_ratio_reward=False,
+        temperature=1,
+        device=None,
+        use_kl=True,
+        optimizer_type='adamw',
+        log_frequency=1,
+        validation_frequency=10
     ):
         self.device = device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -82,19 +89,55 @@ class GRPO:
         self.dtype = dtype if dtype is not None else (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
         self.beta = beta
         self.epsilon = epsilon
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        self.log_frequency = log_frequency
+        
+        self.use_kl = use_kl
+        
+        # Initialize optimizer based on optimizer_type parameter
+        if optimizer_type.lower() == 'adamw':
+            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        elif optimizer_type.lower() == 'muon_mix':
+            # Separate parameters: matrix_params for 2D or higher, vector_params for others
+            matrix_params = [p for p in self.model.parameters() if p.ndim >= 2]
+            vector_params = [p for p in self.model.parameters() if p.ndim < 2]
+            
+            from muon import Muon
+            muon_opt = Muon(matrix_params, lr=lr, weight_decay=weight_decay, momentum=0.95, nesterov=True, ns_steps=5) if matrix_params else None
+            adamw_opt = torch.optim.AdamW(vector_params, lr=lr, weight_decay=weight_decay) if vector_params else None
+            
+            # Define a simple composite optimizer to update both optimizers
+            class CompositeOptimizer:
+                def __init__(self, optimizers):
+                    # Filter out any None optimizers
+                    self.optimizers = [opt for opt in optimizers if opt is not None]
+                def step(self):
+                    for opt in self.optimizers:
+                        opt.step()
+                def zero_grad(self):
+                    for opt in self.optimizers:
+                        opt.zero_grad()
+            
+            self.optimizer = CompositeOptimizer([muon_opt, adamw_opt])
+        else:
+            raise ValueError(f"Unknown optimizer_type: {optimizer_type}")
         
         # Active reward configuration
         self.use_exact_match_reward = use_exact_match_reward
         self.use_tanimoto_reward = use_tanimoto_reward
+        self.use_ecfp6_reward = use_ecfp6_reward
+        self.use_valid_smiles_reward = use_valid_smiles_reward
+        self.use_mcs_ratio_reward = use_mcs_ratio_reward
         
         # Ensure at least one reward is active
-        assert self.use_exact_match_reward or self.use_tanimoto_reward, "At least one reward function must be enabled"
+        assert self.use_exact_match_reward or self.use_tanimoto_reward or self.use_ecfp6_reward or self.use_valid_smiles_reward or self.use_mcs_ratio_reward, "At least one reward function must be enabled"
         
         # Print reward configuration
         print(f"[GRPO] 🎯 Active rewards:")
         print(f"  - Exact match reward: {'✓' if self.use_exact_match_reward else '✗'}")
         print(f"  - Tanimoto reward: {'✓' if self.use_tanimoto_reward else '✗'}")
+        print(f"  - ECFP6 reward: {'✓' if self.use_ecfp6_reward else '✗'}")
+        print(f"  - Valid SMILES reward: {'✓' if self.use_valid_smiles_reward else '✗'}")
+        print(f"  - MCS Ratio reward: {'✓' if self.use_mcs_ratio_reward else '✗'}")
 
         # For the MultiModal model, we're not using LoRA adapters
         self.using_lora = False
@@ -111,24 +154,32 @@ class GRPO:
         if self.ref_model is not None:
             self.ref_model.to(self.device)
         
+        # Watch model with wandb to track gradients and parameters
+        if self.log_wandb and wandb.run is not None:
+            wandb.watch(
+                self.model,
+                log="gradients",  # Track gradients
+                log_freq=self.log_frequency * 10,  # Log less frequently than metrics to avoid overhead
+                log_graph=True  # Log model graph
+            )
+        
         # Print some info about models
         print(f"[GRPO] Model device: {next(self.model.parameters()).device}")
         print(f"[GRPO] Model training: {self.model.training}")
         
         # Set up validation steps
-        self.validation_frequency = 10
+        self.validation_frequency = validation_frequency
 
-    def get_per_token_logps(self, model, target_seq, nmr_tokens, ir_data, target_mask=None) -> Tensor:
+    def get_per_token_logps(self, model, target_seq, nmr_tokens, ir_data) -> Tensor:
         """
         Compute log probabilities for each token in the target sequence.
         Adapted to work with MultiModalToSMILESModel.
         """
-        # Get logits from the model
+        # Get logits from the model; rely on the decoder to handle attention mask automatically
         logits = model(
             nmr_tokens=nmr_tokens,
             ir_data=ir_data,
-            target_seq=target_seq[:, :-1],
-            target_mask=target_mask
+            target_seq=target_seq[:, :-1]
         )
         
         # Get the target tokens (shifted right)
@@ -146,31 +197,23 @@ class GRPO:
         """
         Compute the GRPO loss.
         """
-        # Create causal mask for target sequence
-        T = target_seq.size(1)
-        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=target_seq.device), 1)
-        target_mask = mask  # Use full mask instead of mask[:-1, :-1]
-        
-        # Get log probabilities from current policy
+        # Get log probabilities from current policy (decoder will handle attention mask internally)
         policy_log_probs = self.get_per_token_logps(
             self.model,
             target_seq=target_seq,
             nmr_tokens=nmr_tokens,
-            ir_data=ir_data,
-            target_mask=target_mask
+            ir_data=ir_data
         )
         
-        # Get log probabilities from reference policy
+        # Get log probabilities from reference policy (using decoder's internal mask)
         if self.ref_model is not None:
             ref_policy_log_probs = self.get_per_token_logps(
                 self.ref_model,
                 target_seq=target_seq,
                 nmr_tokens=nmr_tokens,
-                ir_data=ir_data,
-                target_mask=target_mask
+                ir_data=ir_data
             )
         else:
-            # If no ref model, use old policy log probs as reference
             ref_policy_log_probs = old_policy_log_probs
 
         # Ensure reward is properly shaped for broadcasting
@@ -207,8 +250,9 @@ class GRPO:
             
         kld = (kld * loss_mask).sum(dim=-1) / (loss_mask.sum(dim=-1) + 1e-6)
         
-        # Add KL penalty
-        loss += kld * self.beta
+        # Optionally add KL divergence penalty if use_kl is True
+        if self.use_kl:
+            loss += kld * self.beta
         
         # Log KL divergence
         if self.log_wandb:
@@ -372,6 +416,8 @@ class GRPO:
         valid_count = 0
         invalid_count = 0
         total_tanimoto = 0.0
+        total_ecfp6 = 0.0
+        total_mcs_ratio = 0.0
         
         # Match generated SMILES with their targets based on group position
         for i, generated in enumerate(generated_smiles):
@@ -396,25 +442,50 @@ class GRPO:
                 reward += tanimoto_score
                 total_tanimoto += tanimoto_score
             
-            # Check validity
+            # Apply ECFP6 reward if enabled
+            ecfp6_score = 0.0
+            if self.use_ecfp6_reward:
+                ecfp6_score = ecfp6_reward(target, generated)
+                reward += ecfp6_score
+                total_ecfp6 += ecfp6_score
+            
+            # Apply MCS ratio reward if enabled
+            mcs_ratio_score = 0.0
+            if self.use_mcs_ratio_reward:
+                mcs_ratio_score = mcs_ratio_reward(target, generated)
+                reward += mcs_ratio_score
+                total_mcs_ratio += mcs_ratio_score
+            
+            # Check validity and apply valid SMILES reward if enabled
             mol = None
+            valid_smiles_score = 0.0
             try:
                 mol = Chem.MolFromSmiles(generated)
                 if mol is not None:
                     valid_count += 1
+                    valid_smiles_score = 1.0
                 else:
                     invalid_count += 1
             except Exception:
                 invalid_count += 1
             
+            if self.use_valid_smiles_reward:
+                reward += valid_smiles_score
+            
             rewards.append(reward)
             
-            # Log rewards for tracking (only for a subset to avoid excessive logging)
-            if self.log_wandb and i < 16:  # Log for the first 16 samples
+            # Log rewards for tracking (log for all samples, not just a subset)
+            if self.log_wandb:
                 if self.use_exact_match_reward:
                     self.metrics["exact_match_rewards"].append(exact_match_score)
                 if self.use_tanimoto_reward:
                     self.metrics["tanimoto_rewards"].append(tanimoto_score)
+                if self.use_ecfp6_reward:
+                    self.metrics["ecfp6_rewards"].append(ecfp6_score)
+                if self.use_valid_smiles_reward:
+                    self.metrics["valid_smiles_rewards"].append(valid_smiles_score)
+                if self.use_mcs_ratio_reward:
+                    self.metrics["mcs_ratio_rewards"].append(mcs_ratio_score)
                 
                 if mol is not None:
                     self.metrics["valid_molecule"].append(1.0)
@@ -426,6 +497,8 @@ class GRPO:
         valid_pct = valid_count / total * 100
         exact_pct = exact_matches / total * 100
         avg_tanimoto = total_tanimoto / total if self.use_tanimoto_reward else 0.0
+        avg_ecfp6 = total_ecfp6 / total if self.use_ecfp6_reward else 0.0
+        avg_mcs_ratio = total_mcs_ratio / total if self.use_mcs_ratio_reward else 0.0
         
         print(f"[GRPO] 📊 Reward stats:")
         print(f"  - Valid SMILES: {valid_count}/{total} ({valid_pct:.2f}%)")
@@ -433,6 +506,10 @@ class GRPO:
             print(f"  - Exact matches: {exact_matches}/{total} ({exact_pct:.2f}%)")
         if self.use_tanimoto_reward:
             print(f"  - Avg Tanimoto similarity: {avg_tanimoto:.4f}")
+        if self.use_ecfp6_reward:
+            print(f"  - Avg ECFP6 IoU: {avg_ecfp6:.4f}")
+        if self.use_mcs_ratio_reward:
+            print(f"  - Avg MCS ratio: {avg_mcs_ratio:.4f}")
         
         print(f"[DEBUG] Exact match rate: {exact_matches}/{total} = {exact_matches/total:.4f}")
         
@@ -447,6 +524,10 @@ class GRPO:
             self.metrics["valid_smiles_rate"].append(valid_pct / 100.0)
             if self.use_tanimoto_reward:
                 self.metrics["avg_tanimoto"].append(avg_tanimoto)
+            if self.use_ecfp6_reward:
+                self.metrics["avg_ecfp6"].append(avg_ecfp6)
+            if self.use_mcs_ratio_reward:
+                self.metrics["avg_mcs_ratio"].append(avg_mcs_ratio)
         
         return rewards.tolist()
 
@@ -454,16 +535,25 @@ class GRPO:
         """Log metrics to wandb"""
         if self.log_wandb:
             metrics = {}
-            # Prepare metrics to log
+            # Prepare metrics to log - use ALL collected metrics instead of just the last batch
             for k, v in self.metrics.items():
                 if v:  # If not empty
-                    metrics[f"train/{k}"] = np.mean(v[-self.batch_size:]) if len(v) >= self.batch_size else np.mean(v)
+                    metrics[f"train/{k}"] = np.mean(v)
             
             # Add current step
             metrics["step"] = step
             
+            # Count how many samples were used for these metrics
+            metrics["train/samples_in_metrics"] = sum(len(v) for v in self.metrics.values()) / max(1, len(self.metrics))
+            
             # Log to wandb
             wandb.log(metrics)
+            
+            # Print metrics summary
+            print(f"[GRPO] 📊 Logging metrics for {int(metrics['train/samples_in_metrics'])} samples:")
+            for k, v in metrics.items():
+                if k != "step" and k != "train/samples_in_metrics":
+                    print(f"  - {k}: {v:.4f}")
             
             # Clear metrics
             for k in self.metrics:
@@ -474,6 +564,9 @@ class GRPO:
         Train the model with GRPO.
         """
         print(f"\n[GRPO] 🚀 Starting training for {num_iterations} iterations")
+        print(f"[GRPO] 📊 Logging metrics every {self.log_frequency} iterations")
+        print(f"[GRPO] 🔍 Running validation every {self.validation_frequency} iterations")
+        
         start_time = time.perf_counter()
         
         for iteration in range(num_iterations):
@@ -497,21 +590,15 @@ class GRPO:
                 print(f"[GRPO] ⚠️ Skipping update - rewards have no variance")
                 continue
 
-            # Create causal mask for target sequence
-            print(f"[GRPO] 🎭 Creating attention mask and computing old policy log probabilities...")
+            # Get log probabilities from current policy (decoder will handle attention mask internally)
+            print(f"[GRPO] 🎭 Computing old policy log probabilities...")
             logprob_start = time.perf_counter()
-            T = target_tokens.size(1)
-            mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=target_tokens.device), 1)
-            target_mask = mask
-            
-            # Get log probabilities from the current policy (for old policy)
             with torch.no_grad():
                 old_policy_log_probs = self.get_per_token_logps(
                     self.model,
                     target_seq=generated_tokens,
                     nmr_tokens=nmr_tokens,
-                    ir_data=ir_data,
-                    target_mask=target_mask
+                    ir_data=ir_data
                 )
             logprob_time = time.perf_counter() - logprob_start
             print(f"[GRPO] ⌛ Log probabilities computed in {logprob_time:.2f}s")
@@ -616,16 +703,15 @@ class GRPO:
                     # Log group loss
                     if self.log_wandb:
                         self.metrics["policy_loss"].append(group_loss)
-            
-            # Update parameters
-            print(f"[GRPO] 📈 Updating model parameters...")
-            update_param_start = time.perf_counter()
-            # Add gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            update_param_time = time.perf_counter() - update_param_start
-            print(f"[GRPO] ⏱️ Parameter update completed in {update_param_time:.2f}s")
+                    
+                    # Update model parameters after each group (like in original implementation)
+                    # Add gradient clipping for stability
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    
+                    if group_idx % max(1, batch_size // 5) == 0:  # Print progress every ~20% of groups
+                        print(f"[GRPO] 🔄 Updated model after group {group_idx+1}/{batch_size}")
             
             # Calculate average loss
             avg_loss = total_loss / max(1, group_count)
@@ -634,14 +720,14 @@ class GRPO:
             print(f"[GRPO] ⏱️ Total update time: {update_time:.2f}s")
             
             # Log metrics
-            if self.log_wandb:
+            if self.log_wandb and (iteration + 1) % self.log_frequency == 0:
                 self.log_metrics(iteration)
                 
             # Run validation periodically
             if self.val_loader is not None and (iteration + 1) % self.validation_frequency == 0:
                 print(f"\n[GRPO] 🔍 Running validation at iteration {iteration + 1}")
                 metrics = self.validate()
-                
+            
             # Calculate total iteration time
             iter_time = time.perf_counter() - iter_start
             print(f"[GRPO] ⏱️ Iteration {iteration+1} completed in {iter_time:.2f}s")
@@ -659,73 +745,85 @@ class GRPO:
         val_start = time.perf_counter()
         self.model.eval()
         
+        # Define minimum number of samples to validate
+        min_samples = 50
+        
         with torch.no_grad():
-            # Sample a few validation examples for greedy decoding
-            print(f"[GRPO] 📂 Loading validation batch...")
+            print(f"[GRPO] 📂 Loading validation data...")
             batch_start = time.perf_counter()
-            val_batch = next(iter(self.val_loader))
-            target_tokens, ir_data, nmr_tokens, _ = val_batch
             
-            batch_size = target_tokens.size(0)
-            print(f"[GRPO] 📊 Validation batch size: {batch_size}, Target seq length: {target_tokens.size(1)}")
+            # Initialize lists to collect data across batches
+            all_targets = []
+            all_predictions = []
+            all_detailed_results = []
             
-            # Move to device
-            print(f"[GRPO] 🔄 Moving validation data to device: {self.device}")
-            target_tokens = target_tokens.to(self.device)
-            if ir_data is not None:
-                ir_data = ir_data.to(self.device)
-            if nmr_tokens is not None:
-                nmr_tokens = nmr_tokens.to(self.device)
+            # Create iterator for val_loader
+            val_iter = iter(self.val_loader)
+            samples_processed = 0
+            
+            # Process batches until we reach min_samples
+            while samples_processed < min_samples:
+                try:
+                    val_batch = next(val_iter)
+                except StopIteration:
+                    # If we've gone through the whole dataset, restart the iterator
+                    val_iter = iter(self.val_loader)
+                    val_batch = next(val_iter)
+                
+                target_tokens, ir_data, nmr_tokens, _ = val_batch
+                
+                batch_size = target_tokens.size(0)
+                samples_processed += batch_size
+                print(f"[GRPO] 📊 Processing validation batch: {batch_size} samples (Total: {samples_processed})")
+                
+                # Move to device
+                target_tokens = target_tokens.to(self.device)
+                if ir_data is not None:
+                    ir_data = ir_data.to(self.device)
+                if nmr_tokens is not None:
+                    nmr_tokens = nmr_tokens.to(self.device)
+                
+                # Generate with greedy decoding
+                predictions = greedy_decode(
+                    model=self.model,
+                    nmr_tokens=nmr_tokens,
+                    ir_data=ir_data,
+                    tokenizer=self.tokenizer,
+                    device=self.device,
+                    temperature=0.0,
+                    sample=False  # Use greedy decoding (not sampling) for evaluation
+                )
+                
+                # Get targets
+                targets = []
+                for tgt in target_tokens:
+                    try:
+                        eos_idx = tgt.tolist().index(self.tokenizer.sep_token_id)
+                        tgt = tgt[:eos_idx]
+                    except ValueError:
+                        pass
+                    decoded = self.tokenizer.decode(tgt[1:])
+                    targets.append(decoded)
+                
+                # Evaluate this batch of predictions
+                batch_results = evaluate_predictions(predictions, targets)
+                
+                # Collect results
+                all_targets.extend(targets)
+                all_predictions.extend(predictions)
+                all_detailed_results.extend(batch_results)
             
             batch_time = time.perf_counter() - batch_start
-            print(f"[GRPO] ⏱️ Validation batch prepared in {batch_time:.2f}s")
+            print(f"[GRPO] ⏱️ Processed {samples_processed} validation samples in {batch_time:.2f}s")
             
-            # Generate with greedy decoding
-            print(f"[GRPO] 🧪 Starting validation SMILES generation with greedy decoding...")
-            gen_start = time.perf_counter()
-            predictions = greedy_decode(
-                model=self.model,
-                nmr_tokens=nmr_tokens,
-                ir_data=ir_data,
-                tokenizer=self.tokenizer,
-                device=self.device,
-                temperature=1.0,
-                sample=False  # Use greedy decoding (not sampling) for validation
-            )
-            gen_time = time.perf_counter() - gen_start
-            avg_gen_time = gen_time / batch_size if batch_size > 0 else 0
-            print(f"[GRPO] ⏱️ Validation generation completed in {gen_time:.2f}s ({avg_gen_time:.4f}s per sample)")
-            
-            # Get targets
-            print(f"[GRPO] 🎯 Processing targets for comparison...")
-            targets_start = time.perf_counter()
-            targets = []
-            for tgt in target_tokens:
-                try:
-                    eos_idx = tgt.tolist().index(self.tokenizer.sep_token_id)
-                    tgt = tgt[:eos_idx]
-                except ValueError:
-                    pass
-                decoded = self.tokenizer.decode(tgt[1:])
-                targets.append(decoded)
-            targets_time = time.perf_counter() - targets_start
-            print(f"[GRPO] ⏱️ Targets processed in {targets_time:.2f}s")
-            
-            # Evaluate predictions
-            print(f"[GRPO] 📊 Evaluating predictions...")
-            eval_start = time.perf_counter()
-            detailed_results = evaluate_predictions(predictions, targets)
-            eval_time = time.perf_counter() - eval_start
-            print(f"[GRPO] ⏱️ Evaluation completed in {eval_time:.2f}s")
-            
-            # Calculate metrics
-            print(f"[GRPO] 📈 Calculating metrics...")
+            # Calculate metrics across all processed samples
+            print(f"[GRPO] 📈 Calculating metrics for {len(all_detailed_results)} samples...")
             metrics_start = time.perf_counter()
             metrics = {
-                "exact_match": np.mean([r["exact_match"] for r in detailed_results]),
-                "valid_smiles": np.mean([r["valid"] for r in detailed_results]),
-                "tanimoto": np.mean([r["tanimoto"] for r in detailed_results]),
-                "ecfp6_iou": np.mean([r["ecfp6_iou"] for r in detailed_results])
+                "exact_match": np.mean([r["exact_match"] for r in all_detailed_results]),
+                "valid_smiles": np.mean([r["valid"] for r in all_detailed_results]),
+                "tanimoto": np.mean([r["tanimoto"] for r in all_detailed_results]),
+                "ecfp6_iou": np.mean([r["ecfp6_iou"] for r in all_detailed_results])
             }
             
             if self.log_wandb:
@@ -740,18 +838,18 @@ class GRPO:
             
             # Print some examples
             print("\n[GRPO] 📝 Examples:")
-            for i in range(min(3, len(predictions))):
-                print(f"  Target:     {targets[i]}")
-                print(f"  Prediction: {predictions[i]}")
-                print(f"  Match:      {'✓' if detailed_results[i]['exact_match'] else '✗'}")
-                print(f"  Similarity: {detailed_results[i]['tanimoto']:.4f}")
+            for i in range(min(3, len(all_predictions))):
+                print(f"  Target:     {all_targets[i]}")
+                print(f"  Prediction: {all_predictions[i]}")
+                print(f"  Match:      {'✓' if all_detailed_results[i]['exact_match'] else '✗'}")
+                print(f"  Similarity: {all_detailed_results[i]['tanimoto']:.4f}")
                 print()
         
         # Set back to train mode
         self.model.train()
         
         total_val_time = time.perf_counter() - val_start
-        print(f"[GRPO] ✅ Validation completed in {total_val_time:.2f}s")
+        print(f"[GRPO] ✅ Validation completed in {total_val_time:.2f}s (processed {len(all_detailed_results)} samples)")
         
         return metrics
 
@@ -824,6 +922,86 @@ def tanimoto_reward(target, generated):
     except:
         return 0.0
 
+def ecfp6_reward(target, generated):
+    """Reward based on ECFP6 (Morgan radius 3) IoU similarity between molecules"""
+    try:
+        # Remove spaces and strip both target and generated SMILES
+        target_clean = target.replace(' ', '').strip()
+        generated_clean = generated.replace(' ', '').strip()
+        
+        # Convert SMILES to molecules
+        mol1 = Chem.MolFromSmiles(target_clean)
+        mol2 = Chem.MolFromSmiles(generated_clean)
+        
+        # If either molecule is invalid, return 0
+        if mol1 is None or mol2 is None:
+            return 0.0
+        
+        # Generate ECFP6 fingerprints (Morgan radius 3)
+        fp1 = AllChem.GetMorganFingerprintAsBitVect(mol1, 3, nBits=2048)
+        fp2 = AllChem.GetMorganFingerprintAsBitVect(mol2, 3, nBits=2048)
+        
+        # Convert to numpy arrays
+        fp1_array = np.array(fp1)
+        fp2_array = np.array(fp2)
+        
+        # Calculate Intersection over Union
+        intersection = np.sum(fp1_array & fp2_array)
+        union = np.sum(fp1_array | fp2_array)
+        
+        # Avoid division by zero
+        if union == 0:
+            return 0.0
+            
+        iou = intersection / union
+        return float(iou)
+    except:
+        return 0.0
+
+def valid_smiles_reward(target, generated):
+    """Reward based on whether the generated SMILES is valid"""
+    try:
+        # Remove spaces and strip the generated SMILES
+        generated_clean = generated.replace(' ', '').strip()
+        
+        # Convert SMILES to molecule
+        mol = Chem.MolFromSmiles(generated_clean)
+        
+        # Return 1 if valid, 0 if invalid
+        return 1.0 if mol is not None else 0.0
+    except:
+        return 0.0
+
+def mcs_ratio_reward(target, generated):
+    """Reward based on Maximum Common Substructure (MCS) ratio"""
+    try:
+        # Remove spaces and strip both target and generated SMILES
+        target_clean = target.replace(' ', '').strip()
+        generated_clean = generated.replace(' ', '').strip()
+        
+        # Convert SMILES to molecules
+        mol1 = Chem.MolFromSmiles(target_clean)
+        mol2 = Chem.MolFromSmiles(generated_clean)
+        
+        # If either molecule is invalid, return 0
+        if mol1 is None or mol2 is None:
+            return 0.0
+        
+        # Find MCS with timeout to prevent hanging on complex structures
+        mcs = rdFMCS.FindMCS([mol1, mol2], timeout=1)
+        
+        # If MCS is empty, return 0
+        if mcs.numAtoms == 0:
+            return 0.0
+        
+        # Return ratio of MCS atoms to target molecule atoms
+        target_atoms = mol1.GetNumAtoms()
+        mcs_ratio = mcs.numAtoms / target_atoms if target_atoms > 0 else 0.0
+        
+        return float(mcs_ratio)
+    except:
+        return 0.0
+
 def load_pretrained_model(checkpoint_path, config, device):
     """Load a pretrained model from a checkpoint"""
     print(f"Loading pretrained model from {checkpoint_path}")
@@ -871,12 +1049,12 @@ def main():
     parser.add_argument('--config', type=str, help='Path to config file')
     parser.add_argument('--checkpoint', type=str, help='Path to pretrained model checkpoint')
     parser.add_argument('--iterations', type=int, default=1000, help='Number of training iterations')
-    parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling (higher = more random)')
+    parser.add_argument('--temperature', type=float, default=1, help='Temperature for sampling (higher = more random)')
     parser.add_argument('--group-size', type=int, default=None, help='Group size for GRPO')
     parser.add_argument('--micro-group-size', type=int, default=None, help='Micro-batch size within each group')
     parser.add_argument('--batch-size', type=int, default=None, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-6, help='Learning rate')
-    parser.add_argument('--epsilon', type=float, default=0.2, help='GRPO epsilon for clipping')
+    parser.add_argument('--epsilon', type=float, default=1, help='GRPO epsilon for clipping')
     parser.add_argument('--beta', type=float, default=0.01, help='KL penalty coefficient')
     parser.add_argument('--wandb', action='store_true', help='Log to wandb')
     parser.add_argument('--block-ir', action='store_true', help='Block IR signals in the model inputs')
@@ -885,6 +1063,14 @@ def main():
     parser.add_argument('--no-exact-match-reward', dest='exact_match', action='store_false', help='Disable exact match reward')
     parser.add_argument('--tanimoto-reward', dest='tanimoto', action='store_true', default=False, help='Use Tanimoto similarity reward')
     parser.add_argument('--no-tanimoto-reward', dest='tanimoto', action='store_false', help='Disable Tanimoto similarity reward')
+    parser.add_argument('--ecfp6-reward', dest='ecfp6', action='store_true', default=False, help='Use ECFP6 IoU reward')
+    parser.add_argument('--no-ecfp6-reward', dest='ecfp6', action='store_false', help='Disable ECFP6 IoU reward')
+    parser.add_argument('--valid-smiles-reward', dest='valid_smiles', action='store_true', default=False, help='Use valid SMILES reward')
+    parser.add_argument('--no-valid-smiles-reward', dest='valid_smiles', action='store_false', help='Disable valid SMILES reward')
+    parser.add_argument('--mcs-ratio-reward', dest='mcs_ratio', action='store_true', default=False, help='Use MCS ratio reward')
+    parser.add_argument('--no-mcs-ratio-reward', dest='mcs_ratio', action='store_false', help='Disable MCS ratio reward')
+    parser.add_argument('--log-frequency', type=int, default=5, help='Number of iterations between metric logging (default: 5)')
+    parser.add_argument('--validation-frequency', type=int, default=10, help='Number of iterations between validations (default: 10)')
     args = parser.parse_args()
 
     # Load configuration
@@ -930,7 +1116,10 @@ def main():
             'beta': args.beta,
             'log_wandb': args.wandb,
             'use_exact_match_reward': args.exact_match,
-            'use_tanimoto_reward': args.tanimoto
+            'use_tanimoto_reward': args.tanimoto,
+            'use_ecfp6_reward': args.ecfp6,
+            'use_valid_smiles_reward': args.valid_smiles,
+            'use_mcs_ratio_reward': args.mcs_ratio
         }
     }
 
@@ -1016,10 +1205,13 @@ def main():
     print(f"\n====== REWARD CONFIGURATION ======")
     print(f"- Exact match reward: {'ENABLED' if args.exact_match else 'DISABLED'}")
     print(f"- Tanimoto reward: {'ENABLED' if args.tanimoto else 'DISABLED'}")
+    print(f"- ECFP6 reward: {'ENABLED' if args.ecfp6 else 'DISABLED'}")
+    print(f"- Valid SMILES reward: {'ENABLED' if args.valid_smiles else 'DISABLED'}")
+    print(f"- MCS Ratio reward: {'ENABLED' if args.mcs_ratio else 'DISABLED'}")
     print(f"==================================\n")
     
     # Ensure at least one reward is active
-    if not (args.exact_match or args.tanimoto):
+    if not (args.exact_match or args.tanimoto or args.ecfp6 or args.valid_smiles or args.mcs_ratio):
         print("ERROR: At least one reward function must be enabled!")
         return
 
@@ -1042,18 +1234,24 @@ def main():
         tokenizer=tokenizer,
         group_size=grpo_group_size,
         micro_group_size=grpo_micro_group_size,
-        batch_size=grpo_batch_size,  # Use the batch size from the RL config
+        batch_size=grpo_batch_size,
         max_iterations=args.iterations,
         train_loader=train_loader,
         val_loader=val_loader,
         use_exact_match_reward=args.exact_match,
         use_tanimoto_reward=args.tanimoto,
+        use_ecfp6_reward=args.ecfp6,
+        use_valid_smiles_reward=args.valid_smiles,
+        use_mcs_ratio_reward=args.mcs_ratio,
         log_wandb=args.wandb,
         lr=args.lr,
         beta=args.beta,
         epsilon=args.epsilon,
         temperature=args.temperature,
-        device=device
+        device=device,
+        use_kl=True,
+        log_frequency=args.log_frequency,
+        validation_frequency=args.validation_frequency
     )
     
     # Run training

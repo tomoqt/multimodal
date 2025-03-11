@@ -608,7 +608,9 @@ def load_config(config_path=None):
             'resample_size': 1000,
             'use_concat': True,
             'use_stablemax': False,
-            'ir_encoder_type': 'regular'
+            'ir_encoder_type': 'regular',
+            'max_loops': 1,
+            'loop_range': [0, 5]  # Range for uniform sampling of loop count during training
         },
         'training': {
             'batch_size': 32,
@@ -781,7 +783,8 @@ def main():
         use_stablemax=config['model'].get('use_stablemax', False),
         ir_encoder_type=config['model'].get('ir_encoder_type', 'regular'),
         ir_as_prompt=config['data'].get('ir_as_prompt', False),
-        ir_vocab_size=ir_vocab_size
+        ir_vocab_size=ir_vocab_size,
+        max_loops=max(config['model'].get('max_loops', 1), max(config['model'].get('loop_range', [0, 1])))
     ).to(device)
 
     print("\n[Main] Creating data loaders...")
@@ -1105,11 +1108,19 @@ def main():
                 T = target_tokens.size(1)
                 mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=target_tokens.device), 1)
                 
+                # Uniformly sample the number of loops for training if loop_range is set
+                loop_range = config['model'].get('loop_range', None)
+                num_loops = None
+                if loop_range and model.training:
+                    min_loops, max_loops = loop_range
+                    num_loops = torch.randint(min_loops, max_loops + 1, (1,)).item()
+                
                 logits = model(
                     nmr_tokens=nmr_tokens,
                     ir_data=ir_data,
                     target_seq=target_tokens[:, :-1],
-                    target_mask=mask[:-1, :-1]
+                    target_mask=mask[:-1, :-1],
+                    num_loops=num_loops
                 )
                 loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
@@ -1183,11 +1194,19 @@ def main():
             T = target_tokens.size(1)
             mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=target_tokens.device), 1)
             
+            # Uniformly sample the number of loops for training if loop_range is set
+            loop_range = config['model'].get('loop_range', None)
+            num_loops = None
+            if loop_range and model.training:
+                min_loops, max_loops = loop_range
+                num_loops = torch.randint(min_loops, max_loops + 1, (1,)).item()
+            
             logits = model(
                 nmr_tokens=nmr_tokens,
                 ir_data=ir_data,
                 target_seq=target_tokens[:, :-1],
-                target_mask=mask[:-1, :-1]
+                target_mask=mask[:-1, :-1],
+                num_loops=num_loops
             )
             loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
 
