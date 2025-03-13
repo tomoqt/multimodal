@@ -932,7 +932,10 @@ def main():
             nesterov=config['optimizer'].get('muon', {}).get('nesterov', True),
             ns_steps=config['optimizer'].get('muon', {}).get('ns_steps', 5),
             rank=rank,
-            world_size=world_size
+            world_size=world_size,
+            orthogonalize=config['optimizer']['muon'].get('orthogonalize', False),
+            ortho_eps=config['optimizer']['muon'].get('ortho_eps', 1e-30),
+            ortho_rescale=config['optimizer']['muon'].get('ortho_rescale', True)
         ) if matrix_params else None
         
         adamw_opt = optim.AdamW(

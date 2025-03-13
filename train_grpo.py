@@ -1048,92 +1048,80 @@ def main():
     parser = argparse.ArgumentParser(description='Post-train SMILES generation model with GRPO RL')
     parser.add_argument('--config', type=str, help='Path to config file')
     parser.add_argument('--checkpoint', type=str, help='Path to pretrained model checkpoint')
-    parser.add_argument('--iterations', type=int, default=1000, help='Number of training iterations')
-    parser.add_argument('--temperature', type=float, default=1, help='Temperature for sampling (higher = more random)')
+    parser.add_argument('--iterations', type=int, default=None, help='Number of training iterations')
+    parser.add_argument('--temperature', type=float, default=None, help='Temperature for sampling (higher = more random)')
     parser.add_argument('--group-size', type=int, default=None, help='Group size for GRPO')
     parser.add_argument('--micro-group-size', type=int, default=None, help='Micro-batch size within each group')
     parser.add_argument('--batch-size', type=int, default=None, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-6, help='Learning rate')
-    parser.add_argument('--epsilon', type=float, default=1, help='GRPO epsilon for clipping')
-    parser.add_argument('--beta', type=float, default=0.01, help='KL penalty coefficient')
-    parser.add_argument('--wandb', action='store_true', help='Log to wandb')
-    parser.add_argument('--block-ir', action='store_true', help='Block IR signals in the model inputs')
-    parser.add_argument('--block-nmr', action='store_true', help='Block NMR signals in the model inputs')
-    parser.add_argument('--exact-match-reward', dest='exact_match', action='store_true', default=True, help='Use exact match reward')
-    parser.add_argument('--no-exact-match-reward', dest='exact_match', action='store_false', help='Disable exact match reward')
-    parser.add_argument('--tanimoto-reward', dest='tanimoto', action='store_true', default=False, help='Use Tanimoto similarity reward')
-    parser.add_argument('--no-tanimoto-reward', dest='tanimoto', action='store_false', help='Disable Tanimoto similarity reward')
-    parser.add_argument('--ecfp6-reward', dest='ecfp6', action='store_true', default=False, help='Use ECFP6 IoU reward')
-    parser.add_argument('--no-ecfp6-reward', dest='ecfp6', action='store_false', help='Disable ECFP6 IoU reward')
-    parser.add_argument('--valid-smiles-reward', dest='valid_smiles', action='store_true', default=False, help='Use valid SMILES reward')
-    parser.add_argument('--no-valid-smiles-reward', dest='valid_smiles', action='store_false', help='Disable valid SMILES reward')
-    parser.add_argument('--mcs-ratio-reward', dest='mcs_ratio', action='store_true', default=False, help='Use MCS ratio reward')
-    parser.add_argument('--no-mcs-ratio-reward', dest='mcs_ratio', action='store_false', help='Disable MCS ratio reward')
-    parser.add_argument('--log-frequency', type=int, default=5, help='Number of iterations between metric logging (default: 5)')
-    parser.add_argument('--validation-frequency', type=int, default=10, help='Number of iterations between validations (default: 10)')
+    parser.add_argument('--lr', type=float, default=None, help='Learning rate for GRPO')
+    parser.add_argument('--epsilon', type=float, default=None, help='GRPO epsilon for clipping')
+    parser.add_argument('--beta', type=float, default=None, help='KL penalty coefficient')
+    parser.add_argument('--wandb', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Log to wandb (true/false)')
+    parser.add_argument('--block-ir', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Block IR signals in the model inputs (true/false)')
+    parser.add_argument('--block-nmr', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Block NMR signals in the model inputs (true/false)')
+    parser.add_argument('--exact-match-reward', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Use exact match reward (true/false)')
+    parser.add_argument('--tanimoto-reward', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Use Tanimoto similarity reward (true/false)')
+    parser.add_argument('--ecfp6-reward', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Use ECFP6 IoU reward (true/false)')
+    parser.add_argument('--valid-smiles-reward', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Use valid SMILES reward (true/false)')
+    parser.add_argument('--mcs-ratio-reward', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Use MCS ratio reward (true/false)')
+    parser.add_argument('--log-frequency', type=int, default=None, help='Number of iterations between metric logging')
+    parser.add_argument('--validation-frequency', type=int, default=None, help='Number of iterations between validations')
+
     args = parser.parse_args()
 
-    # Load configuration
+    # Load configuration and ensure necessary sections exist
     config = load_config(args.config)
+    config.setdefault('rl', {}).setdefault('grpo', {})
+    config.setdefault('data', {})
+    config.setdefault('training', {})
 
-    # Override config values with command-line arguments if provided
+    # Override config with CLI args if provided, otherwise use config defaults or hard-coded defaults
+    config['rl']['grpo']['max_iterations'] = (args.iterations if args.iterations is not None 
+                                                else config['rl']['grpo'].get('max_iterations', 1000))
+    config['rl']['grpo']['temperature'] = (args.temperature if args.temperature is not None 
+                                           else config['rl']['grpo'].get('temperature', 1))
+    config['rl']['grpo']['group_size'] = (args.group_size if args.group_size is not None 
+                                          else config['rl']['grpo'].get('group_size', 8))
+    config['rl']['grpo']['micro_group_size'] = (args.micro_group_size if args.micro_group_size is not None 
+                                                else config['rl']['grpo'].get('micro_group_size', 1))
     if args.batch_size is not None:
-        # Set batch size in both data and training sections
-        # In your config.yaml, batch_size is actually in training.batch_size
-        if 'data' not in config:
-            config['data'] = {}
-        if 'training' not in config:
-            config['training'] = {}
-        
-        # Override the batch size in BOTH locations
-        print(f"\n[CONFIG] Overriding batch size with command-line argument: {args.batch_size}")
         config['data']['batch_size'] = args.batch_size
-        config['training']['batch_size'] = args.batch_size  # This is likely the one that matters!
-        
-        print(f"[CONFIG] Updated batch size in training config: {config['training']['batch_size']}")
-    
-    if args.group_size is not None:
-        # Override the GRPO group size in the RL config
-        # Ensure the nested structure exists
-        if 'rl' not in config or 'grpo' not in config['rl']:
-            config.setdefault('rl', {}).setdefault('grpo', {})
-        config['rl']['grpo']['group_size'] = args.group_size
-    
-    if args.micro_group_size is not None:
-        if 'rl' not in config or 'grpo' not in config['rl']:
-            config.setdefault('rl', {}).setdefault('grpo', {})
-        config['rl']['grpo']['micro_group_size'] = args.micro_group_size
+        config['training']['batch_size'] = args.batch_size
+        config['rl']['grpo']['batch_size'] = args.batch_size
+    else:
+        batch_size_for_loader = config['training'].get('batch_size', 32)
+        config['data']['batch_size'] = batch_size_for_loader
+        config['training']['batch_size'] = batch_size_for_loader
+        config['rl']['grpo']['batch_size'] = config['rl']['grpo'].get('batch_size', 1)
 
-    # Update rl configuration with command-line args, using config value if argument is None
-    rl_config = {
-        'grpo': {
-            'group_size': config['rl']['grpo'].get('group_size', 8),
-            'micro_group_size': config['rl']['grpo'].get('micro_group_size', 1),
-            'batch_size': config['data'].get('batch_size', 1),
-            'iterations': args.iterations,
-            'learning_rate': args.lr,
-            'epsilon': args.epsilon,
-            'beta': args.beta,
-            'log_wandb': args.wandb,
-            'use_exact_match_reward': args.exact_match,
-            'use_tanimoto_reward': args.tanimoto,
-            'use_ecfp6_reward': args.ecfp6,
-            'use_valid_smiles_reward': args.valid_smiles,
-            'use_mcs_ratio_reward': args.mcs_ratio
-        }
-    }
+    config['rl']['grpo']['learning_rate'] = (args.lr if args.lr is not None 
+                                             else config['rl']['grpo'].get('learning_rate', 1e-6))
+    config['rl']['grpo']['epsilon'] = (args.epsilon if args.epsilon is not None 
+                                       else config['rl']['grpo'].get('epsilon', 1))
+    config['rl']['grpo']['beta'] = (args.beta if args.beta is not None 
+                                    else config['rl']['grpo'].get('beta', 0.01))
 
-    # Merge configs
-    def update_dict(d, u):
-        for k, v in u.items():
-            if isinstance(v, dict):
-                d[k] = update_dict(d.get(k, {}), v)
-            else:
-                d[k] = v
-        return d
+    config['rl']['grpo']['log_wandb'] = (args.wandb if args.wandb is not None 
+                                         else config['rl']['grpo'].get('log_wandb', False))
+    config['rl']['grpo']['exact_match_reward'] = (args.exact_match_reward if args.exact_match_reward is not None 
+                                                  else config['rl']['grpo'].get('exact_match_reward', True))
+    config['rl']['grpo']['tanimoto_reward'] = (args.tanimoto_reward if args.tanimoto_reward is not None 
+                                               else config['rl']['grpo'].get('tanimoto_reward', True))
+    config['rl']['grpo']['ecfp6_reward'] = (args.ecfp6_reward if args.ecfp6_reward is not None 
+                                            else config['rl']['grpo'].get('ecfp6_reward', True))
+    config['rl']['grpo']['valid_smiles_reward'] = (args.valid_smiles_reward if args.valid_smiles_reward is not None 
+                                                    else config['rl']['grpo'].get('valid_smiles_reward', True))
+    config['rl']['grpo']['mcs_ratio_reward'] = (args.mcs_ratio_reward if args.mcs_ratio_reward is not None 
+                                                 else config['rl']['grpo'].get('mcs_ratio_reward', True))
 
-    update_dict(config, {'rl': rl_config})
-    
+    log_frequency = (args.log_frequency if args.log_frequency is not None 
+                     else config['training'].get('logging_frequency', 10))
+    validation_frequency = (args.validation_frequency if args.validation_frequency is not None 
+                            else config['training'].get('validation_frequency', 10))
+
+    block_ir = args.block_ir if args.block_ir is not None else False
+    block_nmr = args.block_nmr if args.block_nmr is not None else False
+
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -1193,7 +1181,7 @@ def main():
     )
     
     # Initialize wandb if needed
-    if args.wandb:
+    if config['rl']['grpo']['log_wandb']:
         run_name = f"grpo_rl_{datetime.datetime.now().strftime('%m%d_%H%M')}"
         wandb.init(
             project=config['wandb']['project'],
@@ -1203,15 +1191,19 @@ def main():
     
     # Print chosen reward configuration
     print(f"\n====== REWARD CONFIGURATION ======")
-    print(f"- Exact match reward: {'ENABLED' if args.exact_match else 'DISABLED'}")
-    print(f"- Tanimoto reward: {'ENABLED' if args.tanimoto else 'DISABLED'}")
-    print(f"- ECFP6 reward: {'ENABLED' if args.ecfp6 else 'DISABLED'}")
-    print(f"- Valid SMILES reward: {'ENABLED' if args.valid_smiles else 'DISABLED'}")
-    print(f"- MCS Ratio reward: {'ENABLED' if args.mcs_ratio else 'DISABLED'}")
+    print(f"- Exact match reward: {'ENABLED' if config['rl']['grpo']['exact_match_reward'] else 'DISABLED'}")
+    print(f"- Tanimoto reward: {'ENABLED' if config['rl']['grpo']['tanimoto_reward'] else 'DISABLED'}")
+    print(f"- ECFP6 reward: {'ENABLED' if config['rl']['grpo']['ecfp6_reward'] else 'DISABLED'}")
+    print(f"- Valid SMILES reward: {'ENABLED' if config['rl']['grpo']['valid_smiles_reward'] else 'DISABLED'}")
+    print(f"- MCS Ratio reward: {'ENABLED' if config['rl']['grpo']['mcs_ratio_reward'] else 'DISABLED'}")
     print(f"==================================\n")
     
     # Ensure at least one reward is active
-    if not (args.exact_match or args.tanimoto or args.ecfp6 or args.valid_smiles or args.mcs_ratio):
+    if not (config['rl']['grpo']['exact_match_reward'] or 
+            config['rl']['grpo']['tanimoto_reward'] or 
+            config['rl']['grpo']['ecfp6_reward'] or 
+            config['rl']['grpo']['valid_smiles_reward'] or 
+            config['rl']['grpo']['mcs_ratio_reward']):
         print("ERROR: At least one reward function must be enabled!")
         return
 
@@ -1235,27 +1227,27 @@ def main():
         group_size=grpo_group_size,
         micro_group_size=grpo_micro_group_size,
         batch_size=grpo_batch_size,
-        max_iterations=args.iterations,
+        max_iterations=config['rl']['grpo']['max_iterations'],
         train_loader=train_loader,
         val_loader=val_loader,
-        use_exact_match_reward=args.exact_match,
-        use_tanimoto_reward=args.tanimoto,
-        use_ecfp6_reward=args.ecfp6,
-        use_valid_smiles_reward=args.valid_smiles,
-        use_mcs_ratio_reward=args.mcs_ratio,
-        log_wandb=args.wandb,
-        lr=args.lr,
-        beta=args.beta,
-        epsilon=args.epsilon,
-        temperature=args.temperature,
+        use_exact_match_reward=config['rl']['grpo']['exact_match_reward'],
+        use_tanimoto_reward=config['rl']['grpo']['tanimoto_reward'],
+        use_ecfp6_reward=config['rl']['grpo']['ecfp6_reward'],
+        use_valid_smiles_reward=config['rl']['grpo']['valid_smiles_reward'],
+        use_mcs_ratio_reward=config['rl']['grpo']['mcs_ratio_reward'],
+        log_wandb=config['rl']['grpo']['log_wandb'],
+        lr=config['rl']['grpo']['learning_rate'],
+        beta=config['rl']['grpo']['beta'],
+        epsilon=config['rl']['grpo']['epsilon'],
+        temperature=config['rl']['grpo']['temperature'],
         device=device,
         use_kl=True,
-        log_frequency=args.log_frequency,
-        validation_frequency=args.validation_frequency
+        log_frequency=log_frequency,
+        validation_frequency=validation_frequency
     )
     
     # Run training
-    grpo.train(num_iterations=args.iterations)
+    grpo.train(num_iterations=config['rl']['grpo']['max_iterations'])
     
     # Save the fine-tuned model
     output_dir = Path('checkpoints_rl')
@@ -1282,9 +1274,9 @@ def main():
             target_tokens, ir_data, nmr_tokens, _ = batch
             
             # Apply blocking if requested
-            if args.block_ir:
+            if block_ir:
                 ir_data = None
-            if args.block_nmr:
+            if block_nmr:
                 nmr_tokens = None
                 
             # Move to device
@@ -1326,7 +1318,7 @@ def main():
     print(f"Final test accuracy: {accuracy:.4f} ({correct}/{total})")
     
     # Log final metrics
-    if args.wandb:
+    if config['rl']['grpo']['log_wandb']:
         wandb.log(test_metrics)
         wandb.finish()
 

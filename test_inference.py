@@ -590,7 +590,7 @@ def main():
     parser.add_argument('--index', type=int, default=0, help='Index in dataset to test (only if --dataset_test)')
     parser.add_argument('--batch_size', type=int, default=1, help='Number of examples to process in parallel (only with --full_dataset_test)')
     parser.add_argument('--max_examples', type=int, default=None, help='Maximum number of test examples to process (only with --full_dataset_test)')
-    parser.add_argument('--strategies', type=str, default='all', help='Comma-separated list of decoding strategies to test (greedy,beam,sampling,nucleus,entropix)')
+    parser.add_argument('--strategies', type=str, default='all', help='Comma-separated list of decoding strategies to test (greedy,beam,sampling,nucleus,entropix,greedy_loop)')
     parser.add_argument('--ir_as_prompt', action='store_true', help='Use IR as prompt tokens')
     parser.add_argument('--no_ir_as_prompt', action='store_true', help='Do not use IR as prompt tokens')
     parser.add_argument('--entropy_threshold', type=float, default=0.6939, help='Entropy threshold for Entropix decoding')
@@ -688,10 +688,10 @@ def main():
     
     # Determine which strategies to use based on args.strategies
     if args.strategies.lower() == 'all':
-        strategies = ["greedy", "beam", "sampling", "nucleus", "entropix"]
+        strategies = ["greedy", "beam", "sampling", "nucleus", "entropix", "greedy_loop"]
     else:
         strategies = [s.strip().lower() for s in args.strategies.split(',')]
-        valid_strategies = ["greedy", "beam", "sampling", "nucleus", "entropix"]
+        valid_strategies = ["greedy", "beam", "sampling", "nucleus", "entropix", "greedy_loop"]
         for s in strategies:
             if s not in valid_strategies:
                 raise ValueError(f"Invalid strategy '{s}'. Valid options are: {', '.join(valid_strategies)}")
@@ -1044,6 +1044,29 @@ def main():
             entropix_metrics = evaluate_similarity(entropix_results, target_smiles, "Entropix")
             all_metrics["Entropix"] = entropix_metrics
     
+    if "greedy_loop" in strategies:
+        print("\nX. Greedy Loop Decoding with Varying Layer Loop Counts")
+        greedy_loop_results = []  # Initialize list to store loop results
+        # Test with different numbers of loops
+        for loop_count in range(args.max_loops):
+            results = inference.decode(
+                nmr_tokens=nmr_tokens,
+                ir_data=ir_data,
+                strategy=DecodingStrategy.GREEDY_LOOP,
+                max_len=config['model']['max_seq_length'],
+                num_loops=loop_count
+            )
+            greedy_loop_results.append(results)  # Store results from current loop count
+            print(f"\nResults for Greedy Loop Decoding with num_loops = {loop_count}:")
+            for i, result in enumerate(results):
+                print(f"  Result {i+1}: {result}")
+            if target_smiles:
+                metrics = evaluate_similarity(results, target_smiles, f"Greedy Loop (num_loops={loop_count})")
+                all_metrics[f"GreedyLoop_{loop_count}"] = metrics
+        selected_greedy_loop_results = greedy_loop_results[-1]  # Use last iteration result for comparison
+        if target_smiles:
+            all_metrics["GreedyLoop"] = all_metrics[f"GreedyLoop_{args.max_loops - 1}"]
+
     # Compare results
     print("\n===== Results Comparison =====")
     all_results = {}
@@ -1057,6 +1080,8 @@ def main():
         all_results["Nucleus"] = nucleus_results[0]
     if "entropix" in strategies:
         all_results["Entropix"] = entropix_results[0]
+    if "greedy_loop" in strategies:
+        all_results["GreedyLoop"] = selected_greedy_loop_results
     
     for method, result in all_results.items():
         print(f"{method}: {result}")

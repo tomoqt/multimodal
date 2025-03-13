@@ -8,6 +8,7 @@ import heapq
 class DecodingStrategy(Enum):
     """Enum for different decoding strategies."""
     GREEDY = "greedy"
+    GREEDY_LOOP = "greedy_loop"
     BEAM = "beam"
     SAMPLING = "sampling"
     NUCLEUS = "nucleus"
@@ -215,6 +216,8 @@ class ModelInference:
         """
         if strategy == DecodingStrategy.GREEDY:
             return self.greedy_decode(nmr_tokens, ir_data, mass_data, max_len)
+        elif strategy == DecodingStrategy.GREEDY_LOOP:
+            return self.greedy_decode_with_loops(nmr_tokens, ir_data, mass_data, max_len, num_loops=kwargs.get("num_loops", 1))
         elif strategy == DecodingStrategy.BEAM:
             return self.beam_search(nmr_tokens, ir_data, mass_data, max_len, beam_width, length_penalty)
         elif strategy in [DecodingStrategy.SAMPLING, DecodingStrategy.NUCLEUS]:
@@ -877,6 +880,38 @@ class ModelInference:
             
             # Post-process and decode the sequences
             return self.postprocess_sequences(sequences)
+    
+    def greedy_decode_with_loops(self, nmr_tokens, ir_data, mass_data=None, max_len=128, num_loops=1):
+        """
+        Greedy decoding strategy with layer looping - selects the most probable token at each step,
+        but applies the decoder with a specified num_loops parameter at each step.
+
+        Args:
+            nmr_tokens: Tokenized NMR data
+            ir_data: IR data
+            mass_data: Mass spectrometry data
+            max_len: Maximum sequence length
+            num_loops: Number of layer looping iterations to apply in the decoder
+
+        Returns:
+            List of decoded sequences
+        """
+        self.model.eval()
+        with torch.no_grad():
+            (nmr_tokens, ir_data, mass_data), batch_size = self.prepare_inputs(nmr_tokens, ir_data, mass_data)
+            memory = self.encode_inputs(nmr_tokens, ir_data, mass_data)
+            current_token = torch.tensor([[self.bos_token_id]] * batch_size, device=self.device)
+            generated_sequences = [[self.bos_token_id] for _ in range(batch_size)]
+            for _ in range(max_len):
+                logits = self.model.decoder(tgt=current_token, memory=memory, nmr_tokens=nmr_tokens, num_loops=num_loops)
+                next_token = logits[:, -1:].argmax(dim=-1)
+                for i in range(batch_size):
+                    token_id = next_token[i].item()
+                    generated_sequences[i].append(token_id)
+                    if token_id == self.eos_token_id:
+                        break
+                current_token = torch.cat((current_token, next_token), dim=1)
+            return self.postprocess_sequences(generated_sequences)
 
 
 # Simple usage example
