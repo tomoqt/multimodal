@@ -11,13 +11,13 @@ model:
   resample_size: 1000
   use_stablemax: False
   ir_encoder_type: convnext #regular, convnext
-  loop_range: [0, 0]
-  max_loops: 0
+  loop_range: [0, 10]
+  max_loops: 10
 
 # Training Parameters
 training:
-  precision: "fp32"  # Controls training precision (fp32, fp16, bf16)
-  batch_size: 20
+  precision: "fp16"  # Controls training precision (fp32, fp16, bf16)
+  batch_size: 32
   test_batch_size: 1
   num_epochs: 10
   learning_rate: 1.0e-3  # This will be used for AdamW components
@@ -31,14 +31,14 @@ training:
 
 # Optimizer Configuration
 optimizer:
-  type: AdamW  # Use Muon for matrices and AdamW for vectors/scalars
+  type: muon_mix  # Use Muon for matrices and AdamW for vectors/scalars
   adamw:  # Settings for vector parameters (< 2D)
     betas: [0.9, 0.999]
     eps: 1.0e-8
     weight_decay: 0.1
     caution: false
   muon:  # Settings for matrix parameters (≥ 2D)
-    lr: 1.0e-4
+    lr: 1.0e-3
     momentum: 0.95
     nesterov: true
     ns_steps: 5
