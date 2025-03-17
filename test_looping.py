@@ -29,7 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description="Full Dataset Looping Test for Greedy Loop Decoding")
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
     parser.add_argument('--config', type=str, default=None, help='Path to configuration YAML file')
-    parser.add_argument('--max_samples', type=int, default=500, help='Maximum number of dataset samples to process')
+    parser.add_argument('--max_samples', type=int, default=50, help='Maximum number of dataset samples to process')
     parser.add_argument('--max_loops', type=int, default=10, help='Maximum number of loops for greedy loop decoding')
     parser.add_argument('--split', type=str, default='test', help='Dataset split to use')
     parser.add_argument('--output_dir', type=str, default='inference_results', help='Directory to save results')

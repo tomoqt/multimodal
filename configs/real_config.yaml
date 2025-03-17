@@ -9,7 +9,7 @@ model:
   num_layers: 8
   dropout: 0.0
   resample_size: 1000
-  use_stablemax: True
+  use_stablemax: False
   ir_encoder_type: convnext #regular, convnext
   loop_range: [0, 0]
   max_loops: 0

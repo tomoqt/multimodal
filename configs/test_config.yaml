@@ -11,8 +11,8 @@ model:
   resample_size: 1000
   use_stablemax: False
   ir_encoder_type: convnext #regular, convnext
-  loop_range: [0, 10]
-  max_loops: 10
+  loop_range: [0, 0]
+  max_loops: 0
 
 # Training Parameters
 training:
@@ -75,9 +75,14 @@ rl:
     group_size: 8
     micro_group_size: 1
     batch_size: 1
-    max_iterations: 1000
-    use_exact_match_reward: True
-    use_tanimoto_reward: True
-    use_ecfp6_reward: True
-    use_valid_smiles_reward: True
-    use_mcs_ratio_reward: True
+    max_iterations: 10000
+    learning_rate: 1.0e-5    # Added default learning rate for GRPO
+    epsilon: 1           # Added default epsilon for GRPO
+    beta: 0.1           # Added default beta for GRPO
+    temperature: 1       # Added default temperature for GRPO
+    log_wandb: True     # Added default for logging wandb
+    exact_match_reward: True
+    tanimoto_reward: True
+    ecfp6_reward: True
+    valid_smiles_reward: True
+    mcs_ratio_reward: True
