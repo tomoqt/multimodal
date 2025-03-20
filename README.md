@@ -22,9 +22,10 @@ Current TODOs:
 
 * install and download data
 ```bash
+python3 download_data.py  
+
 # install packages and download
 pip install -r requirements.txt
-python3 download_data.py  
 # OR [if want faster, at your own risk] python3 download_data_parallel.py 
 ```
 * Tokenize data (or skip if you're not in development, not needed to actually train):
@@ -35,20 +36,22 @@ python3 create_tokenized_dataset_smallram.py --analytical_data "data_extraction/
 # real
 python3 create_tokenized_dataset_faster.py --analytical_data "data_extraction/multimodal_spectroscopic_dataset" --out_path "tokenized_baseline" --h_nmr --c_nmr --ir --formula
 ```
-* Download the data: 
+* Download the (pre-tokenized) data: 
 ```bash
-python3 download_tokenized_dataset.py
+python3 data/download_tokenized_dsataset.py  
+
 python3 build_vocab.py
 
+
+
+
 # train the model
-CUDA_VISIBLE_DEVICES=0 python3 train_autoregressive.py --config configs/local_config.yaml
-CUDA_VISIBLE_DEVICES=2 python3 train_autoregressive.py --config configs/real_config.yaml
+torchrun --nproc_per_node=1 train_autoregressive.py --config configs/test_config.yaml 
 
-# MUP
-CUDA_VISIBLE_DEVICES=1 python3 train_autoregressive_mup.py --config configs/real_config.yaml
+#test inference modes
 
+python test_inference --config your_config_path --checkpoint your_checkpoint_path
 
-```
 
 
 ### Paper Notes: 
