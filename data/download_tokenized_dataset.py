@@ -9,7 +9,7 @@ import shutil
     "--output_path",
     "-o",
     type=click.Path(path_type=Path),
-    default=Path("tokenized_baseline"),
+    default=Path("data/tokenized_baseline"),
     help="Base output path (dataset will be placed in output_path/data/)"
 )
 @click.option(

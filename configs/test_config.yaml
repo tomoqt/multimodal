@@ -61,7 +61,8 @@ data:
   val_size: 0.001
   preprocessed: False
   ir_as_prompt: False
-  ir_tokenizer_path: "tokenized_baseline/ir_processed/ir_vocab.json"
+  ir_tokenizer_path: "/data/tokenized_baseline/ir_processed/ir_vocab.json"
+  tokenized_dir: "data/tokenized_baseline/data"
 
 # Logging
 wandb:

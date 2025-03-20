@@ -123,6 +123,6 @@ def build_ir_vocabulary(data_dir: Path, output_dir: Path, splits=['train', 'val'
 
 if __name__ == '__main__':
     # Example usage
-    data_dir = Path('tokenized_baseline/data')  # Directory with raw .npy files
-    output_dir = Path('tokenized_baseline/ir_processed')  # Directory for processed files
+    data_dir = Path('data/tokenized_baseline/data')  # Directory with raw .npy files
+    output_dir = Path('data/tokenized_baseline/ir_processed')  # Directory for processed files
     vocab_list, token_to_id = build_ir_vocabulary(data_dir, output_dir) 

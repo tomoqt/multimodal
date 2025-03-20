@@ -33,14 +33,14 @@ import argparse
 import time
 from pprint import pprint
 from copy import deepcopy
-from logging_utils import evaluate_predictions, aggregate_metrics, log_results
+from utils.logging.logging_utils import evaluate_predictions, aggregate_metrics, log_results
 import heavyball
-from ortho_grad import OrthoGrad  # Import our new optimizer wrapper
+from utils.optimization.ortho_grad import OrthoGrad  # Import our new optimizer wrapper
 # Import our custom tokenizer
 from models.smiles_tokenizer import SmilesTokenizer
 from models.multimodal_to_smiles import MultiModalToSMILESModel
 import subprocess
-from muon import Muon  # Import Muon optimizer from the local file
+from utils.optimization.muon import Muon  # Import Muon optimizer from the local file
 import torch.nn.functional as F
 
 # Disable RDKit logging
