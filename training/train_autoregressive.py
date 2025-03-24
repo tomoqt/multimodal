@@ -771,6 +771,10 @@ def main():
     print("\n[Main] Cleaning wandb cache...")
     cleanup_wandb_cache()
 
+    # Variable to store loaded checkpoint for restoring optimizer state later
+    loaded_checkpoint = None
+    global_step = 0
+
     # Load vocabularies first
     print("\n[Main] Loading vocabularies...")
     smiles_vocab_size, nmr_vocab_size, nmr_tokenizer = load_vocabularies(config)
@@ -815,6 +819,29 @@ def main():
     # Set precision for training based on configuration
     precision = config['training'].get('precision', 'fp32')
     print(f"[Main] Using {precision} precision for training")
+    
+    # Load checkpoint if specified in config
+    if 'checkpoint' in config and 'load_path' in config['checkpoint'] and config['checkpoint']['load_path']:
+        checkpoint_path = config['checkpoint']['load_path']
+        print(f"\n[Main] Loading checkpoint from {checkpoint_path}...")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"[Main] Successfully loaded model from checkpoint at epoch {checkpoint['epoch']}, step {checkpoint['global_step']}")
+            
+            # Record the best validation loss from the checkpoint
+            best_val_loss = checkpoint.get('val_loss', float('inf'))
+            print(f"[Main] Checkpoint validation loss: {best_val_loss:.4f}")
+            
+            # Save global_step from checkpoint if available
+            if 'global_step' in checkpoint:
+                global_step = checkpoint['global_step']
+                print(f"[Main] Resuming from global step: {global_step}")
+            
+            # Store checkpoint for optimizer state restoration later
+            loaded_checkpoint = checkpoint
+        except Exception as e:
+            print(f"[Main] Error loading checkpoint: {e}")
     
     if precision == 'fp16' and torch.cuda.is_available():
         print("[Main] Enabling automatic mixed precision (AMP) for FP16 training")
@@ -1042,6 +1069,27 @@ def main():
     if config['scheduler'].get('type') == 'cosine':
         print(f"      - Min LR: {config['training'].get('min_learning_rate', 1e-6)}")
 
+    # Restore optimizer state if we loaded a checkpoint and reset_optimizer is False
+    if loaded_checkpoint is not None and 'checkpoint' in config and not config['checkpoint'].get('reset_optimizer', True):
+        print("\n[Main] Restoring optimizer state from checkpoint...")
+        try:
+            if 'optimizer_state_dicts' in loaded_checkpoint and loaded_checkpoint['optimizer_state_dicts']:
+                # For multiple optimizers
+                if len(loaded_checkpoint['optimizer_state_dicts']) == len(optimizers):
+                    for i, opt in enumerate(optimizers):
+                        opt.load_state_dict(loaded_checkpoint['optimizer_state_dicts'][i])
+                    print(f"[Main] Successfully restored state for {len(optimizers)} optimizers")
+                else:
+                    print(f"[Main] Warning: Mismatch in optimizer count. Checkpoint has {len(loaded_checkpoint['optimizer_state_dicts'])}, current has {len(optimizers)}.")
+                    print("[Main] Will only restore the primary optimizer state.")
+                    optimizers[0].load_state_dict(loaded_checkpoint['optimizer_state_dicts'][0])
+            else:
+                print("[Main] No optimizer state found in checkpoint or state is empty.")
+        except Exception as e:
+            print(f"[Main] Error restoring optimizer state: {e}")
+    else:
+        print("\n[Main] Starting with fresh optimizer state.")
+
     print("\n[Main] Creating checkpoint directory (overwriting previous checkpoints)...")
     save_dir = Path('checkpoints')
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -1142,7 +1190,6 @@ def main():
         scaler = torch.cuda.amp.GradScaler()
         print("[Main] Initialized GradScaler for FP16 mixed precision training")
     
-    global_step = 0
     start_time = time.time()
     
     # Helper for validation
