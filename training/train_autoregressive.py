@@ -9,6 +9,8 @@ Key Steps:
 3) Basic training loop with teacher forcing
 4) Minimal inference (greedy decode) function
 """
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import os
 import torch
