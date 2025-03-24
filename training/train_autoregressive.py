@@ -10,9 +10,10 @@ Key Steps:
 4) Minimal inference (greedy decode) function
 """
 import sys
+import os
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
