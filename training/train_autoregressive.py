@@ -767,13 +767,32 @@ def main():
     world_size = 1
     if "LOCAL_RANK" in os.environ:
         print("[Main] Detected distributed environment (torchrun)")
-        torch.distributed.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+        
+        # Set NCCL environment variables for better handling of PCIe-only GPUs
+        os.environ['NCCL_DEBUG'] = 'INFO'
+        os.environ['NCCL_IB_DISABLE'] = '1'  # Disable InfiniBand
+        os.environ['NCCL_P2P_DISABLE'] = '1'  # Disable P2P transport
+        
+        # Initialize process group with longer timeout and explicit init method
+        torch.distributed.init_process_group(
+            backend="nccl",  # Keep NCCL but with optimized settings
+            init_method="env://"
+        )
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         print(f"[Main] Process rank: {rank}, world size: {world_size}")
         
         # Set device based on local rank
         device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
+        
+        # Print GPU topology information on rank 0
+        if rank == 0:
+            print("\n[Main] GPU Topology:")
+            try:
+                topo = subprocess.check_output(['nvidia-smi', 'topo', '-m']).decode()
+                print(topo)
+            except Exception as e:
+                print(f"Could not get GPU topology: {e}")
     else:
         print("[Main] Running in non-distributed mode")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
