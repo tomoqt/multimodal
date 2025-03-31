@@ -17,7 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import wandb
 from datetime import datetime
 from sklearn.model_selection import train_test_split
@@ -45,6 +45,7 @@ from models.multimodal_to_smiles import MultiModalToSMILESModel
 import subprocess
 from utils.optimization.muon import Muon  # Import Muon optimizer from the local file
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Disable RDKit logging
 RDLogger.DisableLog("rdApp.*")
@@ -591,13 +592,23 @@ def create_data_loaders(smiles_tokenizer, nmr_tokenizer, config):
     print(f"          Val: {len(val_dataset)}")
     print(f"          Test: {len(test_dataset)}")
 
+    # Create distributed samplers if running in distributed mode
+    train_sampler = None
+    val_sampler = None
+    test_sampler = None
+    if torch.distributed.is_initialized():
+        train_sampler = DistributedSampler(train_dataset)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        test_sampler = DistributedSampler(test_dataset, shuffle=False)
+
     # Create data loaders with the wrapped collate function
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
-        shuffle=True,
+        shuffle=(train_sampler is None),  # Only shuffle if not using distributed sampler
         num_workers=config['data'].get('num_workers', 0),
-        collate_fn=collate_with_tokenizer
+        collate_fn=collate_with_tokenizer,
+        sampler=train_sampler
     )
 
     val_loader = DataLoader(
@@ -605,7 +616,8 @@ def create_data_loaders(smiles_tokenizer, nmr_tokenizer, config):
         batch_size=config['training']['batch_size'],
         shuffle=False,
         num_workers=config['data'].get('num_workers', 0),
-        collate_fn=collate_with_tokenizer
+        collate_fn=collate_with_tokenizer,
+        sampler=val_sampler
     )
 
     test_loader = DataLoader(
@@ -613,7 +625,8 @@ def create_data_loaders(smiles_tokenizer, nmr_tokenizer, config):
         batch_size=config['training'].get('test_batch_size', 1),
         shuffle=False,
         num_workers=config['data'].get('num_workers', 0),
-        collate_fn=collate_with_tokenizer
+        collate_fn=collate_with_tokenizer,
+        sampler=test_sampler
     )
 
     return train_loader, val_loader, test_loader
@@ -758,8 +771,12 @@ def main():
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         print(f"[Main] Process rank: {rank}, world size: {world_size}")
+        
+        # Set device based on local rank
+        device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
     else:
         print("[Main] Running in non-distributed mode")
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
     # Helper function for wandb logging that only logs on rank 0
     def log_wandb(metrics, step=None):
@@ -783,7 +800,6 @@ def main():
     smiles_vocab_size, nmr_vocab_size, nmr_tokenizer = load_vocabularies(config)
 
     print("\n[Main] Setting up device...")
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.cuda.is_available():
         print(f"[Main] Found {torch.cuda.device_count()} CUDA devices.")
         for i in range(torch.cuda.device_count()):
@@ -861,6 +877,10 @@ def main():
     
     # Move model to device (always in default precision)
     model = model.to(device)
+    
+    # Wrap model with DDP if running in distributed mode
+    if torch.distributed.is_initialized():
+        model = DDP(model, device_ids=[rank], output_device=rank)
 
     print("\n[Main] Creating data loaders...")
     train_loader, val_loader, test_loader = create_data_loaders(

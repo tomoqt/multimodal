@@ -17,12 +17,12 @@ model:
 # Training Parameters
 training:
   precision: "fp16"  # Controls training precision (fp32, fp16, bf16)
-  batch_size: 128
+  batch_size: 32
   test_batch_size: 1
   num_epochs: 50
   learning_rate: 1.0e-3  # This will be used for AdamW components
   min_learning_rate: 1.0e-4
-  weight_decay: 0.2
+  weight_decay: 0.1
   validation_frequency: 100
   logging_frequency: 10
   save_frequency: 10000
@@ -35,7 +35,7 @@ optimizer:
   adamw:  # Settings for vector parameters (< 2D)
     betas: [0.9, 0.999]
     eps: 1.0e-8
-    weight_decay: 0.2
+    weight_decay: 0.1
     caution: false
   muon:  # Settings for matrix parameters (≥ 2D)
     lr: 1.0e-3
