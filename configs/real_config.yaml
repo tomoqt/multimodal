@@ -22,11 +22,11 @@ training:
   learning_rate: 5.0e-5 # This will be used for AdamW components
   min_learning_rate: 5.0e-6
   weight_decay: 0.12
-  validation_frequency: 100
+  validation_frequency: 1000
   logging_frequency: 10
-  save_frequency: 1000
-  save_model_frequency: 1000 # How often to save model to wandb (in steps)
-  greedy_decode_frequency: 1000
+  save_frequency: 10000
+  save_model_frequency: 10000 # How often to save model to wandb (in steps)
+  greedy_decode_frequency: 10000
 
 # Optimizer Configuration
 optimizer:
