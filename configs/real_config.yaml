@@ -5,8 +5,8 @@ model:
   max_nmr_length: 190
   max_memory_length: 32
   embed_dim: 2048
-  num_heads: 16
-  num_layers: 8
+  num_heads: 8
+  num_layers: 12
   dropout: 0.0
   resample_size: 1000
   use_stablemax: False
@@ -18,10 +18,10 @@ training:
   precision: "bf16"  # Controls training precision (fp32, fp16, bf16)
   batch_size: 32
   test_batch_size: 1
-  num_epochs: 10
+  num_epochs: 100
   learning_rate: 5.0e-5 # This will be used for AdamW components
   min_learning_rate: 5.0e-6
-  weight_decay: 0.2
+  weight_decay: 0.12
   validation_frequency: 100
   logging_frequency: 10
   save_frequency: 1000
@@ -34,16 +34,16 @@ optimizer:
   adamw:  # Settings for vector parameters (< 2D)
     betas: [0.9, 0.999]
     eps: 1.0e-8
-    weight_decay: 0.2
+    weight_decay: 0.12
     caution: false
   muon:  # Settings for matrix parameters (≥ 2D)
-    lr: 2.5e-4
+    lr: 7.5e-4
     momentum: 0.95
     nesterov: true
     ns_steps: 5
     orthogonalize: False
     ortho_eps: 1.0e-30
-    ortho_rescale: true
+    ortho_rescale: False
 # Scheduler
 scheduler:
   type: cosine
