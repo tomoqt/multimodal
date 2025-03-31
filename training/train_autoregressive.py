@@ -768,15 +768,10 @@ def main():
     if "LOCAL_RANK" in os.environ:
         print("[Main] Detected distributed environment (torchrun)")
         
-        # Set NCCL environment variables for better handling of PCIe-only GPUs
-        os.environ['NCCL_DEBUG'] = 'INFO'
-        os.environ['NCCL_IB_DISABLE'] = '1'  # Disable InfiniBand
-        os.environ['NCCL_P2P_DISABLE'] = '1'  # Disable P2P transport
-        
-        # Initialize process group with longer timeout and explicit init method
+        # Initialize process group with gloo backend
         torch.distributed.init_process_group(
-            backend="nccl",  # Keep NCCL but with optimized settings
-            init_method="env://"
+            backend="gloo",  # Use gloo instead of NCCL
+            init_method="env://",
         )
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
