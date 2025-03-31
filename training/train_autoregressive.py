@@ -893,8 +893,8 @@ def main():
     model = model.to(device)
     
     # Wrap model with DDP if running in distributed mode
-    if torch.distributed.is_initialized():
-        model = DDP(model, device_ids=[rank], output_device=rank)
+    if torch.distributed.is_initialized() and not config['optimizer']['muon'].get('use_distributed', False):
+         model = DDP(model, device_ids=[rank], output_device=rank)
 
     print("\n[Main] Creating data loaders...")
     train_loader, val_loader, test_loader = create_data_loaders(
@@ -999,8 +999,7 @@ def main():
             world_size=world_size,
             orthogonalize=config['optimizer']['muon'].get('orthogonalize', False),
             ortho_eps=config['optimizer']['muon'].get('ortho_eps', 1e-30),
-            ortho_rescale=config['optimizer']['muon'].get('ortho_rescale', True),
-            use_distributed=False  # Disable distributed communication in Muon
+            ortho_rescale=config['optimizer']['muon'].get('ortho_rescale', True)#, use_distributed=False  # Disable distributed communication in Muon
         ) if matrix_params else None
         
         adamw_opt = optim.AdamW(
