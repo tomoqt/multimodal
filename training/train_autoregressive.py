@@ -768,17 +768,21 @@ def main():
     if "LOCAL_RANK" in os.environ:
         print("[Main] Detected distributed environment (torchrun)")
         
-        # Initialize process group with gloo backend
-        torch.distributed.init_process_group(
-            backend="gloo",  # Use gloo instead of NCCL
-            init_method="env://",
-        )
-        rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
-        print(f"[Main] Process rank: {rank}, world size: {world_size}")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank = int(os.environ.get("RANK", local_rank))
+        world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
         
-        # Set device based on local rank
-        device = torch.device(f"cuda:{os.environ['LOCAL_RANK']}")
+        # Set device before initializing process group
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        
+        # Initialize process group with nccl backend (better for GPU communication)
+        torch.distributed.init_process_group(
+            backend="nccl",  # Use NCCL for best GPU performance
+            init_method="env://"
+        )
+        
+        print(f"[Main] Process rank: {rank}, world size: {world_size}")
         
         # Print GPU topology information on rank 0
         if rank == 0:
@@ -892,9 +896,9 @@ def main():
     # Move model to device (always in default precision)
     model = model.to(device)
     
-    # Wrap model with DDP if running in distributed mode
-    if torch.distributed.is_initialized() and not config['optimizer']['muon'].get('use_distributed', False):
-         model = DDP(model, device_ids=[rank], output_device=rank)
+    # Do NOT wrap model with DDP - we'll handle gradient synchronization manually
+    # if torch.distributed.is_initialized():
+    #     model = DDP(model, device_ids=[rank], output_device=rank)
 
     print("\n[Main] Creating data loaders...")
     train_loader, val_loader, test_loader = create_data_loaders(
@@ -996,10 +1000,7 @@ def main():
             nesterov=config['optimizer'].get('muon', {}).get('nesterov', True),
             ns_steps=config['optimizer'].get('muon', {}).get('ns_steps', 5),
             rank=rank,
-            world_size=world_size,
-            orthogonalize=config['optimizer']['muon'].get('orthogonalize', False),
-            ortho_eps=config['optimizer']['muon'].get('ortho_eps', 1e-30),
-            ortho_rescale=config['optimizer']['muon'].get('ortho_rescale', True)#, use_distributed=False  # Disable distributed communication in Muon
+            world_size=world_size
         ) if matrix_params else None
         
         adamw_opt = optim.AdamW(
@@ -1384,6 +1385,12 @@ def main():
                     # Scale loss and do backward pass
                     scaler.scale(loss).backward()
                     
+                    # Manually synchronize gradients across processes like in the reference
+                    if torch.distributed.is_initialized():
+                        for param in model.parameters():
+                            if param.grad is not None:
+                                torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
+                    
                     # Step optimizers with scaler
                     for opt in optimizers:
                         scaler.step(opt)
@@ -1393,6 +1400,12 @@ def main():
                 else:
                     # For BF16, we don't need scaling since it has the same dynamic range as FP32
                     loss.backward()
+                    
+                    # Manually synchronize gradients across processes like in the reference
+                    if torch.distributed.is_initialized():
+                        for param in model.parameters():
+                            if param.grad is not None:
+                                torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
                     
                     # Step all optimizers
                     for opt in optimizers:
@@ -1409,6 +1422,12 @@ def main():
                 loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
                 loss.backward()
+                
+                # Manually synchronize gradients across processes like in the reference
+                if torch.distributed.is_initialized():
+                    for param in model.parameters():
+                        if param.grad is not None:
+                            torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
                 
                 # Step all optimizers
                 for opt in optimizers:

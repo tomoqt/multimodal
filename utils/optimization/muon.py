@@ -35,7 +35,7 @@ class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
 
-    https://kellerjordan.github.io/posts/muon/
+    https://kellyjordan.github.io/posts/muon/
 
     Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
     processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
@@ -53,12 +53,9 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1, orthogonalize=False, ortho_eps=1e-30, ortho_rescale=True):
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
-        self.orthogonalize = orthogonalize
-        self.ortho_eps = ortho_eps
-        self.ortho_rescale = ortho_rescale
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params: list[Tensor] = [*params]
         param_groups = []
@@ -98,16 +95,6 @@ class Muon(torch.optim.Optimizer):
                     if g.ndim == 4: # for the case of conv filters
                         g = g.view(len(g), -1)
                     g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
-                    if self.orthogonalize:
-                        w = p.data.view(-1).to(g.dtype)
-                        orig_norm = g.norm(2)
-                        w_norm_sq = torch.dot(w, w) + self.ortho_eps
-                        proj = torch.dot(w, g) / w_norm_sq
-                        g = g - proj * w
-                        if self.ortho_rescale:
-                            new_norm = g.norm(2) + self.ortho_eps
-                            g = g * (orig_norm / new_norm)
-
                 else:
                     g = update_buffer_views[self.rank]
                 if base_i > 0:
