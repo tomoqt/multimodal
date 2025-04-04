@@ -326,6 +326,9 @@ class SMILESDecoder(nn.Module):
         mask = th.ones(B, M+T, M+T, device=x.device).tril().bool()
         # Allow full attention within prompt
         mask[:, :M, :M] = True
+        # mask out future tokens from prompt
+        mask[:,:M,M:] = False
+        
         mask = mask[:, None].repeat(1, self.num_heads, 1, 1)
 
         # Identify the middle layer (using integer division)
@@ -338,8 +341,27 @@ class SMILESDecoder(nn.Module):
                 if self.verbose:
                     print(f"Looping middle layer (layer {middle_idx}) {num_loops} times")
                 
+                # Store the original input to the middle layer
+                x_original = x.clone()
+                
                 # Loop through the middle layer num_loops times
-                for _ in range(num_loops):
+                for loop_idx in range(num_loops):
+                    
+                    # Add Gaussian noise ONLY to the first loop iteration 
+                    if loop_idx == 0:
+                        # Calculate noise scale with variance = 2/(5*embed_dim)
+                        noise_scale = math.sqrt(2/(5*self.embed_dim))
+                        # Generate Gaussian noise with proper scaling
+                        noise = th.randn_like(x) * noise_scale
+                        # Add noise to the input
+                        x = x + noise
+                        if self.verbose:
+                            print(f"Added Gaussian noise with scale {noise_scale:.6f} to first loop iteration")
+                    
+                    # Add the original input back to the residual stream before each iteration, as in https://arxiv.org/pdf/2502.05171
+                    x = x_original + x
+                    
+                    # Process through the layer
                     x = layer(x, mask)
             else:
                 # Normal processing for non-middle layers

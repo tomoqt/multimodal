@@ -11,8 +11,8 @@ model:
   resample_size: 1000
   use_stablemax: False
   ir_encoder_type: convnext #regular, convnext
-  loop_range: [0, 0]
-  max_loops: 0
+  loop_range: [0, 10]
+  max_loops: 10
 
 # Training Parameters
 training:

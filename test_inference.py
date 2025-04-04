@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from models.multimodal_to_smiles import MultiModalToSMILESModel
 from models.smiles_tokenizer import SmilesTokenizer
-from inference import ModelInference, DecodingStrategy
+from inference.inference import ModelInference, DecodingStrategy
 
 # Import evaluation metrics functions from logging_utils
 try:
