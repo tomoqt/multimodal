@@ -38,9 +38,9 @@ python3 create_tokenized_dataset_faster.py --analytical_data "data_extraction/mu
 ```
 * Download the (pre-tokenized) data: 
 ```bash
-python3 data/download_tokenized_dsataset.py  
+python3 data/download_tokenized_dataset.py  
 
-python3 build_vocab.py
+python3 data/build_vocab.py
 
 
 
