@@ -62,7 +62,7 @@ vocab_path = os.path.join(current_dir, 'vocab.txt')
 tokenizer = SmilesTokenizer(vocab_file=vocab_path)
 
 
-def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=None, temperature=1.0, sample=False, precision='fp32'):
+def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=None, temperature=1.0, sample=False, precision='fp32', num_loops=None):
     """
     Decoding for SMILES generation with optional sampling.
     Args:
@@ -75,6 +75,7 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
         temperature: Temperature for sampling (higher = more random, lower = more deterministic)
         sample: If True, sample from the distribution; if False, use greedy decoding (argmax)
         precision: Precision type ('fp32', 'fp16', 'bf16')
+        num_loops: Number of loops for the model to generate
     """
     if device is None:
         device = next(model.parameters()).device
@@ -132,13 +133,15 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
                     logits = model.decoder(
                         tgt=current_token,
                         memory=memory,
-                        nmr_tokens=nmr_tokens  # NMR tokens used here
+                        nmr_tokens=nmr_tokens,
+                        num_loops=num_loops
                     )
             else:
                 logits = model.decoder(
                     tgt=current_token,
                     memory=memory,
-                    nmr_tokens=nmr_tokens  # NMR tokens used here
+                    nmr_tokens=nmr_tokens,
+                    num_loops=num_loops
                 )
             
             # Get the next token - either sample or take argmax
@@ -233,7 +236,8 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
                 tokenizer=tokenizer,
                 device=device,
                 sample=False,  # Ensure we're using greedy decoding (not sampling) for evaluation
-                precision=precision  # Pass precision setting
+                precision=precision,  # Pass precision setting
+                num_loops=None  # No loops for evaluation
             )
 
             targets = []
@@ -1541,9 +1545,7 @@ def main():
                     test_loader=test_loader,
                     tokenizer=tokenizer,
                     device=device,
-                    num_examples=100,
-                    block_ir=block_ir,
-                    block_nmr=block_nmr
+                    num_loops=None
                 )
                 
                 # Create a new table for greedy decode examples
@@ -1596,8 +1598,7 @@ def main():
         test_loader=test_loader,
         tokenizer=tokenizer,
         device=device,
-        block_ir=block_ir,
-        block_nmr=block_nmr
+        num_loops=None
     )
     log_wandb({
         "final_greedy_valid_smiles": final_greedy_metrics['valid_smiles'],

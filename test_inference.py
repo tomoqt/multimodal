@@ -608,7 +608,7 @@ def main():
     
     # Initialize tokenizers
     current_dir = os.path.dirname(os.path.realpath(__file__))
-    vocab_path = os.path.join(current_dir, 'vocab.txt')
+    vocab_path = os.path.join(current_dir, 'training/vocab.txt')
     tokenizer = SmilesTokenizer(vocab_file=vocab_path)
     
     nmr_vocab_path = Path(config['data']['tokenized_dir']).parent / 'vocab.json'
