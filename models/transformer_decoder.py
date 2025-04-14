@@ -105,8 +105,10 @@ class DecoderPromptLayer(nn.Module):
         self.ffn_w2 = nn.Linear(d_ffn, d_model)
 
         # Layer norms
-        self.attn_norm = nn.LayerNorm(d_model)
-        self.mlp_norm = nn.LayerNorm(d_model)
+        self.attn_norm1 = nn.LayerNorm(d_model)
+        self.attn_norm2 = nn.LayerNorm(d_model)
+        self.mlp_norm1 = nn.LayerNorm(d_model)
+        self.mlp_norm2 = nn.LayerNorm(d_model)
 
         self.attn_dropout = nn.Dropout(0.0)
         self.mlp_dropout = nn.Dropout(0.0)
@@ -119,7 +121,7 @@ class DecoderPromptLayer(nn.Module):
         H = self.nhead
         DH = self.head_dim
 
-        xattn = self.attn_norm(x)
+        xattn = self.attn_norm1(x)
 
         # Self attention
         q = self.q(xattn).view(B, T, H, DH).transpose(1, 2)
@@ -154,13 +156,13 @@ class DecoderPromptLayer(nn.Module):
 
         attn = attn.transpose(1, 2).contiguous().view(B, T, -1)
         xattn = self.attn_dropout(self.out(attn))
-        x = xattn + x
+        x = self.attn_norm2(xattn + x)
 
         # FFN
-        xffn = self.mlp_norm(x)
+        xffn = self.mlp_norm1(x)
         xffn = F.relu(self.ffn_w1(xffn)).square()
         xffn = self.mlp_dropout(self.ffn_w2(xffn))
-        x = x + xffn
+        x = self.mlp_norm2(x + xffn)
 
         return x
 
@@ -357,9 +359,9 @@ class SMILESDecoder(nn.Module):
                         x = x + noise
                         if self.verbose:
                             print(f"Added Gaussian noise with scale {noise_scale:.6f} to first loop iteration")
-                    
-                    # Add the original input back to the residual stream before each iteration, as in https://arxiv.org/pdf/2502.05171
-                    x = x_original + x
+                    else:
+                                            
+                        x = x_original + x# Add the original input back to the residual stream before each iteration, as in https://arxiv.org/pdf/2502.05171
                     
                     # Process through the layer
                     x = layer(x, mask)

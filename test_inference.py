@@ -96,8 +96,11 @@ except ImportError:
             results.append(result)
         return results
 
-    def aggregate_metrics(results):
-        """Aggregate individual result metrics into summary statistics"""
+    def aggregate_metrics(results, metric='tanimoto'):
+        """
+        Aggregate individual result metrics by selecting the best prediction
+        according to the specified metric (default: tanimoto similarity)
+        """
         n_samples = len(results)
         if n_samples == 0:
             return {
@@ -113,35 +116,29 @@ except ImportError:
         n_valid_pred = sum(1 for r in results if r['valid_pred'])
         n_valid_target = sum(1 for r in results if r['valid_target'])
         
-        # Count exact matches (only consider if target is valid)
-        n_exact_match = sum(1 for r in results if r['exact_match'] and r['valid_target'])
-        
-        # Filter for valid molecules to calculate chemical similarities
+        # Filter for valid molecules
         valid_results = [r for r in results if r['valid_pred'] and r['valid_target']]
-        n_valid_pairs = len(valid_results)
         
-        if n_valid_pairs == 0:
+        if not valid_results:
             return {
                 'valid_smiles': n_valid_pred / n_samples if n_samples > 0 else 0.0,
-                'exact_match': n_exact_match / n_valid_target if n_valid_target > 0 else 0.0,
-                'exact_match_all': n_exact_match / n_samples if n_samples > 0 else 0.0,
+                'exact_match': 0.0,
+                'exact_match_all': 0.0,
                 'avg_tanimoto': 0.0,
                 'avg_#mcs/#target': 0.0,
                 'avg_ecfp6_iou': 0.0
             }
         
-        # Calculate averages for similarity metrics
-        avg_tanimoto = sum(r['tanimoto'] for r in valid_results) / n_valid_pairs
-        avg_mcs_ratio = sum(r['#mcs/#target'] for r in valid_results) / n_valid_pairs
-        avg_ecfp6_iou = sum(r['ecfp6_iou'] for r in valid_results) / n_valid_pairs
+        # Find the best prediction according to the specified metric
+        best_result = max(valid_results, key=lambda x: x[metric])
         
         return {
             'valid_smiles': n_valid_pred / n_samples if n_samples > 0 else 0.0,
-            'exact_match': n_exact_match / n_valid_target if n_valid_target > 0 else 0.0,
-            'exact_match_all': n_exact_match / n_samples if n_samples > 0 else 0.0,
-            'avg_tanimoto': avg_tanimoto,
-            'avg_#mcs/#target': avg_mcs_ratio,
-            'avg_ecfp6_iou': avg_ecfp6_iou
+            'exact_match': 1.0 if best_result['exact_match'] else 0.0,
+            'exact_match_all': sum(1 for r in results if r['exact_match']) / n_samples if n_samples > 0 else 0.0,
+            'avg_tanimoto': best_result['tanimoto'],
+            'avg_#mcs/#target': best_result['#mcs/#target'],
+            'avg_ecfp6_iou': best_result['ecfp6_iou']
         }
 
 
