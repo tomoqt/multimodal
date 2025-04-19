@@ -279,30 +279,43 @@ class LinearWarmupCosineDecay(torch.optim.lr_scheduler._LRScheduler):
     Linearly increases learning rate from 0 to max_lr over `warmup_steps`,
     then either maintains constant LR or uses cosine decay from max_lr to min_lr.
     """
-    def __init__(self, optimizer, warmup_steps, total_steps, decay_type='cosine', min_lr=0.0, last_epoch=-1):
+    def __init__(self, optimizer, warmup_steps, total_steps, decay_type='cosine', min_lr=0.0, last_epoch=-1, initial_step=0):
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
         self.decay_type = decay_type
         self.min_lr = min_lr
+        self.initial_step = initial_step  # Store the initial step offset
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
-        if self.last_epoch < self.warmup_steps:
-            # Linear warmup
-            alpha = self.last_epoch / float(max(1, self.warmup_steps))
+        # Calculate the absolute current step based on initial_step and scheduler's internal step counter
+        # self.last_epoch starts at -1, so the first step corresponds to last_epoch=0.
+        # Adding 1 aligns it with the notion of step 1, step 2, etc.
+        current_absolute_step = self.last_epoch + self.initial_step + 1
+
+        if current_absolute_step <= self.warmup_steps:
+            # Linear warmup based on absolute step
+            # Ensure we don't divide by zero if warmup_steps is 0
+            warmup_divisor = float(max(1, self.warmup_steps))
+            alpha = current_absolute_step / warmup_divisor
             return [base_lr * alpha for base_lr in self.base_lrs]
         else:
             if self.decay_type == 'constant':
                 # Constant learning rate after warmup
                 return self.base_lrs
             else:  # cosine decay
-                # Cosine decay
-                progress = (self.last_epoch - self.warmup_steps) / float(
-                    max(1, self.total_steps - self.warmup_steps)
-                )
+                # Progress through the *decay phase* (from warmup_steps to total_steps)
+                # Use absolute step count relative to the start of the decay phase
+                steps_into_decay = current_absolute_step - self.warmup_steps
+                total_decay_steps = self.total_steps - self.warmup_steps
+
+                # Ensure total_decay_steps is at least 1 to avoid division by zero
+                progress = steps_into_decay / float(max(1, total_decay_steps))
+                progress = max(0.0, min(1.0, progress)) # Clamp progress to [0, 1]
+
                 cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
                 return [
-                    self.min_lr + (base_lr - self.min_lr) * cosine_decay 
+                    self.min_lr + (base_lr - self.min_lr) * cosine_decay
                     for base_lr in self.base_lrs
                 ]
 
@@ -1103,7 +1116,8 @@ def main():
         warmup_steps=config['scheduler']['warmup_steps'],
         total_steps=total_training_steps,
         decay_type=config['scheduler'].get('type', 'constant'),
-        min_lr=config['training'].get('min_learning_rate', 1e-6)
+        min_lr=config['training'].get('min_learning_rate', 1e-6),
+        initial_step=global_step  # Pass the loaded or initial global_step
     )
     print(f"[Main] Using {config['scheduler'].get('type', 'constant')} scheduler with:")
     print(f"      - Warmup steps: {config['scheduler']['warmup_steps']}")

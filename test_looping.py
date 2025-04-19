@@ -28,11 +28,12 @@ from test_inference import load_config, get_ir_tokenizer, detect_ir_as_prompt, S
 def main():
     parser = argparse.ArgumentParser(description="Full Dataset Looping Test for Greedy Loop Decoding")
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
-    parser.add_argument('--config', type=str, default=None, help='Path to configuration YAML file')
-    parser.add_argument('--max_samples', type=int, default=50, help='Maximum number of dataset samples to process')
-    parser.add_argument('--max_loops', type=int, default=10, help='Maximum number of loops for greedy loop decoding')
+    parser.add_argument('--config', type=str, default='configs/test_config.yaml', help='Path to configuration YAML file')
+    parser.add_argument('--max_samples', type=int, default=5, help='Maximum number of dataset samples to process')
+    parser.add_argument('--max_loops', type=int, default=100, help='Maximum number of loops for greedy loop decoding')
     parser.add_argument('--split', type=str, default='test', help='Dataset split to use')
     parser.add_argument('--output_dir', type=str, default='inference_results', help='Directory to save results')
+    parser.add_argument('--loops_representation', type=bool, default=False, help='Flag to track and return representations across loops')
     args = parser.parse_args()
 
     # Load configuration
@@ -76,14 +77,15 @@ def main():
         'max_nmr_length': config['model']['max_nmr_length'],
         'max_memory_length': config['model']['max_memory_length'],
         'embed_dim': config['model']['embed_dim'],
-        'num_heads': config['model']['num_heads'],
+        'num_heads': config['model']['num_heads'], 
         'num_layers': config['model']['num_layers'],
         'dropout': config['model']['dropout'],
         'verbose': False,
         'use_stablemax': config['model'].get('use_stablemax', False),
         'ir_as_prompt': ir_as_prompt,
         'ir_encoder_type': config['model'].get('ir_encoder_type', 'regular'),
-        'max_loops': args.max_loops
+        'max_loops': args.max_loops,
+        'loops_representation': args.loops_representation
     }
     if ir_as_prompt:
         if 'ir_vocab_size' in extra_params:
@@ -139,10 +141,14 @@ def main():
                 ir_data=ir_data,
                 strategy=DecodingStrategy.GREEDY_LOOP,
                 max_len=config['model']['max_seq_length'],
-                num_loops=loop_count
+                num_loops=loop_count,
+                loops_representation=args.loops_representation
             )
             # Evaluate metrics for this sample
-            metrics = evaluate_similarity(results, target_smiles, f"Greedy Loop (num_loops={loop_count})")
+            if args.loops_representation:
+                metrics = evaluate_similarity(results[0], target_smiles, f"Greedy Loop (num_loops={loop_count})")
+            else:
+                metrics = evaluate_similarity(results, target_smiles, f"Greedy Loop (num_loops={loop_count})")
             sample_metrics.append(metrics)
         # Aggregate metrics over all samples for this loop count
         aggregated = combine_metrics(sample_metrics)

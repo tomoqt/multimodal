@@ -18,7 +18,7 @@ model:
 
 # Checkpoint Configuration
 checkpoint:
-  load_path: "checkpoints/best_model.pt"  # Path to the checkpoint file
+  load_path: "checkpoints/latest_checkpoint.pt"  # Path to the checkpoint file
   reset_optimizer: False        
 # Training Parameters
 training:
@@ -28,7 +28,7 @@ training:
   num_epochs: 25
   learning_rate: 1.0e-3  # This will be used for AdamW components
   min_learning_rate: 1.0e-4
-  weight_decay: 0.12
+  weight_decay: 0.1
   validation_frequency: 1000
   logging_frequency: 10
   save_frequency: 10000
@@ -41,7 +41,7 @@ optimizer:
   adamw:  # Settings for vector parameters (< 2D)
     betas: [0.9, 0.999]
     eps: 1.0e-8
-    weight_decay: 0.12
+    weight_decay: 0.1
     caution: false
   muon:  # Settings for matrix parameters (≥ 2D)
     lr: 1.0e-3

@@ -212,12 +212,19 @@ class ModelInference:
             max_loops: Maximum number of times to loop the middle layer for high entropy states
             
         Returns:
-            List of decoded sequences
+            List of decoded sequences or Tuple of (List of decoded sequences, List of loop representations)
         """
         if strategy == DecodingStrategy.GREEDY:
             return self.greedy_decode(nmr_tokens, ir_data, mass_data, max_len)
         elif strategy == DecodingStrategy.GREEDY_LOOP:
-            return self.greedy_decode_with_loops(nmr_tokens, ir_data, mass_data, max_len, num_loops=kwargs.get("num_loops", 1))
+            return self.greedy_decode_with_loops(
+                nmr_tokens, 
+                ir_data, 
+                mass_data, 
+                max_len, 
+                num_loops=kwargs.get("num_loops", 1),
+                loops_representation=kwargs.get("loops_representation", False)
+            )
         elif strategy == DecodingStrategy.BEAM:
             return self.beam_search(nmr_tokens, ir_data, mass_data, max_len, beam_width, length_penalty)
         elif strategy in [DecodingStrategy.SAMPLING, DecodingStrategy.NUCLEUS]:
@@ -881,7 +888,7 @@ class ModelInference:
             # Post-process and decode the sequences
             return self.postprocess_sequences(sequences)
     
-    def greedy_decode_with_loops(self, nmr_tokens, ir_data, mass_data=None, max_len=128, num_loops=1):
+    def greedy_decode_with_loops(self, nmr_tokens, ir_data, mass_data=None, max_len=128, num_loops=1, loops_representation=False):
         """
         Greedy decoding strategy with layer looping - selects the most probable token at each step,
         but applies the decoder with a specified num_loops parameter at each step.
@@ -892,9 +899,11 @@ class ModelInference:
             mass_data: Mass spectrometry data
             max_len: Maximum sequence length
             num_loops: Number of layer looping iterations to apply in the decoder
+            loops_representation: Whether to track and return representations across loops
 
         Returns:
-            List of decoded sequences
+            If loops_representation=False: List of decoded sequences
+            If loops_representation=True: Tuple of (List of decoded sequences, List of loop representations)
         """
         self.model.eval()
         with torch.no_grad():
@@ -902,8 +911,30 @@ class ModelInference:
             memory = self.encode_inputs(nmr_tokens, ir_data, mass_data)
             current_token = torch.tensor([[self.bos_token_id]] * batch_size, device=self.device)
             generated_sequences = [[self.bos_token_id] for _ in range(batch_size)]
+            
+            # Initialize the decoder output and track if we need loop representations
+            decoder_output = None
+            
             for _ in range(max_len):
-                logits = self.model.decoder(tgt=current_token, memory=memory, nmr_tokens=nmr_tokens, num_loops=num_loops)
+                # Call decoder with loops_representation parameter
+                if loops_representation:
+                    logits, loop_reps = self.model.decoder(
+                        tgt=current_token, 
+                        memory=memory, 
+                        nmr_tokens=nmr_tokens, 
+                        num_loops=num_loops
+                    )
+                    # Store loop representations from the first token generation step only
+                    if decoder_output is None:
+                        decoder_output = loop_reps
+                else:
+                    logits = self.model.decoder(
+                        tgt=current_token, 
+                        memory=memory, 
+                        nmr_tokens=nmr_tokens, 
+                        num_loops=num_loops
+                    )
+                    
                 next_token = logits[:, -1:].argmax(dim=-1)
                 for i in range(batch_size):
                     token_id = next_token[i].item()
@@ -911,7 +942,14 @@ class ModelInference:
                     if token_id == self.eos_token_id:
                         break
                 current_token = torch.cat((current_token, next_token), dim=1)
-            return self.postprocess_sequences(generated_sequences)
+            
+            # Post-process and return appropriate results
+            decoded_sequences = self.postprocess_sequences(generated_sequences)
+            
+            if loops_representation and decoder_output is not None:
+                return decoded_sequences, decoder_output
+            else:
+                return decoded_sequences
 
 
 # Simple usage example

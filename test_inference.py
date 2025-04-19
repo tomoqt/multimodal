@@ -155,7 +155,7 @@ def load_config(config_path=None):
             'num_layers': 6,
             'dropout': 0.1,
             'use_stablemax': False,
-            'width_basis': 13
+            #'width_basis': 13
         },
         'data': {
             'tokenized_dir': 'tokenized_baseline/data',
@@ -550,6 +550,9 @@ def combine_metrics(metrics_list):
     for metrics in metrics_list:
         for k, v in metrics.items():
             if k != 'method':
+                # Ensure the key exists in combined before appending
+                if k not in combined:
+                    combined[k] = []
                 combined[k].append(v)
     
     # Calculate averages - handle non-numeric values correctly
@@ -560,13 +563,18 @@ def combine_metrics(metrics_list):
             continue
             
         # Check if values are numeric or strings
-        if all(isinstance(x, (int, float, bool, np.number)) for x in v):
-            # For numeric values, calculate mean
-            result[k] = np.mean([x for x in v if x is not None])
+        if all(isinstance(x, (int, float, bool, np.number)) for x in v if x is not None):
+            # For numeric values, calculate mean, ignoring None values
+            valid_values = [x for x in v if x is not None]
+            if valid_values:
+                result[k] = np.mean(valid_values)
+            else:
+                result[k] = None # Or 0.0, depending on desired behavior for all None
         else:
-            # For non-numeric values (like strings), use the first value
+            # For non-numeric values (like strings), use the first non-None value
             # This assumes these values should be the same across all metrics
-            result[k] = v[0]
+            first_valid = next((item for item in v if item is not None), None)
+            result[k] = first_valid
     
     # Add method name back if it exists
     if 'method' in combined:
@@ -754,6 +762,10 @@ def main():
                 
                 # Process each strategy for this example
                 for strategy in strategies:
+                    start_decode_time = time.time()
+                    results = None
+                    metrics = None
+                    
                     if strategy == "greedy":
                         results = inference.decode(
                             nmr_tokens=nmr_tokens,
@@ -761,8 +773,8 @@ def main():
                             strategy=DecodingStrategy.GREEDY,
                             max_len=config['model']['max_seq_length']
                         )
+                        decode_time = time.time() - start_decode_time
                         metrics = evaluate_similarity(results, target_smiles, "Greedy Decoding")
-                        all_strategy_metrics[strategy].append(metrics)
                     
                     elif strategy == "beam":
                         results = inference.decode(
@@ -772,8 +784,8 @@ def main():
                             max_len=config['model']['max_seq_length'],
                             beam_width=5
                         )
+                        decode_time = time.time() - start_decode_time
                         metrics = evaluate_similarity(results, target_smiles, "Beam Search")
-                        all_strategy_metrics[strategy].append(metrics)
                     
                     elif strategy == "sampling":
                         results = inference.decode(
@@ -783,8 +795,8 @@ def main():
                             max_len=config['model']['max_seq_length'],
                             temperature=1.0
                         )
+                        decode_time = time.time() - start_decode_time
                         metrics = evaluate_similarity(results, target_smiles, "Sampling")
-                        all_strategy_metrics[strategy].append(metrics)
                     
                     elif strategy == "nucleus":
                         results = inference.decode(
@@ -795,8 +807,8 @@ def main():
                             temperature=1.0,
                             top_p=0.9
                         )
+                        decode_time = time.time() - start_decode_time
                         metrics = evaluate_similarity(results, target_smiles, "Nucleus Sampling")
-                        all_strategy_metrics[strategy].append(metrics)
                     
                     elif strategy == "entropix":
                         results = inference.decode(
@@ -809,9 +821,39 @@ def main():
                             varentropy_threshold=args.varentropy_threshold,
                             max_loops=args.max_loops
                         )
+                        decode_time = time.time() - start_decode_time
                         metrics = evaluate_similarity(results, target_smiles, "Entropix")
+                        
+                    elif strategy == "greedy_loop":
+                        # Time the entire loop process for greedy_loop
+                        loop_times = []
+                        all_loop_results = []
+                        for loop_count in range(args.max_loops):
+                            loop_start_time = time.time()
+                            loop_results = inference.decode(
+                                nmr_tokens=nmr_tokens,
+                                ir_data=ir_data,
+                                strategy=DecodingStrategy.GREEDY_LOOP,
+                                max_len=config['model']['max_seq_length'],
+                                num_loops=loop_count
+                            )
+                            loop_duration = time.time() - loop_start_time
+                            loop_times.append(loop_duration)
+                            all_loop_results.append(loop_results) # Store results for each loop count if needed
+                        
+                        # Use the results from the last loop for evaluation
+                        results = all_loop_results[-1] if all_loop_results else []
+                        # Total time is the time for the last iteration or sum? Let's use last iteration time for consistency?
+                        # Or maybe sum makes more sense as it represents total computation? Let's use the total time for the whole process.
+                        decode_time = time.time() - start_decode_time # Total time for all loops
+                        metrics = evaluate_similarity(results, target_smiles, f"Greedy Loop (max_loops={args.max_loops})")
+                        # We could also average loop_times, but let's stick to total time for now.
+                        
+                    # Add timing information to metrics
+                    if metrics is not None:
+                        metrics['duration'] = decode_time
                         all_strategy_metrics[strategy].append(metrics)
-            
+                        
             # Show progress after each batch
             elapsed_time = time.time() - start_time
             examples_processed = batch_end
@@ -840,13 +882,17 @@ def main():
         metrics_rows = []
         for strategy, metrics in aggregate_metrics.items():
             if metrics:
+                # Format duration if available
+                duration_str = f"{metrics.get('duration', 0.0):.4f}s" if metrics.get('duration') is not None else "N/A"
+                
                 metrics_rows.append({
-                    'Method': strategy.capitalize(),
+                    'Method': strategy.capitalize().replace('_', ' '),
                     'Valid SMILES': f"{metrics['valid_smiles']:.2%}",
                     'Exact Match': f"{metrics['exact_match']:.2%}",
                     'Tanimoto': f"{metrics['avg_tanimoto']:.4f}",
                     'MCS Ratio': f"{metrics['avg_#mcs/#target']:.4f}",
-                    'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f}"
+                    'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f}",
+                    'Avg Time': duration_str  # Add timing info
                 })
         
         # Convert to DataFrame for nice printing
@@ -858,7 +904,11 @@ def main():
         # Save metrics to file
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         results_file = output_dir / f"inference_results_{timestamp}.csv"
-        metrics_df.to_csv(results_file, index=False)
+        # Add the Avg Time column to the DataFrame before saving
+        metrics_df_save = metrics_df.copy() # Avoid modifying the printed df
+        metrics_df_save['Avg Time (s)'] = [metrics.get('duration', None) for metrics in aggregate_metrics.values() if metrics] # Add raw seconds for CSV
+        metrics_df_save.drop(columns=['Avg Time'], inplace=True) # Remove formatted string version
+        metrics_df_save.to_csv(results_file, index=False)
         print(f"\nSaved results to {results_file}")
         
         # Also save raw metrics (numbers only) for further analysis
@@ -870,7 +920,8 @@ def main():
                     'exact_match': metrics['exact_match'],
                     'avg_tanimoto': metrics['avg_tanimoto'],
                     'avg_#mcs/#target': metrics['avg_#mcs/#target'],
-                    'avg_ecfp6_iou': metrics['avg_ecfp6_iou']
+                    'avg_ecfp6_iou': metrics['avg_ecfp6_iou'],
+                    'avg_duration': metrics.get('duration', None) # Add timing info
                 }
         
         raw_file = output_dir / f"inference_raw_metrics_{timestamp}.json"
@@ -943,6 +994,7 @@ def main():
     
     # Dictionary to store metrics for all methods
     all_metrics = {}
+    all_times = {} # Dictionary to store timing for single sample test
     
     # Test different decoding strategies
     print("\n===== Testing Different Decoding Strategies =====")
@@ -951,12 +1003,16 @@ def main():
     if "greedy" in strategies:
         # 1. Greedy decoding
         print("\n1. Greedy Decoding")
+        start_decode_time = time.time()
         greedy_results = inference.decode(
             nmr_tokens=nmr_tokens,
             ir_data=ir_data,
             strategy=DecodingStrategy.GREEDY,
             max_len=config['model']['max_seq_length']
         )
+        decode_time = time.time() - start_decode_time
+        all_times["Greedy"] = decode_time
+        print(f"  Time: {decode_time:.4f}s")
         for i, result in enumerate(greedy_results):
             print(f"  Result {i+1}: {result}")
         
@@ -968,6 +1024,7 @@ def main():
     if "beam" in strategies:
         # 2. Beam search
         print("\n2. Beam Search (width=5)")
+        start_decode_time = time.time()
         beam_results = inference.decode(
             nmr_tokens=nmr_tokens,
             ir_data=ir_data,
@@ -975,6 +1032,9 @@ def main():
             max_len=config['model']['max_seq_length'],
             beam_width=5
         )
+        decode_time = time.time() - start_decode_time
+        all_times["Beam"] = decode_time
+        print(f"  Time: {decode_time:.4f}s")
         for i, result in enumerate(beam_results):
             print(f"  Result {i+1}: {result}")
         
@@ -986,6 +1046,7 @@ def main():
     if "sampling" in strategies:
         # 3. Sampling with temperature
         print("\n3. Sampling (temperature=1.0)")
+        start_decode_time = time.time()
         sampling_results = inference.decode(
             nmr_tokens=nmr_tokens,
             ir_data=ir_data,
@@ -993,6 +1054,9 @@ def main():
             max_len=config['model']['max_seq_length'],
             temperature=1.0
         )
+        decode_time = time.time() - start_decode_time
+        all_times["Sampling"] = decode_time
+        print(f"  Time: {decode_time:.4f}s")
         for i, result in enumerate(sampling_results):
             print(f"  Result {i+1}: {result}")
         
@@ -1004,6 +1068,7 @@ def main():
     if "nucleus" in strategies:
         # 4. Nucleus sampling (top-p)
         print("\n4. Nucleus Sampling (top-p=0.9)")
+        start_decode_time = time.time()
         nucleus_results = inference.decode(
             nmr_tokens=nmr_tokens,
             ir_data=ir_data,
@@ -1012,6 +1077,9 @@ def main():
             temperature=1.0,
             top_p=0.9
         )
+        decode_time = time.time() - start_decode_time
+        all_times["Nucleus"] = decode_time
+        print(f"  Time: {decode_time:.4f}s")
         for i, result in enumerate(nucleus_results):
             print(f"  Result {i+1}: {result}")
         
@@ -1023,6 +1091,7 @@ def main():
     if "entropix" in strategies:
         # 5. Entropix tree search
         print(f"\n5. Entropix Tree Search (entropy_threshold={args.entropy_threshold}, varentropy_threshold={args.varentropy_threshold}, max_loops={args.max_loops})")
+        start_decode_time = time.time()
         entropix_results = inference.decode(
             nmr_tokens=nmr_tokens,
             ir_data=ir_data,
@@ -1033,6 +1102,9 @@ def main():
             varentropy_threshold=args.varentropy_threshold,
             max_loops=args.max_loops
         )
+        decode_time = time.time() - start_decode_time
+        all_times["Entropix"] = decode_time
+        print(f"  Time: {decode_time:.4f}s")
         for i, result in enumerate(entropix_results):
             print(f"  Result {i+1}: {result}")
         
@@ -1044,8 +1116,11 @@ def main():
     if "greedy_loop" in strategies:
         print("\nX. Greedy Loop Decoding with Varying Layer Loop Counts")
         greedy_loop_results = []  # Initialize list to store loop results
+        loop_times = []
+        overall_start_time = time.time()
         # Test with different numbers of loops
         for loop_count in range(args.max_loops):
+            loop_start_time = time.time()
             results = inference.decode(
                 nmr_tokens=nmr_tokens,
                 ir_data=ir_data,
@@ -1053,16 +1128,27 @@ def main():
                 max_len=config['model']['max_seq_length'],
                 num_loops=loop_count
             )
+            loop_duration = time.time() - loop_start_time
+            loop_times.append(loop_duration)
             greedy_loop_results.append(results)  # Store results from current loop count
-            print(f"\nResults for Greedy Loop Decoding with num_loops = {loop_count}:")
+            print(f"\nResults for Greedy Loop Decoding with num_loops = {loop_count}: (Time: {loop_duration:.4f}s)")
             for i, result in enumerate(results):
                 print(f"  Result {i+1}: {result}")
             if target_smiles:
                 metrics = evaluate_similarity(results, target_smiles, f"Greedy Loop (num_loops={loop_count})")
-                all_metrics[f"GreedyLoop_{loop_count}"] = metrics
-        selected_greedy_loop_results = greedy_loop_results[-1]  # Use last iteration result for comparison
-        if target_smiles:
+                # Store metrics for each loop count separately if needed
+                all_metrics[f"GreedyLoop_{loop_count}"] = metrics 
+        
+        overall_decode_time = time.time() - overall_start_time
+        all_times["GreedyLoop"] = overall_decode_time # Store overall time for the strategy
+        print(f"\nOverall time for Greedy Loop strategy (up to {args.max_loops} loops): {overall_decode_time:.4f}s")
+        
+        # Use last iteration result for comparison tables and final metrics
+        selected_greedy_loop_results = greedy_loop_results[-1] if greedy_loop_results else []
+        if target_smiles and f"GreedyLoop_{args.max_loops - 1}" in all_metrics:
+             # Use metrics from the last loop count for the main "GreedyLoop" entry
             all_metrics["GreedyLoop"] = all_metrics[f"GreedyLoop_{args.max_loops - 1}"]
+
 
     # Compare results
     print("\n===== Results Comparison =====")
@@ -1095,9 +1181,10 @@ def main():
                 'Exact Match': f"{metrics['exact_match']:.2%}",
                 'Tanimoto': f"{metrics['avg_tanimoto']:.4f}",
                 'MCS Ratio': f"{metrics['avg_#mcs/#target']:.4f}",
-                'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f}"
+                'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f}",
+                'Time (s)': f"{all_times.get(method, 0.0):.4f}" # Add timing info
             }
-            for method, metrics in all_metrics.items()
+            for method, metrics in all_metrics.items() if method in all_times # Ensure method has timing info
         ])
         
         # Print table

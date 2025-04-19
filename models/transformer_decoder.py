@@ -182,7 +182,8 @@ class SMILESDecoder(nn.Module):
         verbose: bool = True,
         use_stablemax: bool = False,  # Add this parameter
         ir_as_prompt: bool = False,
-        max_loops: int = 1  # Maximum number of times to loop the middle layer
+        max_loops: int = 1,  # Maximum number of times to loop the middle layer
+        loops_representation: bool = False #flag to track and return representations across loops
     ):
         super().__init__()
         
@@ -197,7 +198,7 @@ class SMILESDecoder(nn.Module):
         self.ir_as_prompt = ir_as_prompt
         self.max_loops = max_loops
         self.num_layers = num_layers
-        
+        self.loops_representation = loops_representation
         # Separate embeddings with different vocabulary sizes
         self.smiles_embed = nn.Embedding(smiles_vocab_size, embed_dim)
         self.nmr_embed = nn.Embedding(nmr_vocab_size, embed_dim)
@@ -231,6 +232,8 @@ class SMILESDecoder(nn.Module):
             nmr_tokens: tokenized NMR data, shape (B, N)
             num_loops: number of times to loop the middle layer (defaults to self.max_loops)
         """
+        if self.loops_representation:
+            self.loop_representations = []
         B, T = tgt.shape
         if self.verbose:
             print(f"\nDecoder Input Shapes:")
@@ -365,6 +368,8 @@ class SMILESDecoder(nn.Module):
                     
                     # Process through the layer
                     x = layer(x, mask)
+                    if self.loops_representation:
+                        self.loop_representations.append(x.clone())
             else:
                 # Normal processing for non-middle layers
                 x = layer(x, mask)
@@ -377,4 +382,7 @@ class SMILESDecoder(nn.Module):
         if self.verbose:
             print(f"Target sequence output shape: {out.shape}")
 
-        return out
+        if self.loops_representation:
+            return out, self.loop_representations
+        else:
+            return out
