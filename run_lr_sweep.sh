@@ -28,7 +28,7 @@ do
   # Overriding both AdamW lr (training.learning_rate) and Muon lr (optimizer.muon.lr)
   # Also overriding the wandb base run name for clarity
   # And overriding the min_learning_rate
-  python training/train_autoregressive.py \
+  torchrun --standalone --nproc_per_node=1 training/train_autoregressive.py \
     --config "$CONFIG_FILE" \
     training.learning_rate="$lr" \
     training.min_learning_rate="$min_lr" \
