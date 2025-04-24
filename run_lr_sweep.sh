@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration
-CONFIG_FILE="configs/test_config.yaml"
+CONFIG_FILE="configs/sweep_config.yaml"
 BASE_RUN_NAME="muon_mix_lr_sweep" # Base name for wandb runs
 LRS=(1e-2 5e-3 1e-3 1e-4)
 
