@@ -212,8 +212,14 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
     try:
         # Access the global config if available
         precision = config['training'].get('precision', 'fp32')
+        automatic_loop_exit = config['model'].get('automatic_loop_exit', False)
+        automatic_loop_exit_threshold = config['model'].get('automatic_loop_exit_threshold', 0.01)
+        max_loops = config['model'].get('max_loops', 1)
     except (NameError, KeyError):
-        pass
+        # Fallback if config is not available (e.g., when called outside main script)
+        automatic_loop_exit = False
+        automatic_loop_exit_threshold = 0.01
+        max_loops = 1
 
     with torch.no_grad():
         for target_tokens, ir_data, nmr_tokens, _ in tqdm(test_loader, desc="Greedy decoding"):
@@ -229,6 +235,12 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
             if nmr_tokens is not None:
                 nmr_tokens = nmr_tokens.to(device)
 
+            # Determine num_loops for greedy decoding
+            if automatic_loop_exit:
+                current_num_loops = max_loops # Use max_loops when auto exit is on
+            else:
+                current_num_loops = 1 # Default to 1 loop for standard greedy eval
+
             predictions = greedy_decode(
                 model=model,
                 nmr_tokens=nmr_tokens,
@@ -237,7 +249,7 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
                 device=device,
                 sample=False,  # Ensure we're using greedy decoding (not sampling) for evaluation
                 precision=precision,  # Pass precision setting
-                num_loops=None  # No loops for evaluation
+                num_loops=current_num_loops # Pass the determined number of loops
             )
 
             targets = []
@@ -668,7 +680,9 @@ def load_config(config_path=None):
             'use_stablemax': False,
             'ir_encoder_type': 'regular',
             'max_loops': 1,
-            'loop_range': [0, 5]  # Range for uniform sampling of loop count during training
+            'loop_range': [0, 5],  # Range for uniform sampling of loop count during training
+            'automatic_loop_exit': False, # Add new flag
+            'automatic_loop_exit_threshold': 0.01 # Add threshold
         },
         'training': {
             'batch_size': 32,
@@ -748,12 +762,122 @@ def load_config(config_path=None):
     return default_config
 
 
+# Helper function to update config dict from command-line args
+def update_config_from_args(config, overrides):
+    """
+    Updates the config dictionary with overrides from the command line.
+    Overrides are expected in the format 'key1.key2.key3=value'.
+    Attempts to convert value to the type of the existing config value.
+    """
+    print("[Config] Applying command-line overrides...")
+    for arg in overrides:
+        if '=' not in arg:
+            print(f"  [Warning] Skipping invalid override format (missing '='): {arg}")
+            continue
+
+        key_str, value_str = arg.split('=', 1)
+        keys = key_str.split('.')
+        
+        # Traverse the config dict
+        d = config
+        valid_key = True
+        for i, key in enumerate(keys[:-1]):
+            if isinstance(d, dict) and key in d:
+                d = d[key]
+            else:
+                print(f"  [Warning] Invalid key path in override: {key_str}")
+                valid_key = False
+                break
+        
+        if not valid_key:
+            continue
+
+        # Update the value
+        final_key = keys[-1]
+        if isinstance(d, dict) and final_key in d:
+            target_type = type(d[final_key])
+            original_value = d[final_key]
+            try:
+                # Attempt type conversion
+                if target_type == bool:
+                    converted_value = value_str.lower() in ['true', '1', 'yes']
+                elif target_type == list:
+                    # Handle list conversion (assuming comma-separated or simple JSON-like list)
+                    try:
+                        import json
+                        converted_value = json.loads(value_str)
+                        if not isinstance(converted_value, list):
+                             raise ValueError("Parsed value is not a list")
+                    except (json.JSONDecodeError, ValueError):
+                        # Fallback for simple comma-separated strings if JSON fails
+                        converted_value = [item.strip() for item in value_str.split(',')]
+                    # Attempt to convert list elements if original list had consistent types
+                    if original_value and all(isinstance(x, type(original_value[0])) for x in original_value):
+                         elem_type = type(original_value[0])
+                         converted_value = [elem_type(item) for item in converted_value]
+
+                else:
+                    converted_value = target_type(value_str)
+                
+                d[final_key] = converted_value
+                print(f"  Overriding: {key_str} = {converted_value} (was {original_value})")
+            except ValueError as e:
+                print(f"  [Warning] Could not convert override value '{value_str}' for key '{key_str}' to type {target_type}. Error: {e}")
+            except Exception as e:
+                 print(f"  [Warning] Error applying override for key '{key_str}'. Error: {e}")
+        elif isinstance(d, dict):
+             # Key doesn't exist, try to infer type (basic inference)
+            try:
+                if value_str.lower() in ['true', 'false']:
+                    d[final_key] = value_str.lower() == 'true'
+                    print(f"  Adding new boolean key: {key_str} = {d[final_key]}")
+                elif value_str.startswith('[') and value_str.endswith(']'):
+                     # Basic list inference
+                    try:
+                        import json
+                        d[final_key] = json.loads(value_str)
+                        print(f"  Adding new list key: {key_str} = {d[final_key]}")
+                    except json.JSONDecodeError:
+                         # Fallback: treat as comma-separated string list
+                         items = value_str[1:-1].split(',')
+                         d[final_key] = [item.strip() for item in items]
+                         print(f"  Adding new string list key (fallback): {key_str} = {d[final_key]}")
+
+                elif '.' in value_str or 'e' in value_str.lower():
+                    d[final_key] = float(value_str)
+                    print(f"  Adding new float key: {key_str} = {d[final_key]}")
+                elif value_str.isdigit() or (value_str.startswith('-') and value_str[1:].isdigit()):
+                    d[final_key] = int(value_str)
+                    print(f"  Adding new integer key: {key_str} = {d[final_key]}")
+                else:
+                    d[final_key] = value_str # Assume string
+                    print(f"  Adding new string key: {key_str} = {d[final_key]}")
+            except ValueError:
+                 d[final_key] = value_str # Fallback to string
+                 print(f"  [Warning] Could not infer type for new key '{key_str}', setting as string: {value_str}")
+        else:
+             print(f"  [Warning] Cannot set key '{final_key}' on non-dictionary element for path: {key_str}")
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train SMILES generation model')
+    parser = argparse.ArgumentParser(description='Train SMILES generation model', add_help=False) # Disable default help to handle overrides cleanly
+    
+    # Known arguments
     parser.add_argument('--config', type=str, help='Path to config file')
     parser.add_argument('--block-ir', action='store_true', help='Block IR signals in the model inputs')
     parser.add_argument('--block-nmr', action='store_true', help='Block NMR signals in the model inputs')
-    return parser.parse_args()
+    
+    # Add help argument manually
+    parser.add_argument('-h', '--help', action='help', default=argparse.SUPPRESS,
+                        help='Show this help message and exit. Use key.subkey=value for config overrides.')
+
+    # Parse known args first, remainder will be overrides
+    args, unknown_args = parser.parse_known_args()
+    
+    # Attach unknown_args (overrides) to the args object for later processing
+    args.overrides = unknown_args
+    
+    return args
 
 
 def cleanup_wandb_cache():
@@ -820,7 +944,14 @@ def main():
 
     print("[Main] Loading configuration...")
     config = load_config(args.config)
-    print("[Main] Configuration loaded.")
+    # Apply command-line overrides AFTER loading the base config
+    if args.overrides:
+        update_config_from_args(config, args.overrides)
+    print("[Main] Configuration loaded and overrides applied.")
+    # Optionally print the final config for verification (can be verbose)
+    # if rank == 0: 
+    #     print("[Main] Final Configuration:")
+    #     pprint(config)
 
     # Clean wandb cache before starting
     print("\n[Main] Cleaning wandb cache...")
@@ -867,7 +998,10 @@ def main():
         ir_encoder_type=config['model'].get('ir_encoder_type', 'regular'),
         ir_as_prompt=config['data'].get('ir_as_prompt', False),
         ir_vocab_size=ir_vocab_size,
-        max_loops=max(config['model'].get('max_loops', 1), max(config['model'].get('loop_range', [0, 1])))
+        max_loops=max(config['model'].get('max_loops', 1), max(config['model'].get('loop_range', [0, 1]))),
+        loops_representation=config['model'].get('loops_representation', False),
+        automatic_loop_exit=config['model'].get('automatic_loop_exit', False), # Pass flag
+        automatic_loop_exit_threshold=config['model'].get('automatic_loop_exit_threshold', 0.01) # Pass threshold
     )
     
     # Set precision for training based on configuration
@@ -1272,12 +1406,18 @@ def main():
                 T = target_tokens.size(1)
                 mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=target_tokens.device), 1)
                 
-                # Uniformly sample the number of loops for validation if loop_range is set
+                # Determine number of loops for training
                 loop_range = config['model'].get('loop_range', None)
+                automatic_loop_exit = config['model'].get('automatic_loop_exit', False)
+                max_loops = config['model'].get('max_loops', 1)
                 num_loops = None
-                if loop_range and model.training:
-                    min_loops, max_loops = loop_range
-                    num_loops = torch.randint(min_loops, max_loops + 1, (1,)).item()
+                if automatic_loop_exit:
+                    num_loops = max_loops # Use max_loops when auto exit is on
+                elif loop_range: # Only sample if auto exit is off and loop_range is defined
+                    min_loops, max_loops_range = loop_range
+                    num_loops = torch.randint(min_loops, max_loops_range + 1, (1,)).item()
+                else:
+                     num_loops = 1 # Default to 1 loop if no range and no auto exit
                 
                 # Use mixed precision for validation too if enabled
                 precision = config['training'].get('precision', 'fp32')
@@ -1374,12 +1514,18 @@ def main():
             T = target_tokens.size(1)
             mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=target_tokens.device), 1)
             
-            # Uniformly sample the number of loops for training if loop_range is set
+            # Determine number of loops for training
             loop_range = config['model'].get('loop_range', None)
+            automatic_loop_exit = config['model'].get('automatic_loop_exit', False)
+            max_loops = config['model'].get('max_loops', 1)
             num_loops = None
-            if loop_range and model.training:
-                min_loops, max_loops = loop_range
-                num_loops = torch.randint(min_loops, max_loops + 1, (1,)).item()
+            if automatic_loop_exit:
+                num_loops = max_loops # Use max_loops when auto exit is on
+            elif loop_range: # Only sample if auto exit is off and loop_range is defined
+                min_loops, max_loops_range = loop_range
+                num_loops = torch.randint(min_loops, max_loops_range + 1, (1,)).item()
+            else:
+                 num_loops = 1 # Default to 1 loop if no range and no auto exit
             
             # Zero gradients for all optimizers
             for opt in optimizers:

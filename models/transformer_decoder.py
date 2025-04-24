@@ -183,7 +183,9 @@ class SMILESDecoder(nn.Module):
         use_stablemax: bool = False,  # Add this parameter
         ir_as_prompt: bool = False,
         max_loops: int = 1,  # Maximum number of times to loop the middle layer
-        loops_representation: bool = False #flag to track and return representations across loops
+        loops_representation: bool = False, #flag to track and return representations across loops
+        automatic_loop_exit: bool = False, # flag to automatically exit loops based on convergence of representations
+        automatic_loop_exit_threshold: float = 0.01 # threshold for automatic loop exit
     ):
         super().__init__()
         
@@ -197,6 +199,8 @@ class SMILESDecoder(nn.Module):
         self.max_memory_length = max_memory_length
         self.ir_as_prompt = ir_as_prompt
         self.max_loops = max_loops
+        self.automatic_loop_exit = automatic_loop_exit
+        self.automatic_loop_exit_threshold = automatic_loop_exit_threshold
         self.num_layers = num_layers
         self.loops_representation = loops_representation
         # Separate embeddings with different vocabulary sizes
@@ -273,7 +277,7 @@ class SMILESDecoder(nn.Module):
         # Check if target sequence + prompt length exceeds maximum
         # Note: Individual components (target, memory, nmr) are already checked separately above
         # This is just to ensure the total sequence length doesn't exceed transformer architecture limits
-        max_transformer_length = 1024  # Standard upper bound for transformer architectures
+        max_transformer_length = 1024  
         if T + total_prompt_length > max_transformer_length:
             raise ValueError(
                 f"Combined sequence length ({T} + {total_prompt_length} = {T + total_prompt_length}) "
@@ -367,7 +371,19 @@ class SMILESDecoder(nn.Module):
                         x = x_original + x# Add the original input back to the residual stream before each iteration, as in https://arxiv.org/pdf/2502.05171
                     
                     # Process through the layer
-                    x = layer(x, mask)
+                    
+                    # automatically exit loop if we converge.
+                    if self.automatic_loop_exit:
+                        x_new = layer(x,mask)
+                        diff_norm = th.norm(x_new - x, dim=-1)
+                        if (diff_norm.max() < self.automatic_loop_exit_threshold): # take max difference to indicate convergence.
+                            break
+                        else:
+                            x = x_new
+
+                    else:
+                        x = layer(x, mask)
+
                     if self.loops_representation:
                         self.loop_representations.append(x.clone())
             else:

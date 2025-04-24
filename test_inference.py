@@ -595,7 +595,7 @@ def main():
     parser.add_argument('--index', type=int, default=0, help='Index in dataset to test (only if --dataset_test)')
     parser.add_argument('--batch_size', type=int, default=1, help='Number of examples to process in parallel (only with --full_dataset_test)')
     parser.add_argument('--max_examples', type=int, default=None, help='Maximum number of test examples to process (only with --full_dataset_test)')
-    parser.add_argument('--strategies', type=str, default='all', help='Comma-separated list of decoding strategies to test (greedy,beam,sampling,nucleus,entropix,greedy_loop)')
+    parser.add_argument('--strategies', type=str, default='greedy,beam,sampling,nucleus,entropix', help='Comma-separated list of decoding strategies to test (greedy,beam,sampling,nucleus,entropix,greedy_loop)')
     parser.add_argument('--ir_as_prompt', action='store_true', help='Use IR as prompt tokens')
     parser.add_argument('--no_ir_as_prompt', action='store_true', help='Do not use IR as prompt tokens')
     parser.add_argument('--entropy_threshold', type=float, default=0.6939, help='Entropy threshold for Entropix decoding')

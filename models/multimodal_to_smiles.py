@@ -31,7 +31,9 @@ class MultiModalToSMILESModel(nn.Module):
         ir_as_prompt: bool = False,
         ir_vocab_size: int = None,
         max_loops: int = 1,
-        loops_representation: bool = False
+        loops_representation: bool = False,
+        automatic_loop_exit: bool = False,
+        automatic_loop_exit_threshold: float = 0.01
     ):
         """
         Args:
@@ -51,6 +53,8 @@ class MultiModalToSMILESModel(nn.Module):
             ir_vocab_size: Number of tokens in the IR vocabulary if IR is used as prompt.
             max_loops: Maximum number of times to loop the middle layer in the decoder.
             loops_representation: Whether to track and return representations across loops.
+            automatic_loop_exit: Whether to enable automatic exiting from middle layer loops based on representation convergence.
+            automatic_loop_exit_threshold: The threshold for convergence detection when automatic_loop_exit is enabled.
         """
         super().__init__()
         self.verbose = verbose
@@ -90,7 +94,9 @@ class MultiModalToSMILESModel(nn.Module):
             use_stablemax=use_stablemax,
             ir_as_prompt=ir_as_prompt,
             max_loops=max_loops,
-            loops_representation=loops_representation
+            loops_representation=loops_representation,
+            automatic_loop_exit=automatic_loop_exit,
+            automatic_loop_exit_threshold=automatic_loop_exit_threshold
         )
 
     def forward(
