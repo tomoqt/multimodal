@@ -17,10 +17,8 @@ do
   lr_tag=$(echo "$lr" | sed 's/\./p/' | sed 's/e-0\?/em/' | sed 's/+//') 
   run_name="${BASE_RUN_NAME}_${lr_tag}"
 
-  # Calculate min_lr = lr / 10
-  min_lr=$(echo "scale=10; $lr / 10" | bc) 
-  # Format min_lr to scientific notation if needed (optional, depends on how python script handles it)
-  # min_lr=$(printf "%.1E" "$min_lr") # Example: 1.0E-05
+  # Calculate min_lr = lr / 10 using awk
+  min_lr=$(awk -v lr="$lr" 'BEGIN { printf "%.1E", lr / 10 }')
 
   echo "--------------------------------------------------"
   echo "Running with LR = $lr, Min LR = $min_lr (Run Name: $run_name)"
