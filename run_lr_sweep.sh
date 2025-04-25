@@ -3,7 +3,7 @@
 # Configuration
 CONFIG_FILE="configs/sweep_config.yaml"
 BASE_RUN_NAME="adamw_lr_sweep" # Base name for wandb runs
-LRS=(5e-3 1e-3 1e-4)
+LRS=(1e-3 5e-3 1e-3 1e-4)
 
 # Ensure the script exits if any command fails
 set -e
@@ -28,7 +28,7 @@ do
   # Overriding both AdamW lr (training.learning_rate) and Muon lr (optimizer.muon.lr)
   # Also overriding the wandb base run name for clarity
   # And overriding the min_learning_rate
-  torchrun --standalone --nproc_per_node=1 training/train_autoregressive.py \
+  python training/train_autoregressive.py \
     --config "$CONFIG_FILE" \
     training.learning_rate="$lr" \
     training.min_learning_rate="$min_lr" \
