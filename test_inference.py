@@ -602,6 +602,8 @@ def main():
     parser.add_argument('--varentropy_threshold', type=float, default=1.3781, help='Varentropy threshold for Entropix decoding')
     parser.add_argument('--max_loops', type=int, default=10, help='Maximum number of middle layer loops for high entropy states')
     parser.add_argument('--output_dir', type=str, default='inference_results', help='Directory to save inference results')
+    parser.add_argument('--automatic_loop_exit', action='store_true', help='Enable automatic loop exit in Entropix/decoder based on representation convergence')
+    parser.add_argument('--automatic_loop_exit_threshold', type=float, default=0.01, help='Threshold for automatic loop exit convergence')
     args = parser.parse_args()
 
     # Load configuration
@@ -670,6 +672,8 @@ def main():
     # Added to ensure the correct IR encoder type and max_loops are used
     model_kwargs['ir_encoder_type'] = config['model'].get('ir_encoder_type', 'regular')
     model_kwargs['max_loops'] = args.max_loops
+    model_kwargs['automatic_loop_exit'] = args.automatic_loop_exit
+    model_kwargs['automatic_loop_exit_threshold'] = args.automatic_loop_exit_threshold
     
     # Add ir_vocab_size if needed
     if ir_as_prompt:
@@ -819,7 +823,9 @@ def main():
                             top_k=5,
                             entropy_threshold=args.entropy_threshold,
                             varentropy_threshold=args.varentropy_threshold,
-                            max_loops=args.max_loops
+                            max_loops=args.max_loops,
+                            automatic_loop_exit=args.automatic_loop_exit,
+                            automatic_loop_exit_threshold=args.automatic_loop_exit_threshold
                         )
                         decode_time = time.time() - start_decode_time
                         metrics = evaluate_similarity(results, target_smiles, "Entropix")
@@ -1100,7 +1106,9 @@ def main():
             top_k=5,
             entropy_threshold=args.entropy_threshold,
             varentropy_threshold=args.varentropy_threshold,
-            max_loops=args.max_loops
+            max_loops=args.max_loops,
+            automatic_loop_exit=args.automatic_loop_exit,
+            automatic_loop_exit_threshold=args.automatic_loop_exit_threshold
         )
         decode_time = time.time() - start_decode_time
         all_times["Entropix"] = decode_time

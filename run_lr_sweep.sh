@@ -2,7 +2,7 @@
 
 # Configuration
 CONFIG_FILE="configs/sweep_config.yaml"
-BASE_RUN_NAME="muon_mix_lr_sweep" # Base name for wandb runs
+BASE_RUN_NAME="adamw_lr_sweep" # Base name for wandb runs
 LRS=(5e-3 1e-3 1e-4)
 
 # Ensure the script exits if any command fails

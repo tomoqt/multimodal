@@ -34,7 +34,7 @@ training:
 
 # Optimizer Configuration
 optimizer:
-  type: muon_mix  # Use Muon for matrices and AdamW for vectors/scalars
+  type: adamw  # Use Muon for matrices and AdamW for vectors/scalars
   adamw:  # Settings for vector parameters (< 2D)
     betas: [0.9, 0.999]
     eps: 1.0e-8
