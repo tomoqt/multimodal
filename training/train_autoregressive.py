@@ -201,7 +201,7 @@ def canonicalize_smiles(smiles):
         return cleaned
 
 
-def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examples=None, block_ir=False, block_nmr=False, num_loops=None):
+def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examples=100, block_ir=False, block_nmr=False, num_loops=None):
     """Evaluate model using greedy decoding with optional IR/NMR blocking"""
     model.eval()
     all_predictions = []
