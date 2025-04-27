@@ -1418,6 +1418,8 @@ def main():
                 elif loop_range: # Only sample if auto exit is off and loop_range is defined
                     min_loops, max_loops_range = loop_range
                     num_loops = torch.randint(min_loops, max_loops_range + 1, (1,)).item()
+                    print(f"num_loops: {num_loops}")
+
                 else:
                      num_loops = 1 # Default to 1 loop if no range and no auto exit
                 
