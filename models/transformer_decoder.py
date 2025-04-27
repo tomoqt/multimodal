@@ -256,7 +256,7 @@ class SMILESDecoder(nn.Module):
         
         # Ensure num_loops doesn't exceed max_loops
         num_loops = min(num_loops, self.max_loops)
-
+        print(f"num_loops: {num_loops}")
         # Check and enforce target sequence length limits
         if T > self.max_seq_length:
             if self.verbose:
