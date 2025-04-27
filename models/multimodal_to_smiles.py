@@ -33,7 +33,8 @@ class MultiModalToSMILESModel(nn.Module):
         max_loops: int = 1,
         loops_representation: bool = False,
         automatic_loop_exit: bool = False,
-        automatic_loop_exit_threshold: float = 0.01
+        automatic_loop_exit_threshold: float = 0.01,
+        use_loop_concat: bool = True
     ):
         """
         Args:
@@ -55,6 +56,7 @@ class MultiModalToSMILESModel(nn.Module):
             loops_representation: Whether to track and return representations across loops.
             automatic_loop_exit: Whether to enable automatic exiting from middle layer loops based on representation convergence.
             automatic_loop_exit_threshold: The threshold for convergence detection when automatic_loop_exit is enabled.
+            use_loop_concat: Whether to concatenate original input with looped input in the middle layer.
         """
         super().__init__()
         self.verbose = verbose
@@ -96,7 +98,8 @@ class MultiModalToSMILESModel(nn.Module):
             max_loops=max_loops,
             loops_representation=loops_representation,
             automatic_loop_exit=automatic_loop_exit,
-            automatic_loop_exit_threshold=automatic_loop_exit_threshold
+            automatic_loop_exit_threshold=automatic_loop_exit_threshold,
+            use_loop_concat=use_loop_concat
         )
 
     def forward(

@@ -54,13 +54,6 @@ python test_inference --config your_config_path --checkpoint your_checkpoint_pat
 
 
 
-### Paper Notes: 
-
-
-#### Ablations
-
-To investigate the effect of molecular (in) validity of model outputs, we train a model to produce the SELFIES encoding of molecules instead of SMILES. The results are provided in Table 4. 
-
 
 
 

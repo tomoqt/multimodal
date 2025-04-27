@@ -682,7 +682,8 @@ def load_config(config_path=None):
             'max_loops': 1,
             'loop_range': [0, 5],  # Range for uniform sampling of loop count during training
             'automatic_loop_exit': False, # Add new flag
-            'automatic_loop_exit_threshold': 0.01 # Add threshold
+            'automatic_loop_exit_threshold': 0.01, # Add threshold
+            'use_loop_concat': True # Add new flag for loop concatenation
         },
         'training': {
             'batch_size': 32,
@@ -1001,7 +1002,8 @@ def main():
         max_loops=max(config['model'].get('max_loops', 1), max(config['model'].get('loop_range', [0, 1]))),
         loops_representation=config['model'].get('loops_representation', False),
         automatic_loop_exit=config['model'].get('automatic_loop_exit', False), # Pass flag
-        automatic_loop_exit_threshold=config['model'].get('automatic_loop_exit_threshold', 0.01) # Pass threshold
+        automatic_loop_exit_threshold=config['model'].get('automatic_loop_exit_threshold', 0.01), # Pass threshold
+        use_loop_concat=config['model'].get('use_loop_concat', True) # Pass loop concat flag
     )
     
     # Set precision for training based on configuration

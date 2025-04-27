@@ -185,7 +185,8 @@ class SMILESDecoder(nn.Module):
         max_loops: int = 1,  # Maximum number of times to loop the middle layer
         loops_representation: bool = False, #flag to track and return representations across loops
         automatic_loop_exit: bool = False, # flag to automatically exit loops based on convergence of representations
-        automatic_loop_exit_threshold: float = 0.01 # threshold for automatic loop exit
+        automatic_loop_exit_threshold: float = 0.01, # threshold for automatic loop exit
+        use_loop_concat:bool = True
     ):
         super().__init__()
         
@@ -206,6 +207,9 @@ class SMILESDecoder(nn.Module):
         # Separate embeddings with different vocabulary sizes
         self.smiles_embed = nn.Embedding(smiles_vocab_size, embed_dim)
         self.nmr_embed = nn.Embedding(nmr_vocab_size, embed_dim)
+        self.use_loop_concat = use_loop_concat
+        if use_loop_concat:
+            self.loop_concat_adapter = nn.Linear(2*embed_dim, embed_dim) #adapts concatenation of original input to input dim of looped block. 
         
         # Add input projection for memory if dimensions don't match
         self.memory_proj = nn.Identity() if ir_as_prompt else (nn.Linear(memory_dim, embed_dim) if memory_dim != embed_dim else nn.Identity())
@@ -363,12 +367,17 @@ class SMILESDecoder(nn.Module):
                         # Generate Gaussian noise with proper scaling
                         noise = th.randn_like(x) * noise_scale
                         # Add noise to the input
-                        x = x + noise
+                        if self.use_loop_concat:
+                            x = self.loop_concat_adapter(th.cat([x, noise], dim=-1))
+                        else:
+                            x = x + noise
                         if self.verbose:
                             print(f"Added Gaussian noise with scale {noise_scale:.6f} to first loop iteration")
                     else:
-                                            
-                        x = x_original + x# Add the original input back to the residual stream before each iteration, as in https://arxiv.org/pdf/2502.05171
+                        if self.use_loop_concat:
+                            x = self.loop_concat_adapter(th.cat([x_original, x], dim=-1))
+                        else:
+                            x = x_original + x# Add the original input back to the residual stream before each iteration, as in https://arxiv.org/pdf/2502.05171
                     
                     # Process through the layer
                     
