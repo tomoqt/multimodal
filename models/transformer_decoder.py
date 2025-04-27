@@ -349,7 +349,7 @@ class SMILESDecoder(nn.Module):
         # Process through decoder layers with looping for the middle layer
         for i, layer in enumerate(self.layers):
             # For the middle layer, loop num_loops times
-            if i == middle_idx and num_loops > 1:
+            if i == middle_idx and num_loops >= 1:
                 if self.verbose:
                     print(f"Looping middle layer (layer {middle_idx}) {num_loops} times")
                 
