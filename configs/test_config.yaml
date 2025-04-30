@@ -5,14 +5,14 @@ model:
   max_nmr_length: 190
   max_memory_length: 32
   embed_dim: 512
-  num_heads: 4
-  num_layers: 8
+  num_heads: 8
+  num_layers: 4
   dropout: 0.0
   resample_size: 1000
   use_stablemax: False
   ir_encoder_type: convnext #regular, convnext
   loop_range: [1, 30]
-  max_loops: 1000
+  max_loops: 200
   automatic_loop_exit: False
   automatic_loop_exit_threshold: 0.01
   use_loop_concat: True
@@ -30,7 +30,7 @@ training:
   test_batch_size: 1
   num_epochs: 10
   learning_rate: 1.0e-3  # This will be used for AdamW components
-  min_learning_rate: 1.0e-4
+  min_learning_rate: 1.0e-5
   weight_decay: 0.1
   validation_frequency: 1000
   logging_frequency: 10
