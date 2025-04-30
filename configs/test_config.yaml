@@ -12,16 +12,17 @@ model:
   use_stablemax: False
   ir_encoder_type: convnext #regular, convnext
   loop_range: [1, 30]
-  max_loops: 30
+  max_loops: 1000
   automatic_loop_exit: False
   automatic_loop_exit_threshold: 0.01
   use_loop_concat: True
-
-
+  log_normal_poisson: True
+  log_normal_mean: 32.0
+  log_normal_std: 0.5 
 # Checkpoint Configuration
-checkpoint:
-  load_path: "checkpoints/latest_checkpoint.pt"  # Path to the checkpoint file
-  reset_optimizer: False        
+#checkpoint:
+ # load_path: "checkpoints/latest_checkpoint.pt"  # Path to the checkpoint file
+ # reset_optimizer: False        
 # Training Parameters
 training:
   precision: "fp16"  # Controls training precision (fp32, fp16, bf16)

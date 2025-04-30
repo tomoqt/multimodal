@@ -697,7 +697,8 @@ def load_config(config_path=None):
             'generate_during_training': False,
             'save_local': False,
             'greedy_decode_frequency': 1000,
-            'weight_decay': 0.01
+            'weight_decay': 0.01,
+            'use_torch_compile': False # Add flag for torch compile
         },
         'scheduler': {
             'type': 'constant',  # or 'cosine'
@@ -713,7 +714,7 @@ def load_config(config_path=None):
             'log_examples': True
         },
         'optimizer': {
-            'type': 'adamw',  # Options: 'adamw', 'foreachadopt', 'ortho_adamw', 'foreachmuon', 'muon_mix'
+            'type': 'adamw',  # Options: 'adamw', 'ortho_adamw', 'muon_mix'
             'adamw': {
                 'betas': (0.9, 0.999),
                 'eps': 1e-8,
@@ -867,6 +868,7 @@ def parse_args():
     parser.add_argument('--config', type=str, help='Path to config file')
     parser.add_argument('--block-ir', action='store_true', help='Block IR signals in the model inputs')
     parser.add_argument('--block-nmr', action='store_true', help='Block NMR signals in the model inputs')
+    parser.add_argument('--use-torch-compile', action='store_true', help='Enable torch.compile for the model') # Add argument
     
     # Add help argument manually
     parser.add_argument('-h', '--help', action='help', default=argparse.SUPPRESS,
@@ -1049,6 +1051,17 @@ def main():
     # Move model to device (always in default precision)
     model = model.to(device)
     
+    # Compile the model for potential performance boost if enabled in config
+    if config['training'].get('use_torch_compile', False):
+        print("[Main] Compiling the model...")
+        try:
+            model = torch.compile(model) # Add compilation step
+            print("[Main] Model compilation complete.")
+        except Exception as e:
+            print(f"[Main] Model compilation failed: {e}")
+    else:
+        print("[Main] Skipping torch.compile based on configuration.")
+
     # Do NOT wrap model with DDP - we'll handle gradient synchronization manually
     # if torch.distributed.is_initialized():
     #     model = DDP(model, device_ids=[rank], output_device=rank)
@@ -1102,26 +1115,8 @@ def main():
     # Initialize optimizer based on config
     optimizer_type = config.get('optimizer', {}).get('type', 'adamw')
     
-    if optimizer_type == 'foreachadopt':
-        optimizer = heavyball.ForeachADOPT(
-            model.parameters(), 
-            lr=config['training']['learning_rate'],
-            caution=config['optimizer']['foreachadopt'].get('caution', True)
-        )
-        optimizers = [optimizer]
-    elif optimizer_type == 'foreachmuon':
-        optimizer = heavyball.ForeachMuon(
-            model.parameters(),
-            lr=config['training']['learning_rate'],
-            betas=config['optimizer']['foreachmuon'].get('betas', (0.9, 0.99)),
-            eps=config['optimizer']['foreachmuon'].get('eps', 1e-8),
-            weight_decay=config['training']['weight_decay'],  # Use weight decay from training config
-            warmup_steps=config['optimizer']['foreachmuon'].get('warmup_steps', 0),
-            beta2_scale=config['optimizer']['foreachmuon'].get('beta2_scale', 0.8),
-            nesterov=config['optimizer']['foreachmuon'].get('nesterov', True),
-        )
-        optimizers = [optimizer]
-    elif optimizer_type == 'muon_mix':
+
+    if optimizer_type == 'muon_mix':
         # Directly use the approach from the Muon repository
         # Filter parameters by dimensionality
         matrix_params = [p for p in model.parameters() if p.ndim >= 2]
@@ -1199,25 +1194,15 @@ def main():
             **base_args
         )
         optimizers = [optimizer]
-    else:  # AdamW variants
-        use_caution = config['optimizer']['adamw'].get('caution', False)
-        if use_caution:
-            optimizer = heavyball.AdamW(
-                model.parameters(),
-                lr=config['training']['learning_rate'],
-                betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
-                eps=config['optimizer']['adamw'].get('eps', 1e-8),
-                weight_decay=config['training']['weight_decay'],  # Use weight decay from training config
-                caution=True
-            )
-        else:
-            optimizer = optim.AdamW(
-                model.parameters(),
-                lr=config['training']['learning_rate'],
-                betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
-                eps=config['optimizer']['adamw'].get('eps', 1e-8),
-                weight_decay=config['training']['weight_decay']  # Use weight decay from training config
-            )
+    else:  # Default to AdamW
+        # Remove heavyball.AdamW variant and caution check
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config['training']['learning_rate'],
+            betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
+            eps=config['optimizer']['adamw'].get('eps', 1e-8),
+            weight_decay=config['training']['weight_decay']  # Use weight decay from training config
+        )
         optimizers = [optimizer]
 
     print(f"[Main] Using optimizer: {optimizer_type}")
@@ -1225,11 +1210,7 @@ def main():
         print(f"      - Base optimizer: AdamW")
         print(f"      - Orthogonalization eps: {config['optimizer']['ortho'].get('eps', 1e-30)}")
         print(f"      - Rescale gradients: {config['optimizer']['ortho'].get('rescale', True)}")
-    elif optimizer_type == 'foreachmuon':
-        print(f"      - Betas: {config['optimizer']['foreachmuon'].get('betas', (0.9, 0.99))}")
-        print(f"      - Weight decay: {config['training']['weight_decay']}")
-        print(f"      - Beta2 scale: {config['optimizer']['foreachmuon'].get('beta2_scale', 0.8)}")
-        print(f"      - Nesterov: {config['optimizer']['foreachmuon'].get('nesterov', True)}")
+
     elif optimizer_type == 'muon_mix':
         print(f"      - Muon config:")
         print(f"        - Learning rate: {config['optimizer'].get('muon', {}).get('lr', 0.02)}")
@@ -1412,13 +1393,35 @@ def main():
                 loop_range = config['model'].get('loop_range', None)
                 automatic_loop_exit = config['model'].get('automatic_loop_exit', False)
                 max_loops = config['model'].get('max_loops', 1)
+                log_normal_poisson = config['model'].get('log_normal_poisson', False)
+                log_normal_mean = config['model'].get('log_normal_mean', 1.0)
+                log_normal_std = config['model'].get('log_normal_std', 0.5)
                 num_loops = None
                 if automatic_loop_exit:
                     num_loops = max_loops # Use max_loops when auto exit is on
                 elif loop_range: # Only sample if auto exit is off and loop_range is defined
                     min_loops, max_loops_range = loop_range
                     num_loops = torch.randint(min_loops, max_loops_range + 1, (1,)).item()
-                    print(f"num_loops: {num_loops}")
+                elif log_normal_poisson:
+                    # Define the parameters for the Normal distribution of τ
+                    # Assuming log_normal_mean corresponds to r_bar and log_normal_std to sigma
+                    mean_tau = torch.log(torch.tensor(log_normal_mean)) - 0.5 * torch.tensor(log_normal_std)**2
+                    std_tau = torch.tensor(log_normal_std) # Use sigma directly, not log(sigma)
+                    
+                    # Create the Normal distribution object
+                    normal_dist = torch.distributions.Normal(mean_tau, std_tau)
+                    
+                    # Sample τ from the Normal distribution
+                    tau = normal_dist.sample((1,)).item() # Sample τ ~ N(mean_tau, std_tau)
+                    
+                    # Calculate the rate for the Poisson distribution: exp(τ)
+                    # Ensure rate is positive
+                    rate = torch.exp(torch.tensor(tau)).item()
+                    rate = max(rate, 1e-6) # Avoid non-positive rates for Poisson
+
+                    # Sample from Poisson(rate=exp(τ)) and add 1
+                    poisson_sample = torch.poisson(torch.tensor(rate)).item()
+                    num_loops = int(poisson_sample) + 1
 
                 else:
                      num_loops = 1 # Default to 1 loop if no range and no auto exit
@@ -1600,7 +1603,6 @@ def main():
                 # Step all optimizers
                 for opt in optimizers:
                     opt.step()
-            
             # Step the scheduler regardless of precision mode
             scheduler.step()
             
