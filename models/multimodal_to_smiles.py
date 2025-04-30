@@ -17,7 +17,8 @@ class MultiModalToSMILESModel(nn.Module):
         resample_size: int = 1000,
         use_concat: bool = True,
         verbose: bool = False,
-        domain_ranges: list | None = None
+        domain_ranges: list | None = None,
+        use_mlp_for_nmr: bool = True
     ):
         super().__init__()
         
@@ -34,7 +35,8 @@ class MultiModalToSMILESModel(nn.Module):
             resample_size=resample_size,
             use_concat=use_concat,
             verbose=verbose,
-            domain_ranges=domain_ranges
+            domain_ranges=domain_ranges,
+            use_mlp_for_nmr=use_mlp_for_nmr
         )
         
         # Calculate decoder input dimension
