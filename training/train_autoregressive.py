@@ -1630,31 +1630,109 @@ def main():
             # Periodic validation
             if global_step % validation_frequency == 0:
                 print(f"\nRunning validation at step {global_step}...")
-                val_metrics = validate(model, val_loader, criterion, tokenizer, device, block_ir, block_nmr)
-                
-                # Clean wandb cache periodically (every 5 validation steps)
-                if (global_step // validation_frequency) % 5 == 0:
-                    cleanup_wandb_cache()
-                
-                # Create a new table for each validation step
-                examples_table = wandb.Table(columns=columns)
-                
-                # Log results - sample 10 random examples for logging
-                if val_metrics['predictions']:
-                    # Randomly sample 10 indices
-                    num_examples = len(val_metrics['predictions'])
-                    sample_indices = np.random.choice(
-                        num_examples, 
-                        min(10, num_examples), 
-                        replace=False
+                # Only validate on rank 0
+                if rank == 0:
+                    val_metrics = validate(model, val_loader, criterion, tokenizer, device, block_ir, block_nmr)
+
+                    # Clean wandb cache periodically (every 5 validation steps)
+                    if (global_step // validation_frequency) % 5 == 0:
+                        cleanup_wandb_cache()
+
+                    # Create a new table for each validation step
+                    examples_table = wandb.Table(columns=columns)
+
+                    # Log results - sample 10 random examples for logging
+                    if val_metrics['predictions']:
+                        # Randomly sample 10 indices
+                        num_examples = len(val_metrics['predictions'])
+                        sample_indices = np.random.choice(
+                            num_examples,
+                            min(10, num_examples),
+                            replace=False
+                        )
+
+                        for idx in sample_indices:
+                            pred = val_metrics['predictions'][idx]
+                            tgt = val_metrics['targets'][idx]
+                            # Calculate metrics for this pair
+                            pair_results = evaluate_predictions([pred], [tgt])[0]
+                            examples_table.add_data(
+                                global_step,
+                                pred,
+                                tgt,
+                                pair_results['exact_match'],
+                                pair_results['tanimoto'],
+                                pair_results['#mcs/#target'],
+                                pair_results['ecfp6_iou']
+                            )
+
+                    # Log metrics
+                    log_wandb({
+                        "val_loss": val_metrics['val_loss'],
+                        "val_valid_smiles": val_metrics['valid_smiles_rate'],
+                        "val_exact_matches": val_metrics['exact_match_rate'],
+                        "val_exact_matches_all": val_metrics['exact_match_all_rate'],
+                        "val_tanimoto": val_metrics['tanimoto_similarity'],
+                        "val_mcs_ratio": val_metrics['mcs_ratio'],
+                        "val_ecfp6_iou": val_metrics['ecfp6_iou'],
+                        "val_examples": examples_table,  # Log new table each time
+                        "global_step": global_step
+                    }, step=global_step)
+
+                    print(f"[Val] Loss: {val_metrics['val_loss']:.4f}")
+
+                    # Save model periodically (outside validation check)
+                    # Condition saving on rank 0 and frequency
+                    if global_step % config['training']['save_model_frequency'] == 0:
+                        print(f"\nSaving model checkpoint at step {global_step}...")
+
+                        # Get current validation metrics if available
+                        current_val_loss = val_metrics.get('val_loss', float('inf')) # Use .get for safety
+
+                        # Save checkpoint and manage storage
+                        is_best = current_val_loss < best_val_loss
+                        if is_best:
+                            best_val_loss = current_val_loss
+                            print(f"New best validation loss: {best_val_loss:.4f}")
+
+                        # Saving is already rank-aware inside save_checkpoint
+                        save_checkpoint(
+                            model=model,
+                            optimizers=optimizers,  # Pass all optimizers
+                            epoch=epoch,
+                            global_step=global_step,
+                            val_loss=current_val_loss,
+                            is_best=is_best
+                        )
+
+                        print(f"[Main] Model checkpoint saved at step {global_step}")
+                else:
+                    # Ensure all processes wait if not validating/saving
+                    if torch.distributed.is_initialized():
+                        torch.distributed.barrier()
+
+
+            # Periodic greedy decode evaluation
+            if global_step % greedy_decode_frequency == 0:
+                print(f"\nRunning greedy decode evaluation at step {global_step}...")
+                # Only run greedy decode on rank 0
+                if rank == 0:
+                    greedy_metrics = evaluate_with_greedy_decode(
+                        model=model,
+                        test_loader=test_loader, # Use test_loader for greedy eval
+                        tokenizer=tokenizer,
+                        device=device,
+                        num_loops=None
                     )
-                    
-                    for idx in sample_indices:
-                        pred = val_metrics['predictions'][idx]
-                        tgt = val_metrics['targets'][idx]
+
+                    # Create a new table for greedy decode examples
+                    greedy_table = wandb.Table(columns=columns)
+
+                    # Log sample results
+                    for pred, tgt in zip(greedy_metrics['predictions'], greedy_metrics['targets']):
                         # Calculate metrics for this pair
                         pair_results = evaluate_predictions([pred], [tgt])[0]
-                        examples_table.add_data(
+                        greedy_table.add_data(
                             global_step,
                             pred,
                             tgt,
@@ -1663,131 +1741,81 @@ def main():
                             pair_results['#mcs/#target'],
                             pair_results['ecfp6_iou']
                         )
-                
-                # Log metrics
-                log_wandb({
-                    "val_loss": val_metrics['val_loss'],
-                    "val_valid_smiles": val_metrics['valid_smiles_rate'],
-                    "val_exact_matches": val_metrics['exact_match_rate'],
-                    "val_exact_matches_all": val_metrics['exact_match_all_rate'],
-                    "val_tanimoto": val_metrics['tanimoto_similarity'],
-                    "val_mcs_ratio": val_metrics['mcs_ratio'],
-                    "val_ecfp6_iou": val_metrics['ecfp6_iou'],
-                    "val_examples": examples_table,  # Log new table each time
-                    "global_step": global_step
-                }, step=global_step)
-                
-                print(f"[Val] Loss: {val_metrics['val_loss']:.4f}")
 
-                # Save model periodically (outside validation check)
-                if global_step % config['training']['save_model_frequency'] == 0:
-                    print(f"\nSaving model checkpoint at step {global_step}...")
-                    
-                    # Get current validation metrics if available
-                    current_val_loss = val_metrics['val_loss'] if 'val_metrics' in locals() else float('inf')
-                    
-                    # Save checkpoint and manage storage
-                    is_best = current_val_loss < best_val_loss
-                    if is_best:
-                        best_val_loss = current_val_loss
-                        print(f"New best validation loss: {best_val_loss:.4f}")
-                    
-                    save_checkpoint(
-                        model=model,
-                        optimizers=optimizers,  # Pass all optimizers
-                        epoch=epoch,
-                        global_step=global_step,
-                        val_loss=current_val_loss,
-                        is_best=is_best
-                    )
-                    
-                    print(f"[Main] Model checkpoint saved at step {global_step}")
+                    # Log metrics
+                    log_wandb({
+                        "greedy_valid_smiles": greedy_metrics['valid_smiles'],
+                        "greedy_exact_matches": greedy_metrics['exact_match'],
+                        "greedy_exact_matches_all": greedy_metrics['exact_match_all'],
+                        "greedy_tanimoto": greedy_metrics['avg_tanimoto'],
+                        "greedy_mcs_ratio": greedy_metrics['avg_#mcs/#target'],
+                        "greedy_ecfp6_iou": greedy_metrics['avg_ecfp6_iou'],
+                        "greedy_examples": greedy_table,
+                        "global_step": global_step
+                    }, step=global_step)
 
-            # Periodic greedy decode evaluation
-            if global_step % greedy_decode_frequency == 0:
-                print(f"\nRunning greedy decode evaluation at step {global_step}...")
-                greedy_metrics = evaluate_with_greedy_decode(
-                    model=model,
-                    test_loader=test_loader,
-                    tokenizer=tokenizer,
-                    device=device,
-                    num_loops=None
-                )
-                
-                # Create a new table for greedy decode examples
-                greedy_table = wandb.Table(columns=columns)
-                
-                # Log sample results
-                for pred, tgt in zip(greedy_metrics['predictions'], greedy_metrics['targets']):
-                    # Calculate metrics for this pair
-                    pair_results = evaluate_predictions([pred], [tgt])[0]
-                    pair_results = evaluate_predictions([pred], [tgt])[0]
-                    greedy_table.add_data(
-                        global_step,
-                        pred,
-                        tgt,
-                        pair_results['exact_match'],
-                        pair_results['tanimoto'],
-                        pair_results['#mcs/#target'],
-                        pair_results['ecfp6_iou']
-                    )
-                
-                # Log metrics
-                log_wandb({
-                    "greedy_valid_smiles": greedy_metrics['valid_smiles'],
-                    "greedy_exact_matches": greedy_metrics['exact_match'],
-                    "greedy_exact_matches_all": greedy_metrics['exact_match_all'],
-                    "greedy_tanimoto": greedy_metrics['avg_tanimoto'],
-                    "greedy_mcs_ratio": greedy_metrics['avg_#mcs/#target'],
-                    "greedy_ecfp6_iou": greedy_metrics['avg_ecfp6_iou'],
-                    "greedy_examples": greedy_table,
-                    "global_step": global_step
-                }, step=global_step)
-                
-                print(f"[Greedy] Valid SMILES: {greedy_metrics['valid_smiles']:.2%}")
-                print(f"[Greedy] Exact matches: {greedy_metrics['exact_match']:.2%}")
-                print(f"[Greedy] Tanimoto similarity: {greedy_metrics['avg_tanimoto']:.4f}")
+                    print(f"[Greedy] Valid SMILES: {greedy_metrics['valid_smiles']:.2%}")
+                    print(f"[Greedy] Exact matches: {greedy_metrics['exact_match']:.2%}")
+                    print(f"[Greedy] Tanimoto similarity: {greedy_metrics['avg_tanimoto']:.4f}")
+                else:
+                     # Ensure all processes wait if not evaluating
+                     if torch.distributed.is_initialized():
+                         torch.distributed.barrier()
 
         avg_epoch_loss = epoch_loss / max(num_batches, 1)
         print(f"Epoch {epoch+1} completed | Average Loss: {avg_epoch_loss:.4f}")
 
-    # Final test set evaluation
-    print("\n[Main] Evaluating on test set...")
-    final_test_loss = validate(model, test_loader, criterion, tokenizer, device, block_ir, block_nmr)
-    log_wandb({"test_loss": final_test_loss['val_loss']}, step=global_step)
-    print(f"[Test] Loss: {final_test_loss['val_loss']:.4f}")
+    # Final test set evaluation - Only on rank 0
+    final_test_metrics = {}
+    if rank == 0:
+        print("\n[Main] Evaluating on test set...")
+        final_test_metrics = validate(model, test_loader, criterion, tokenizer, device, block_ir, block_nmr)
+        log_wandb({"test_loss": final_test_metrics.get('val_loss', float('inf'))}, step=global_step)
+        print(f"[Test] Loss: {final_test_metrics.get('val_loss', float('inf')):.4f}")
+    else:
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
-    # Final greedy decode evaluation
-    print("\n[Main] Running final greedy decode evaluation...")
-    final_greedy_metrics = evaluate_with_greedy_decode(
-        model=model,
-        test_loader=test_loader,
-        tokenizer=tokenizer,
-        device=device,
-        num_loops=None
-    )
-    log_wandb({
-        "final_greedy_valid_smiles": final_greedy_metrics['valid_smiles'],
-        "final_greedy_exact_matches": final_greedy_metrics['exact_match'],
-        "final_greedy_tanimoto": final_greedy_metrics['avg_tanimoto'],
-        "final_greedy_mcs_ratio": final_greedy_metrics['avg_#mcs/#target'],
-        "final_greedy_ecfp6_iou": final_greedy_metrics['avg_ecfp6_iou']
-    }, step=global_step)
-    print(f"[Final Greedy] Valid SMILES: {final_greedy_metrics['valid_smiles']:.2%}")
-    print(f"[Final Greedy] Exact matches: {final_greedy_metrics['exact_match']:.2%}")
-    print(f"[Final Greedy] Tanimoto similarity: {final_greedy_metrics['avg_tanimoto']:.4f}")
 
-    # Save final model if requested
-    if config['training'].get('save_local', False):
-        save_checkpoint(
+    # Final greedy decode evaluation - Only on rank 0
+    final_greedy_metrics = {}
+    if rank == 0:
+        print("\n[Main] Running final greedy decode evaluation...")
+        final_greedy_metrics = evaluate_with_greedy_decode(
             model=model,
-            optimizers=optimizers,  # Pass all optimizers
-            epoch=NUM_EPOCHS,
-            global_step=global_step,
-            val_loss=final_test_loss['val_loss'],
-            is_best=final_test_loss['val_loss'] < best_val_loss
+            test_loader=test_loader,
+            tokenizer=tokenizer,
+            device=device,
+            num_loops=None
         )
-        print(f"Final checkpoint saved in {save_dir}")
+        log_wandb({
+            "final_greedy_valid_smiles": final_greedy_metrics.get('valid_smiles', 0.0),
+            "final_greedy_exact_matches": final_greedy_metrics.get('exact_match', 0.0),
+            "final_greedy_tanimoto": final_greedy_metrics.get('avg_tanimoto', 0.0),
+            "final_greedy_mcs_ratio": final_greedy_metrics.get('avg_#mcs/#target', 0.0),
+            "final_greedy_ecfp6_iou": final_greedy_metrics.get('avg_ecfp6_iou', 0.0)
+        }, step=global_step)
+        print(f"[Final Greedy] Valid SMILES: {final_greedy_metrics.get('valid_smiles', 0.0):.2%}")
+        print(f"[Final Greedy] Exact matches: {final_greedy_metrics.get('exact_match', 0.0):.2%}")
+        print(f"[Final Greedy] Tanimoto similarity: {final_greedy_metrics.get('avg_tanimoto', 0.0):.4f}")
+    else:
+         if torch.distributed.is_initialized():
+             torch.distributed.barrier()
+
+
+    # Save final model if requested - Only on rank 0
+    if rank == 0:
+        if config['training'].get('save_local', False):
+            current_val_loss = final_test_metrics.get('val_loss', float('inf'))
+            save_checkpoint(
+                model=model,
+                optimizers=optimizers,  # Pass all optimizers
+                epoch=NUM_EPOCHS,
+                global_step=global_step,
+                val_loss=current_val_loss,
+                is_best=current_val_loss < best_val_loss
+            )
+            print(f"Final checkpoint saved in {save_dir}")
 
     print("[Main] Training script completed.")
     if rank == 0 and wandb.run is not None:
