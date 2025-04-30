@@ -92,3 +92,5 @@ smiles_statistics/
 pretrain_data/
 pretrained_decoder/
 sweep_results/
+inference_results/
+checkpoints_rl/

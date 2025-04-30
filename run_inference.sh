@@ -1,0 +1,2 @@
+#!/bin/bash
+python test_inference.py --config configs/test_config.yaml --checkpoint /home/consorzio/Technoscience/Research/multimodal/checkpoints/best_model.pt --max_loops 10 --full_dataset_test --max_examples 50 

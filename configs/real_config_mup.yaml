@@ -14,7 +14,7 @@ model:
 
 # Training Parameters with muP settings
 training:
-  batch_size: 32
+  batch_size: 64
   test_batch_size: 1
   num_epochs: 10
   d1_horizon: 1000        # Original horizon where best LR was found

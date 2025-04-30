@@ -13,3 +13,7 @@ pyarrow
 transformers
 seaborn
 heavyball
+gradio
+py3Dmol
+gradio_molecule3d
+tabulate

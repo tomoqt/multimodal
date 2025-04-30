@@ -4,38 +4,47 @@ model:
   max_seq_length: 95
   max_nmr_length: 190
   max_memory_length: 32
-  embed_dim: 768
+  embed_dim: 512
   num_heads: 4
   num_layers: 8
   dropout: 0.0
   resample_size: 1000
-  use_stablemax: True
+  use_stablemax: False
+  ir_encoder_type: convnext #regular, convnext
+  loop_range: [0, 0]
+  max_loops: 0
 
 # Training Parameters
 training:
+  precision: "fp16"  # Controls training precision (fp32, fp16, bf16)
   batch_size: 32
   test_batch_size: 1
   num_epochs: 10
-  learning_rate: 1.0e-4
-  min_learning_rate: 1.0e-5
+  learning_rate: 1.0e-3  # This will be used for AdamW components
+  min_learning_rate: 1.0e-4
   weight_decay: 0.1
   validation_frequency: 100
   logging_frequency: 10
   save_frequency: 1000
-  save_model_frequency: 10  # How often to save model to wandb (in steps)
-  greedy_decode_frequency: 100
+  save_model_frequency: 1000 # How often to save model to wandb (in steps)
+  greedy_decode_frequency: 500
 
 # Optimizer Configuration
 optimizer:
-  type: ortho_adamw  # Use orthogonal gradient optimization
-  adamw:  # Base optimizer settings
+  type: muon_mix  # Use Muon for matrices and AdamW for vectors/scalars
+  adamw:  # Settings for vector parameters (< 2D)
     betas: [0.9, 0.999]
     eps: 1.0e-8
-    weight_decay: 0.01
+    weight_decay: 0.1
     caution: false
-  ortho:  # Orthogonal gradient settings
-    eps: 1.0e-30
-    rescale: true
+  muon:  # Settings for matrix parameters (≥ 2D)
+    lr: 1.0e-3
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    orthogonalize: False
+    ortho_eps: 1.0e-30
+    ortho_rescale: true
 
 # Scheduler
 scheduler:
@@ -51,9 +60,29 @@ data:
   test_size: 20
   val_size: 0.001
   preprocessed: False
+  ir_as_prompt: False
+  ir_tokenizer_path: "tokenized_baseline/ir_processed/ir_vocab.json"
 
 # Logging
 wandb:
   project: "smiles-generation"
-  base_run_name: "smiles_gen"
+  base_run_name: "muon_mix"  # Changed to reflect the optimizer being used
   log_examples: true 
+
+
+rl:
+  grpo:
+    group_size: 8
+    micro_group_size: 1
+    batch_size: 1
+    max_iterations: 10000
+    learning_rate: 1.0e-5    # Added default learning rate for GRPO
+    epsilon: 1           # Added default epsilon for GRPO
+    beta: 0.1           # Added default beta for GRPO
+    temperature: 1       # Added default temperature for GRPO
+    log_wandb: True     # Added default for logging wandb
+    exact_match_reward: True
+    tanimoto_reward: True
+    ecfp6_reward: True
+    valid_smiles_reward: True
+    mcs_ratio_reward: True
