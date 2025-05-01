@@ -34,7 +34,8 @@ class MultiModalToSMILESModel(nn.Module):
         loops_representation: bool = False,
         automatic_loop_exit: bool = False,
         automatic_loop_exit_threshold: float = 0.01,
-        use_loop_concat: bool = True
+        use_loop_concat: bool = True,
+        loop_radius: int = 0
     ):
         """
         Args:
@@ -56,7 +57,8 @@ class MultiModalToSMILESModel(nn.Module):
             loops_representation: Whether to track and return representations across loops.
             automatic_loop_exit: Whether to enable automatic exiting from middle layer loops based on representation convergence.
             automatic_loop_exit_threshold: The threshold for convergence detection when automatic_loop_exit is enabled.
-            use_loop_concat: Whether to concatenate original input with looped input in the middle layer.
+            use_loop_concat: Whether the decoder uses concatenation within its loops.
+            loop_radius: Radius of layers around the center to loop in the decoder.
         """
         super().__init__()
         self.verbose = verbose
@@ -99,7 +101,8 @@ class MultiModalToSMILESModel(nn.Module):
             loops_representation=loops_representation,
             automatic_loop_exit=automatic_loop_exit,
             automatic_loop_exit_threshold=automatic_loop_exit_threshold,
-            use_loop_concat=use_loop_concat
+            use_loop_concat=use_loop_concat,
+            loop_radius=loop_radius
         )
 
     def forward(
@@ -108,7 +111,7 @@ class MultiModalToSMILESModel(nn.Module):
         ir_data: th.Tensor | None,
         target_seq: th.Tensor | None = None,
         target_mask: th.Tensor | None = None,
-        num_loops: int = None
+        num_loops: list = None
     ):
         """
         Args:
@@ -116,7 +119,7 @@ class MultiModalToSMILESModel(nn.Module):
             ir_data:    IR data, shape (B, L).
             target_seq: Token IDs for SMILES, shape (B, T).
             target_mask: Optional causal mask for the target sequence.
-            num_loops: Number of times to loop the middle layer in the decoder.
+            num_loops: List specifying loop counts for each layer in the decoder's loop radius.
 
         Returns:
             logits: (B, T, vocab_size), the decoder output for each token.
@@ -168,6 +171,7 @@ class MultiModalToSMILESModel(nn.Module):
         if self.verbose:
             print("\n=== Starting Decoding ===")
             print(f"Encoder Output (memory) shape: {memory.shape}")
+            print(f"[Debug MultiModal Before Call] Type: {type(num_loops)}, Value: {num_loops}") # DEBUG
 
         # 2) Decode to SMILES: target_seq => shape (B, T)
         logits = self.decoder(target_seq, memory, nmr_tokens, num_loops=num_loops)

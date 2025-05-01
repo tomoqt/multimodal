@@ -186,7 +186,8 @@ class SMILESDecoder(nn.Module):
         loops_representation: bool = False, #flag to track and return representations across loops
         automatic_loop_exit: bool = False, # flag to automatically exit loops based on convergence of representations
         automatic_loop_exit_threshold: float = 0.01, # threshold for automatic loop exit
-        use_loop_concat:bool = True
+        use_loop_concat:bool = True,
+        loop_radius: int = 0 # layers to loop at a distance of loop_radius from the innermost layer.
     ):
         super().__init__()
         
@@ -210,7 +211,7 @@ class SMILESDecoder(nn.Module):
         self.use_loop_concat = use_loop_concat
         if use_loop_concat:
             self.loop_concat_adapter = nn.Linear(2*embed_dim, embed_dim) #adapts concatenation of original input to input dim of looped block. 
-        
+        self.loop_radius = loop_radius
         # Add input projection for memory if dimensions don't match
         self.memory_proj = nn.Identity() if ir_as_prompt else (nn.Linear(memory_dim, embed_dim) if memory_dim != embed_dim else nn.Identity())
         
@@ -233,7 +234,7 @@ class SMILESDecoder(nn.Module):
         # Output projection to SMILES vocabulary
         self.out = nn.Linear(embed_dim, smiles_vocab_size)
         
-    def forward(self, tgt: th.Tensor, memory: th.Tensor, nmr_tokens: th.Tensor = None, num_loops: int = None):
+    def forward(self, tgt: th.Tensor, memory: th.Tensor, nmr_tokens: th.Tensor = None, num_loops: list | int = None):
         """ inputs:
             tgt: target sequence tensor, shape (B, T)
             memory: memory tensor from IR encoder, shape (B, S, D)
@@ -251,11 +252,18 @@ class SMILESDecoder(nn.Module):
                 print(f"NMR tokens: {nmr_tokens.shape}")
 
         # Use default num_loops if not specified
+        num_looping_layers = 2 * self.loop_radius + 1 # Calculate expected list length
         if num_loops is None:
-            num_loops = 1  # Default is 1 (no extra looping)
-        
+            # Default to a list of 1s with length based on loop_radius
+            num_loops = [1] * num_looping_layers
+        elif isinstance(num_loops, int):
+            # Convert integer input to the expected list format
+            num_loops = [num_loops] * num_looping_layers
+
         # Ensure num_loops doesn't exceed max_loops
-        num_loops = min(num_loops, self.max_loops)
+        # Assume num_loops is a list after default assignment, cap values
+        num_loops = [min(loop, self.max_loops) for loop in num_loops]
+
         # Check and enforce target sequence length limits
         if T > self.max_seq_length:
             if self.verbose:
@@ -345,24 +353,24 @@ class SMILESDecoder(nn.Module):
 
         # Identify the middle layer (using integer division)
         middle_idx = self.num_layers // 2
-        
+        looping_indices = list(range(middle_idx-self.loop_radius, middle_idx+self.loop_radius+1))
         # Process through decoder layers with looping for the middle layer
         for i, layer in enumerate(self.layers):
             # For the middle layer, loop num_loops times
-            if i == middle_idx and num_loops >= 1:
+            if i in looping_indices and num_loops[i-middle_idx+self.loop_radius] >= 1:
                 if self.verbose:
-                    print(f"Looping middle layer (layer {middle_idx}) {num_loops} times")
+                    print(f"Looping middle layer (layer {i}) {num_loops[i-middle_idx+self.loop_radius]} times")
                 
                 # Store the original input to the middle layer
                 x_original = x.clone()
                 
-                # Loop through the middle layer num_loops times
-                for loop_idx in range(num_loops):
+                # Loop through the looping layer num_loops times
+                for loop_idx in range(num_loops[i-middle_idx+self.loop_radius]): # num_loops index is gonna be representing layers in a radius k from middle. this means num_loops 0 has  i= middle_idx- radius
                     
                     # Add Gaussian noise ONLY to the first loop iteration 
-                    if loop_idx == 0:
+                    if loop_idx == 0 and i == middle_idx - self.loop_radius: #only noising at the beginning of all loops
                         # Calculate noise scale with variance = 2/(5*embed_dim)
-                        noise_scale = math.sqrt(2/(5*self.embed_dim))
+                        noise_scale = math.sqrt(2/(5*self.embed_dim))  #from https://arxiv.org/pdf/2502.05171
                         # Generate Gaussian noise with proper scaling
                         noise = th.randn_like(x) * noise_scale
                         # Add noise to the input

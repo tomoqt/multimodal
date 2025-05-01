@@ -75,7 +75,7 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
         temperature: Temperature for sampling (higher = more random, lower = more deterministic)
         sample: If True, sample from the distribution; if False, use greedy decoding (argmax)
         precision: Precision type ('fp32', 'fp16', 'bf16')
-        num_loops: Number of loops for the model to generate
+        num_loops: List specifying loop counts for each layer in the decoder's loop radius
     """
     if device is None:
         device = next(model.parameters()).device
@@ -201,7 +201,7 @@ def canonicalize_smiles(smiles):
         return cleaned
 
 
-def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examples=100, block_ir=False, block_nmr=False, num_loops=None):
+def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examples=100, block_ir=False, block_nmr=False):
     """Evaluate model using greedy decoding with optional IR/NMR blocking"""
     model.eval()
     all_predictions = []
@@ -215,11 +215,20 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
         automatic_loop_exit = config['model'].get('automatic_loop_exit', False)
         automatic_loop_exit_threshold = config['model'].get('automatic_loop_exit_threshold', 0.01)
         max_loops = config['model'].get('max_loops', 1)
+        loop_radius = config['model'].get('loop_radius', 0)
+        num_looping_layers = 2 * loop_radius + 1
     except (NameError, KeyError):
         # Fallback if config is not available (e.g., when called outside main script)
         automatic_loop_exit = False
         automatic_loop_exit_threshold = 0.01
         max_loops = 1
+
+    # Determine num_loops LIST for greedy decoding
+    greedy_num_loops = []
+    if automatic_loop_exit:
+        greedy_num_loops = [max_loops] * num_looping_layers # Use max_loops when auto exit is on
+    else:
+        greedy_num_loops = [1] * num_looping_layers # Default to 1 loop for standard greedy eval
 
     with torch.no_grad():
         for target_tokens, ir_data, nmr_tokens, _ in tqdm(test_loader, desc="Greedy decoding"):
@@ -235,12 +244,6 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
             if nmr_tokens is not None:
                 nmr_tokens = nmr_tokens.to(device)
 
-            # Determine num_loops for greedy decoding
-            if automatic_loop_exit:
-                current_num_loops = max_loops # Use max_loops when auto exit is on
-            else:
-                current_num_loops = 1 # Default to 1 loop for standard greedy eval
-
             predictions = greedy_decode(
                 model=model,
                 nmr_tokens=nmr_tokens,
@@ -249,7 +252,7 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
                 device=device,
                 sample=False,  # Ensure we're using greedy decoding (not sampling) for evaluation
                 precision=precision,  # Pass precision setting
-                num_loops=current_num_loops # Pass the determined number of loops
+                num_loops=greedy_num_loops # Pass the determined list of loop counts
             )
 
             targets = []
@@ -676,14 +679,16 @@ def load_config(config_path=None):
             'num_layers': 6,
             'dropout': 0.1,
             'resample_size': 1000,
-            'use_concat': True,
+            #'use_concat': True,
             'use_stablemax': False,
             'ir_encoder_type': 'regular',
             'max_loops': 1,
             'loop_range': [0, 5],  # Range for uniform sampling of loop count during training
             'automatic_loop_exit': False, # Add new flag
             'automatic_loop_exit_threshold': 0.01, # Add threshold
-            'use_loop_concat': True # Add new flag for loop concatenation
+            'loop_radius': 0,                  # Radius of layers to loop around center in decoder
+            'use_loop_concat': True,           # Whether decoder uses concat+adapter in loops
+            'tied_loop_sampling': False        # If True, sample same loop count for all layers in radius (simulates tied looping)
         },
         'training': {
             'batch_size': 32,
@@ -1005,7 +1010,8 @@ def main():
         loops_representation=config['model'].get('loops_representation', False),
         automatic_loop_exit=config['model'].get('automatic_loop_exit', False), # Pass flag
         automatic_loop_exit_threshold=config['model'].get('automatic_loop_exit_threshold', 0.01), # Pass threshold
-        use_loop_concat=config['model'].get('use_loop_concat', True) # Pass loop concat flag
+        loop_radius=config['model'].get('loop_radius', 0),                  # Radius of layers to loop around center in decoder
+        use_loop_concat=config['model'].get('use_loop_concat', True)       # Whether decoder uses concat+adapter in loops
     )
     
     # Set precision for training based on configuration
@@ -1399,7 +1405,7 @@ def main():
                 num_loops = None
                 if automatic_loop_exit:
                     num_loops = max_loops # Use max_loops when auto exit is on
-                elif loop_range: # Only sample if auto exit is off and loop_range is defined
+                elif loop_range and not log_normal_poisson: # Only sample if auto exit is off and loop_range is defined
                     min_loops, max_loops_range = loop_range
                     num_loops = torch.randint(min_loops, max_loops_range + 1, (1,)).item()
                 elif log_normal_poisson:
@@ -1525,15 +1531,29 @@ def main():
             loop_range = config['model'].get('loop_range', None)
             automatic_loop_exit = config['model'].get('automatic_loop_exit', False)
             max_loops = config['model'].get('max_loops', 1)
-            num_loops = None
+            tied_sampling = config['model'].get('tied_loop_sampling', False)
+            loop_radius = config['model'].get('loop_radius', 0)
+            num_looping_layers = 2 * loop_radius + 1
+
+            train_num_loops = [] # Initialize as list
+
             if automatic_loop_exit:
-                num_loops = max_loops # Use max_loops when auto exit is on
-            elif loop_range: # Only sample if auto exit is off and loop_range is defined
+                # Use max_loops for all layers when auto exit is on during training
+                train_num_loops = [max_loops] * num_looping_layers
+            elif loop_range: # Sample if loop_range is defined and auto exit is off
                 min_loops, max_loops_range = loop_range
-                num_loops = torch.randint(min_loops, max_loops_range + 1, (1,)).item()
+
+                if tied_sampling:
+                    # Sample one value and repeat it
+                    sampled_loop_count = torch.randint(min_loops, max_loops_range + 1, (1,)).item()
+                    train_num_loops = [sampled_loop_count] * num_looping_layers
+                else:
+                    # Sample independently for each layer in the radius
+                    train_num_loops = torch.randint(min_loops, max_loops_range + 1, (num_looping_layers,)).tolist()
             else:
-                 num_loops = 1 # Default to 1 loop if no range and no auto exit
-            
+                # Default to 1 loop per layer if no range and no auto exit
+                train_num_loops = [1] * num_looping_layers
+
             # Zero gradients for all optimizers
             for opt in optimizers:
                 opt.zero_grad()
@@ -1547,7 +1567,7 @@ def main():
                         ir_data=ir_data,
                         target_seq=target_tokens[:, :-1],
                         target_mask=mask[:-1, :-1],
-                        num_loops=num_loops
+                        num_loops=train_num_loops # Pass the generated list
                     )
                     loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
@@ -1588,7 +1608,7 @@ def main():
                     ir_data=ir_data,
                     target_seq=target_tokens[:, :-1],
                     target_mask=mask[:-1, :-1],
-                    num_loops=num_loops
+                    num_loops=train_num_loops # Pass the generated list
                 )
                 loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
@@ -1722,7 +1742,7 @@ def main():
                         test_loader=test_loader, # Use test_loader for greedy eval
                         tokenizer=tokenizer,
                         device=device,
-                        num_loops=None
+                        # num_loops is determined internally based on config
                     )
 
                     # Create a new table for greedy decode examples
@@ -1786,7 +1806,7 @@ def main():
             test_loader=test_loader,
             tokenizer=tokenizer,
             device=device,
-            num_loops=None
+            # num_loops is determined internally based on config
         )
         log_wandb({
             "final_greedy_valid_smiles": final_greedy_metrics.get('valid_smiles', 0.0),
