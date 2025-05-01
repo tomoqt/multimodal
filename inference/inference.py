@@ -192,6 +192,7 @@ class ModelInference:
         max_loops: int = 3,
         automatic_loop_exit: bool = False,
         automatic_loop_exit_threshold: float = 0.01,
+        loop_increase_step: int = 5,
         **kwargs
     ) -> List[str]:
         """
@@ -214,6 +215,7 @@ class ModelInference:
             max_loops: Maximum number of times to loop the middle layer
             automatic_loop_exit: Whether to automatically exit loops based on entropy
             automatic_loop_exit_threshold: Threshold for automatic loop exit
+            loop_increase_step: Amount to increase loop count by when in high-entropy (non-automatic mode) in Entropix
             
         Returns:
             List of decoded sequences or Tuple of (List of decoded sequences, List of loop representations)
@@ -235,7 +237,7 @@ class ModelInference:
             return self.sample_decode(nmr_tokens, ir_data, mass_data, max_len, temperature, top_k, top_p)
         elif strategy == DecodingStrategy.ENTROPIX:
             return self.entropix_decode(nmr_tokens, ir_data, mass_data, max_len, top_k,
-                                       entropy_threshold, varentropy_threshold, max_loops, automatic_loop_exit, automatic_loop_exit_threshold)
+                                       entropy_threshold, varentropy_threshold, max_loops, automatic_loop_exit, automatic_loop_exit_threshold, loop_increase_step)
         else:
             raise ValueError(f"Unknown decoding strategy: {strategy}")
     
@@ -620,7 +622,9 @@ class ModelInference:
         return varentropy.item()
     
     def entropix_decode(self, nmr_tokens, ir_data, mass_data=None, max_len=128, top_k=5, 
-                       entropy_threshold=1.0, varentropy_threshold=0.5, max_loops=3, automatic_loop_exit=False, automatic_loop_exit_threshold=0.01):
+                       entropy_threshold=1.0, varentropy_threshold=0.5, max_loops=3, 
+                       automatic_loop_exit=False, automatic_loop_exit_threshold=0.01, 
+                       loop_increase_step=1):
         """
         Entropix tree search - uses entropy and varentropy to make branching decisions.
         
@@ -635,9 +639,12 @@ class ModelInference:
             max_loops: Maximum number of times to loop the middle layer
             automatic_loop_exit: Whether to automatically exit loops based on entropy
             automatic_loop_exit_threshold: Threshold for automatic loop exit
+            loop_increase_step: Amount to increase loop count by when in high-entropy (non-automatic mode)
             
         Returns:
-            List of decoded sequences
+            Tuple: (List of decoded sequences, List of loop counts per sequence)
+            where loop counts per sequence is a list of lists, each inner list containing
+            the loop count used at each step for the corresponding sequence.
         """
         self.model.eval()
         with torch.no_grad():
@@ -825,7 +832,7 @@ class ModelInference:
                             if previous_high_entropy:
                                 if node.curr_loops >= max_loops:
                                      print(f"Hit maximum loops ({max_loops}) at sequence position {node.length}")
-                                loops_to_request = min(node.curr_loops + 1, max_loops)
+                                loops_to_request = min(node.curr_loops + loop_increase_step, max_loops)
                             else:
                                 # Newly entering high entropy state, start with 1 loop request
                                 # (Decoder only actually loops if loops_to_request > 1)
@@ -918,20 +925,26 @@ class ModelInference:
             # Take the top sequences (up to top_k)
             top_nodes = all_nodes[:top_k]
             
-            # Reconstruct the sequences
+            # Reconstruct the sequences and their loop counts
             sequences = []
+            loop_counts_per_sequence = []
             for node in top_nodes:
                 seq = []
+                loops = []
                 n = node
                 while n.prev_node:
                     seq.append(n.token_id)
+                    loops.append(n.curr_loops)
                     n = n.prev_node
                 seq.append(self.bos_token_id)
                 seq.reverse()
+                loops.reverse() # Align loops with sequence steps
                 sequences.append(seq)
+                loop_counts_per_sequence.append(loops)
             
             # Post-process and decode the sequences
-            return self.postprocess_sequences(sequences)
+            decoded_sequences = self.postprocess_sequences(sequences)
+            return decoded_sequences, loop_counts_per_sequence
     
     def greedy_decode_with_loops(self, nmr_tokens, ir_data, mass_data=None, max_len=128, num_loops=1, loops_representation=False):
         """

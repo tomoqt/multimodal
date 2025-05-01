@@ -524,6 +524,19 @@ def evaluate_similarity(predictions, target, method_name=""):
     return metrics
 
 
+def calculate_avg_loops(loop_data):
+    """Calculate the average loop count from the data returned by entropix_decode."""
+    if not loop_data or not isinstance(loop_data, list) or not loop_data[0]:
+        return 0.0 # Return 0 if no loop data or empty
+    
+    # Use loops from the first sequence (usually the best one)
+    first_sequence_loops = loop_data[0]
+    if not first_sequence_loops: # Check if the list of loops is empty
+        return 0.0
+        
+    return np.mean(first_sequence_loops)
+
+
 def combine_metrics(metrics_list):
     """
     Combine metrics from multiple test examples into one aggregate result.
@@ -565,7 +578,9 @@ def combine_metrics(metrics_list):
         # Check if values are numeric or strings
         if all(isinstance(x, (int, float, bool, np.number)) for x in v if x is not None):
             # For numeric values, calculate mean, ignoring None values
-            valid_values = [x for x in v if x is not None]
+            # Special handling for 'avg_loops' to avoid averaging averages if already calculated
+            # Assuming avg_loops is already calculated per example
+            valid_values = [x for x in v if x is not None] 
             if valid_values:
                 result[k] = np.mean(valid_values)
             else:
@@ -815,7 +830,7 @@ def main():
                         metrics = evaluate_similarity(results, target_smiles, "Nucleus Sampling")
                     
                     elif strategy == "entropix":
-                        results = inference.decode(
+                        results, loop_data = inference.decode(
                             nmr_tokens=nmr_tokens,
                             ir_data=ir_data,
                             strategy=DecodingStrategy.ENTROPIX,
@@ -829,7 +844,9 @@ def main():
                         )
                         decode_time = time.time() - start_decode_time
                         metrics = evaluate_similarity(results, target_smiles, "Entropix")
-                        
+                        avg_loops = calculate_avg_loops(loop_data)
+                        metrics['avg_loops'] = avg_loops
+                    
                     elif strategy == "greedy_loop":
                         # Time the entire loop process for greedy_loop
                         loop_times = []
@@ -889,7 +906,12 @@ def main():
         for strategy, metrics in aggregate_metrics.items():
             if metrics:
                 # Format duration if available
-                duration_str = f"{metrics.get('duration', 0.0):.4f}s" if metrics.get('duration') is not None else "N/A"
+                duration_val = metrics.get('duration')
+                duration_str = f"{duration_val:.4f}s" if isinstance(duration_val, (int, float)) else "N/A"
+                
+                # Format avg_loops if available (only for Entropix)
+                avg_loops_val = metrics.get('avg_loops')
+                avg_loops_str = f"{avg_loops_val:.2f}" if strategy == 'entropix' and isinstance(avg_loops_val, (int, float)) else "N/A"
                 
                 metrics_rows.append({
                     'Method': strategy.capitalize().replace('_', ' '),
@@ -898,7 +920,8 @@ def main():
                     'Tanimoto': f"{metrics['avg_tanimoto']:.4f}",
                     'MCS Ratio': f"{metrics['avg_#mcs/#target']:.4f}",
                     'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f}",
-                    'Avg Time': duration_str  # Add timing info
+                    'Avg Time': duration_str,  # Add timing info
+                    'Avg Loops': avg_loops_str # Add loop info (only for Entropix)
                 })
         
         # Convert to DataFrame for nice printing
@@ -914,6 +937,9 @@ def main():
         metrics_df_save = metrics_df.copy() # Avoid modifying the printed df
         metrics_df_save['Avg Time (s)'] = [metrics.get('duration', None) for metrics in aggregate_metrics.values() if metrics] # Add raw seconds for CSV
         metrics_df_save.drop(columns=['Avg Time'], inplace=True) # Remove formatted string version
+        # Add raw avg_loops for CSV
+        metrics_df_save['Avg Loops (Entropix)'] = [metrics.get('avg_loops', None) for metrics in aggregate_metrics.values() if metrics] 
+        metrics_df_save.drop(columns=['Avg Loops'], inplace=True) # Remove formatted string version
         metrics_df_save.to_csv(results_file, index=False)
         print(f"\nSaved results to {results_file}")
         
@@ -927,7 +953,8 @@ def main():
                     'avg_tanimoto': metrics['avg_tanimoto'],
                     'avg_#mcs/#target': metrics['avg_#mcs/#target'],
                     'avg_ecfp6_iou': metrics['avg_ecfp6_iou'],
-                    'avg_duration': metrics.get('duration', None) # Add timing info
+                    'avg_duration': metrics.get('duration', None), # Add timing info
+                    'avg_loops': metrics.get('avg_loops', None) # Add loop info (only for Entropix)
                 }
         
         raw_file = output_dir / f"inference_raw_metrics_{timestamp}.json"
@@ -1118,7 +1145,10 @@ def main():
         
         # Evaluate entropix results if we have a target
         if target_smiles:
-            entropix_metrics = evaluate_similarity(entropix_results, target_smiles, "Entropix")
+            entropix_metrics = evaluate_similarity(entropix_results[0], target_smiles, "Entropix")
+            avg_loops = calculate_avg_loops(entropix_results[1])
+            entropix_metrics['avg_loops'] = avg_loops
+            print(f"  Avg Loops: {avg_loops:.2f}") # Print avg loops for single run
             all_metrics["Entropix"] = entropix_metrics
     
     if "greedy_loop" in strategies:
@@ -1190,7 +1220,10 @@ def main():
                 'Tanimoto': f"{metrics['avg_tanimoto']:.4f}",
                 'MCS Ratio': f"{metrics['avg_#mcs/#target']:.4f}",
                 'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f}",
-                'Time (s)': f"{all_times.get(method, 0.0):.4f}" # Add timing info
+                'Time (s)': f"{all_times.get(method, 0.0):.4f}",
+                'Avg Loops': (f"{metrics.get('avg_loops'):.2f}" 
+                              if method == 'Entropix' and isinstance(metrics.get('avg_loops'), (int, float)) 
+                              else "N/A")
             }
             for method, metrics in all_metrics.items() if method in all_times # Ensure method has timing info
         ])
