@@ -40,7 +40,7 @@ training:
   save_model_frequency: 10000 # How often to save model to wandb (in steps)
   greedy_decode_frequency: 1000
   loops_representation: False
-  
+  use_torch_compile: True
 
 # Optimizer Configuration
 optimizer:
