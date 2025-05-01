@@ -949,14 +949,14 @@ class ModelInference:
     def greedy_decode_with_loops(self, nmr_tokens, ir_data, mass_data=None, max_len=128, num_loops=1, loops_representation=False):
         """
         Greedy decoding strategy with layer looping - selects the most probable token at each step,
-        but applies the decoder with a specified num_loops parameter at each step.
+        but applies the decoder with a specified num_loops parameter (uniformly across the looping radius) at each step.
 
         Args:
             nmr_tokens: Tokenized NMR data
             ir_data: IR data
             mass_data: Mass spectrometry data
             max_len: Maximum sequence length
-            num_loops: Number of layer looping iterations to apply in the decoder
+            num_loops: Number of layer looping iterations to apply uniformly in the decoder's looping radius.
             loops_representation: Whether to track and return representations across loops
 
         Returns:
@@ -972,40 +972,58 @@ class ModelInference:
             
             # Initialize the decoder output and track if we need loop representations
             decoder_output = None
-            
+            loop_reps_list = [] # Store loop representations per step if needed
+
+            # Determine the number of layers in the looping radius
+            # Access loop_radius from the decoder module
+            loop_radius = getattr(self.model.decoder, 'loop_radius', 0) 
+            num_looping_layers = 2 * loop_radius + 1
+            # Convert the single integer num_loops into the list format required by the decoder
+            num_loops_list = [num_loops] * num_looping_layers
+
             for _ in range(max_len):
-                # Call decoder with loops_representation parameter
+                # Call decoder with loops_representation parameter and the list num_loops
+                decoder_args = {
+                    'tgt': current_token, 
+                    'memory': memory, 
+                    'nmr_tokens': nmr_tokens, 
+                    'num_loops': num_loops_list # Pass the list here
+                }
+                
                 if loops_representation:
-                    logits, loop_reps = self.model.decoder(
-                        tgt=current_token, 
-                        memory=memory, 
-                        nmr_tokens=nmr_tokens, 
-                        num_loops=num_loops
-                    )
-                    # Store loop representations from the first token generation step only
-                    if decoder_output is None:
-                        decoder_output = loop_reps
+                    logits, loop_reps = self.model.decoder(**decoder_args)
+                    # Store loop representations from this step
+                    loop_reps_list.append(loop_reps)
                 else:
-                    logits = self.model.decoder(
-                        tgt=current_token, 
-                        memory=memory, 
-                        nmr_tokens=nmr_tokens, 
-                        num_loops=num_loops
-                    )
+                    logits = self.model.decoder(**decoder_args)
                     
                 next_token = logits[:, -1:].argmax(dim=-1)
+                
+                all_finished = True # Check if all sequences in the batch finished
                 for i in range(batch_size):
                     token_id = next_token[i].item()
-                    generated_sequences[i].append(token_id)
-                    if token_id == self.eos_token_id:
-                        break
+                    # Only append if the sequence is not already finished
+                    if generated_sequences[i][-1] != self.eos_token_id:
+                        generated_sequences[i].append(token_id)
+                        if token_id != self.eos_token_id:
+                            all_finished = False # At least one sequence is still generating
+                    # If a sequence was already finished, keep it marked as finished
+                    elif generated_sequences[i][-1] == self.eos_token_id:
+                        pass # Already finished, do nothing
+                        
+                # If all sequences have reached EOS, break early
+                if all_finished:
+                    break
+                    
                 current_token = torch.cat((current_token, next_token), dim=1)
             
             # Post-process and return appropriate results
             decoded_sequences = self.postprocess_sequences(generated_sequences)
             
-            if loops_representation and decoder_output is not None:
-                return decoded_sequences, decoder_output
+            if loops_representation:
+                # Concatenate or process loop_reps_list as needed
+                # For now, returning the list of representations per step
+                return decoded_sequences, loop_reps_list 
             else:
                 return decoded_sequences
 

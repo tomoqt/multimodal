@@ -34,10 +34,16 @@ def main():
     parser.add_argument('--split', type=str, default='test', help='Dataset split to use')
     parser.add_argument('--output_dir', type=str, default='inference_results', help='Directory to save results')
     parser.add_argument('--loops_representation', type=bool, default=False, help='Flag to track and return representations across loops')
+    parser.add_argument('--loop_radius', type=int, default=None, help='Radius of layers around middle to loop (overrides config)')
     args = parser.parse_args()
 
     # Load configuration
     config = load_config(args.config)
+
+    # Determine loop_radius (command line overrides config, defaults to 0)
+    loop_radius = args.loop_radius if args.loop_radius is not None else config['model'].get('loop_radius', 0)
+    num_looping_layers = 2 * loop_radius + 1
+    print(f"Using loop_radius={loop_radius} ({num_looping_layers} looping layers)")
 
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -85,7 +91,11 @@ def main():
         'ir_as_prompt': ir_as_prompt,
         'ir_encoder_type': config['model'].get('ir_encoder_type', 'regular'),
         'max_loops': args.max_loops,
-        'loops_representation': args.loops_representation
+        'loops_representation': args.loops_representation,
+        'automatic_loop_exit': config['model'].get('automatic_loop_exit', False),
+        'automatic_loop_exit_threshold': config['model'].get('automatic_loop_exit_threshold', 0.01),
+        'use_loop_concat': config['model'].get('use_loop_concat', True),
+        'loop_radius': loop_radius
     }
     if ir_as_prompt:
         if 'ir_vocab_size' in extra_params:
@@ -125,10 +135,14 @@ def main():
 
     start_time = time.time()
     # Loop over different num_loops values for greedy loop decoding
-    for loop_count in range(args.max_loops):
+    for loop_count in range(args.max_loops + 1):
         sample_metrics = []
-        print(f"\nTesting Greedy Loop Decoding with num_loops = {loop_count}")
-        for idx in tqdm(range(num_samples), desc=f"Loop Count {loop_count}"):
+        print(f"\nTesting Greedy Loop Decoding with uniform num_loops = {loop_count}")
+        
+        # Create the list of loops for the decoder
+        num_loops_list = [loop_count] * num_looping_layers
+        
+        for idx in tqdm(range(num_samples), desc=f"Uniform Loop Count {loop_count}"):
             target_tokens, (ir_tensor, _), nmr_tokens, _ = dataset[idx]
             if ir_tensor is not None:
                 ir_data = ir_tensor.to(device)
@@ -160,7 +174,7 @@ def main():
     rows = []
     for loop_count, metrics in loop_metric_results.items():
         rows.append({
-            'Num Loops': loop_count,
+            'Num Loops (Uniform)': loop_count,
             'Valid SMILES': f"{metrics['valid_smiles']:.2%}",
             'Exact Match': f"{metrics['exact_match']:.2%}",
             'Tanimoto': f"{metrics['avg_tanimoto']:.4f}",
@@ -177,6 +191,7 @@ def main():
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     results_file = output_dir / f"greedy_loop_full_dataset_{timestamp}.csv"
     df = pd.DataFrame(rows)
+    df.rename(columns={'Num Loops (Uniform)': 'Uniform Loop Count'}, inplace=True)
     df.to_csv(results_file, index=False)
     print(f"Saved aggregate metrics to {results_file}")
 

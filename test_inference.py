@@ -619,6 +619,7 @@ def main():
     parser.add_argument('--output_dir', type=str, default='inference_results', help='Directory to save inference results')
     parser.add_argument('--automatic_loop_exit', action='store_true', help='Enable automatic loop exit in Entropix/decoder based on representation convergence')
     parser.add_argument('--automatic_loop_exit_threshold', type=float, default=0.01, help='Threshold for automatic loop exit convergence')
+    parser.add_argument('--loop_radius', type=int, default=None, help='Radius of layers around middle to loop (overrides config)')
     args = parser.parse_args()
 
     # Load configuration
@@ -689,6 +690,10 @@ def main():
     model_kwargs['max_loops'] = args.max_loops
     model_kwargs['automatic_loop_exit'] = args.automatic_loop_exit
     model_kwargs['automatic_loop_exit_threshold'] = args.automatic_loop_exit_threshold
+    # Add loop_radius from config/args
+    loop_radius = args.loop_radius if args.loop_radius is not None else config['model'].get('loop_radius', 0)
+    model_kwargs['loop_radius'] = loop_radius
+    model_kwargs['use_loop_concat'] = config['model'].get('use_loop_concat', True) # Get from config
     
     # Add ir_vocab_size if needed
     if ir_as_prompt:
@@ -696,6 +701,8 @@ def main():
             model_kwargs['ir_vocab_size'] = extra_params['ir_vocab_size']
         else:
             model_kwargs['ir_vocab_size'] = len(ir_tokenizer)
+        num_looping_layers = 2 * loop_radius + 1
+        print(f"Using loop_radius={loop_radius} ({num_looping_layers} looping layers)")
     
     model = MultiModalToSMILESModel(**model_kwargs).to(device)
     
@@ -1152,40 +1159,50 @@ def main():
             all_metrics["Entropix"] = entropix_metrics
     
     if "greedy_loop" in strategies:
-        print("\nX. Greedy Loop Decoding with Varying Layer Loop Counts")
+        print("\nX. Greedy Loop Decoding with Varying Uniform Layer Loop Counts")
         greedy_loop_results = []  # Initialize list to store loop results
         loop_times = []
         overall_start_time = time.time()
-        # Test with different numbers of loops
-        for loop_count in range(args.max_loops):
+        
+        # Determine number of looping layers based on radius
+        loop_radius = model_kwargs.get('loop_radius', 0)
+        num_looping_layers = 2 * loop_radius + 1
+
+        # Test with different numbers of uniform loops
+        for loop_count in range(args.max_loops + 1): # Iterate 0 to max_loops inclusive
             loop_start_time = time.time()
+            
+            # Create the list of loops for the decoder (handled inside inference.decode)
+            # num_loops_list = [loop_count] * num_looping_layers 
+            
             results = inference.decode(
                 nmr_tokens=nmr_tokens,
                 ir_data=ir_data,
                 strategy=DecodingStrategy.GREEDY_LOOP,
                 max_len=config['model']['max_seq_length'],
-                num_loops=loop_count
+                num_loops=loop_count # Pass the single integer, inference fn handles conversion
+                # num_loops=num_loops_list # Or pass list directly if needed
             )
             loop_duration = time.time() - loop_start_time
             loop_times.append(loop_duration)
             greedy_loop_results.append(results)  # Store results from current loop count
-            print(f"\nResults for Greedy Loop Decoding with num_loops = {loop_count}: (Time: {loop_duration:.4f}s)")
+            print(f"\nResults for Greedy Loop Decoding with uniform num_loops = {loop_count}: (Time: {loop_duration:.4f}s)")
             for i, result in enumerate(results):
                 print(f"  Result {i+1}: {result}")
             if target_smiles:
-                metrics = evaluate_similarity(results, target_smiles, f"Greedy Loop (num_loops={loop_count})")
+                metrics = evaluate_similarity(results, target_smiles, f"Greedy Loop (uniform_loops={loop_count})")
                 # Store metrics for each loop count separately if needed
                 all_metrics[f"GreedyLoop_{loop_count}"] = metrics 
         
         overall_decode_time = time.time() - overall_start_time
         all_times["GreedyLoop"] = overall_decode_time # Store overall time for the strategy
-        print(f"\nOverall time for Greedy Loop strategy (up to {args.max_loops} loops): {overall_decode_time:.4f}s")
+        print(f"\nOverall time for Greedy Loop strategy (up to {args.max_loops} uniform loops): {overall_decode_time:.4f}s")
         
         # Use last iteration result for comparison tables and final metrics
         selected_greedy_loop_results = greedy_loop_results[-1] if greedy_loop_results else []
-        if target_smiles and f"GreedyLoop_{args.max_loops - 1}" in all_metrics:
+        if target_smiles and f"GreedyLoop_{args.max_loops}" in all_metrics:
              # Use metrics from the last loop count for the main "GreedyLoop" entry
-            all_metrics["GreedyLoop"] = all_metrics[f"GreedyLoop_{args.max_loops - 1}"]
+            all_metrics["GreedyLoop"] = all_metrics[f"GreedyLoop_{args.max_loops}"]
 
 
     # Compare results
@@ -1202,7 +1219,7 @@ def main():
     if "entropix" in strategies:
         all_results["Entropix"] = entropix_results[0]
     if "greedy_loop" in strategies:
-        all_results["GreedyLoop"] = selected_greedy_loop_results
+        all_results["GreedyLoop"] = selected_greedy_loop_results[0] if selected_greedy_loop_results else "N/A"
     
     for method, result in all_results.items():
         print(f"{method}: {result}")
