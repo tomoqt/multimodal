@@ -222,6 +222,9 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
         automatic_loop_exit = False
         automatic_loop_exit_threshold = 0.01
         max_loops = 1
+        # Default looping parameters when config is missing
+        loop_radius = 0
+        num_looping_layers = 1
 
     # Determine num_loops LIST for greedy decoding
     greedy_num_loops = []
