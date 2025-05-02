@@ -23,7 +23,7 @@ model:
   log_normal_std: 0.5 
 #Checkpoint Configuration
 checkpoint:
-  load_path: "checkpoints/best_model.pt"  # Path to the checkpoint file
+  load_path: "checkpoints/latest_checkpoint.pt"  # Path to the checkpoint file
   reset_optimizer: False        
 # Training Parameters
 training:
