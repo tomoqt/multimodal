@@ -30,7 +30,7 @@ training:
   precision: "bf16"  # Controls training precision (fp32, fp16, bf16)
   batch_size: 96
   test_batch_size: 1
-  num_epochs: 25
+  num_epochs: 35
   learning_rate: 1.0e-5  # This will be used for AdamW components
   min_learning_rate: 1.0e-7
   weight_decay: 0.1
