@@ -8,7 +8,7 @@ import shutil
     "--data_path",
     "-d",
     type=click.Path(exists=True, path_type=Path),
-    default=Path("data/tokenized_baseline"),
+    default=Path("data/reshaped_tokenized_data"),
     help="Path to the tokenized data directory containing the 'data' folder"
 )
 @click.option(

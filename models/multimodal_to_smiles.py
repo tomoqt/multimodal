@@ -34,7 +34,8 @@ class MultiModalToSMILESModel(nn.Module):
         loops_representation: bool = False,
         automatic_loop_exit: bool = False,
         automatic_loop_exit_threshold: float = 0.01,
-        use_loop_concat: bool = True
+        use_loop_concat: bool = True,
+        use_rmsnorm: bool = False
     ):
         """
         Args:
@@ -57,19 +58,21 @@ class MultiModalToSMILESModel(nn.Module):
             automatic_loop_exit: Whether to enable automatic exiting from middle layer loops based on representation convergence.
             automatic_loop_exit_threshold: The threshold for convergence detection when automatic_loop_exit is enabled.
             use_loop_concat: Whether to concatenate original input with looped input in the middle layer.
+            use_rmsnorm: If True, use RMSNorm instead of LayerNorm in the decoder.
         """
         super().__init__()
         self.verbose = verbose
         self.ir_as_prompt = ir_as_prompt
         self.max_memory_length = max_memory_length
         self.max_loops = max_loops
+        self.use_rmsnorm = use_rmsnorm
 
         # Initialize spectral encoder; pass the flag so that it bypasses encoding if IR is prompt
         self.encoder = MultimodalSpectralEncoder(
             embed_dim=embed_dim,
             verbose=verbose,
             encoder_type=ir_encoder_type,
-            ir_as_prompt=ir_as_prompt
+            ir_as_prompt=ir_as_prompt,
         )
 
         # If IR is used as prompt, create an embedding layer for IR tokens
@@ -99,7 +102,8 @@ class MultiModalToSMILESModel(nn.Module):
             loops_representation=loops_representation,
             automatic_loop_exit=automatic_loop_exit,
             automatic_loop_exit_threshold=automatic_loop_exit_threshold,
-            use_loop_concat=use_loop_concat
+            use_loop_concat=use_loop_concat,
+            use_rmsnorm=use_rmsnorm
         )
 
     def forward(

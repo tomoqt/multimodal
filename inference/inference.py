@@ -1099,7 +1099,8 @@ if __name__ == "__main__":
         num_layers=config['model']['num_layers'],
         dropout=config['model']['dropout'],
         verbose=False,
-        use_stablemax=config['model'].get('use_stablemax', False)
+        use_stablemax=config['model'].get('use_stablemax', False),
+        use_rmsnorm=config['model'].get('use_rmsnorm', False)
     ).to(device)
     
     checkpoint = torch.load(args.checkpoint, map_location=device)

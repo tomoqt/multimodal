@@ -2,6 +2,7 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from torch.nn import LayerNorm, RMSNorm # Import RMSNorm
 
 class RotaryEmbedding(th.nn.Module):
     def __init__(self, dim, base=10000):
@@ -75,7 +76,7 @@ def stablemax(x, dim=-1, clamp_val=20.0, epsilon=1e-9):
     return s_x / denom
 
 class DecoderPromptLayer(nn.Module):
-    def __init__(self, d_model: int, memory_dim: int, nhead: int, d_ffn: int=2048, dropout=0.1, use_rope: bool = False, use_stablemax: bool = False):
+    def __init__(self, d_model: int, memory_dim: int, nhead: int, d_ffn: int=2048, dropout=0.1, use_rope: bool = False, use_stablemax: bool = False, use_rmsnorm: bool = False):
         super().__init__()
         """ Same application as `DecoderLayer` but removes the x-attn part and only usesself-attn
         The `memory` is injected as the prompt, and allowed to fully interact. 
@@ -89,6 +90,7 @@ class DecoderPromptLayer(nn.Module):
         self.head_dim = d_model // nhead
         self.use_rope = use_rope
         self.use_stablemax = use_stablemax
+        self.use_rmsnorm = use_rmsnorm
         assert use_rope, "Other posemb than rope not supported atm"
         if use_rope:
             self.rotary_ndims = int(self.head_dim * 0.5)
@@ -104,11 +106,12 @@ class DecoderPromptLayer(nn.Module):
         self.ffn_w1 = nn.Linear(d_model, d_ffn)
         self.ffn_w2 = nn.Linear(d_ffn, d_model)
 
-        # Layer norms
-        self.attn_norm1 = nn.LayerNorm(d_model)
-        self.attn_norm2 = nn.LayerNorm(d_model)
-        self.mlp_norm1 = nn.LayerNorm(d_model)
-        self.mlp_norm2 = nn.LayerNorm(d_model)
+        # Layer norms (Conditional initialization)
+        NormLayer = RMSNorm if use_rmsnorm else LayerNorm
+        self.attn_norm1 = NormLayer(d_model)
+        self.attn_norm2 = NormLayer(d_model)
+        self.mlp_norm1 = NormLayer(d_model)
+        self.mlp_norm2 = NormLayer(d_model)
 
         self.attn_dropout = nn.Dropout(0.0)
         self.mlp_dropout = nn.Dropout(0.0)
@@ -186,7 +189,8 @@ class SMILESDecoder(nn.Module):
         loops_representation: bool = False, #flag to track and return representations across loops
         automatic_loop_exit: bool = False, # flag to automatically exit loops based on convergence of representations
         automatic_loop_exit_threshold: float = 0.01, # threshold for automatic loop exit
-        use_loop_concat:bool = True
+        use_loop_concat:bool = True,
+        use_rmsnorm: bool = True # Add use_rmsnorm
     ):
         super().__init__()
         
@@ -204,6 +208,8 @@ class SMILESDecoder(nn.Module):
         self.automatic_loop_exit_threshold = automatic_loop_exit_threshold
         self.num_layers = num_layers
         self.loops_representation = loops_representation
+        self.use_rmsnorm = use_rmsnorm
+
         # Separate embeddings with different vocabulary sizes
         self.smiles_embed = nn.Embedding(smiles_vocab_size, embed_dim)
         self.nmr_embed = nn.Embedding(nmr_vocab_size, embed_dim)
@@ -223,12 +229,14 @@ class SMILESDecoder(nn.Module):
                 d_ffn=embed_dim * 4,
                 dropout=dropout,
                 use_rope=True,
-                use_stablemax=use_stablemax  # Pass the stablemax option
+                use_stablemax=use_stablemax,  # Pass the stablemax option
+                use_rmsnorm=use_rmsnorm # Pass use_rmsnorm
             ) for _ in range(num_layers)
         ])
         
-        # Add final layer norm
-        self.final_norm = nn.LayerNorm(embed_dim)
+        # Add final layer norm (Conditional initialization)
+        NormLayer = RMSNorm if use_rmsnorm else LayerNorm
+        self.final_norm = NormLayer(embed_dim)
         
         # Output projection to SMILES vocabulary
         self.out = nn.Linear(embed_dim, smiles_vocab_size)

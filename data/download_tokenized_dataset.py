@@ -9,12 +9,12 @@ import shutil
     "--output_path",
     "-o",
     type=click.Path(path_type=Path),
-    default=Path("data/tokenized_baseline"),
+    default=Path("data/reshaped_tokenized_data"),
     help="Base output path (dataset will be placed in output_path/data/)"
 )
 @click.option(
     "--repo_id",
-    default="Tomoqt/tokenized_NMR_resample1000",
+    default="Tomoqt/tokenized_NMR_1000_newsplit",
     help="Hugging Face repository ID"
 )
 @click.option(

@@ -689,6 +689,7 @@ def main():
     model_kwargs['max_loops'] = args.max_loops
     model_kwargs['automatic_loop_exit'] = args.automatic_loop_exit
     model_kwargs['automatic_loop_exit_threshold'] = args.automatic_loop_exit_threshold
+    model_kwargs['use_rmsnorm'] = config['model'].get('use_rmsnorm', False)
     
     # Add ir_vocab_size if needed
     if ir_as_prompt:
