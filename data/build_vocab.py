@@ -77,8 +77,8 @@ def build_vocabulary(tokenized_dir: Path,
 
 if __name__ == "__main__":
     # Example usage:
-    tokenized_data_dir = Path("data/tokenized_baseline/data")
-    output_vocab = Path("data/tokenized_baseline/vocab.txt")
+    tokenized_data_dir = Path("data/reshaped_tokenized_data/data")
+    output_vocab = Path("data/reshaped_tokenized_data/vocab.txt")
 
     build_vocabulary(
         tokenized_dir=tokenized_data_dir,
