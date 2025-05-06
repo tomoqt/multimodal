@@ -1009,6 +1009,64 @@ class ModelInference:
             else:
                 return decoded_sequences
 
+    def greedy_decode_step_by_step(self, nmr_tokens, ir_data, mass_data=None, max_len=128, num_loops=1):
+        """
+        Greedy decoding that yields the sequence at each step of token generation.
+        Assumes batch_size = 1 for simplicity in yielding intermediate sequences.
+
+        Args:
+            nmr_tokens: Tokenized NMR data (should be [1, seq_len])
+            ir_data: IR data (should be [1, seq_len] or [1, num_features])
+            mass_data: Mass spectrometry data
+            max_len: Maximum sequence length
+            num_loops: Number of layer looping iterations for the decoder 
+                       (passed to model.decoder if it uses this parameter for its internal mechanism).
+
+        Yields:
+            torch.Tensor: Tensor of token IDs generated so far at each step (e.g., [bos, t1], [bos, t1, t2], ...)
+                         for the first item in the batch.
+        """
+        self.model.eval()
+        with torch.no_grad():
+            (nmr_tokens, ir_data, mass_data), batch_size = self.prepare_inputs(nmr_tokens, ir_data, mass_data)
+            if batch_size != 1:
+                raise ValueError("greedy_decode_step_by_step currently supports batch_size=1 for simplicity.")
+
+            memory = self.encode_inputs(nmr_tokens, ir_data, mass_data)
+            
+            current_token_list = [self.bos_token_id]
+            model_input_tokens = torch.tensor([current_token_list], device=self.device)
+
+            yield torch.tensor(current_token_list, device=self.device) # Yield initial BOS token
+
+            for _ in range(max_len):
+                # The model.decoder might have its own looping mechanism (num_loops parameter).
+                # This is distinct from the autoregressive steps.
+                # We pass num_loops here in case the model uses it for its internal processing at each generation step.
+                decoder_output = self.model.decoder(
+                    tgt=model_input_tokens, 
+                    memory=memory, 
+                    nmr_tokens=nmr_tokens, 
+                    num_loops=num_loops 
+                )
+                
+                # Check if decoder_output is a tuple (logits, potentially other data like loop_reps)
+                if isinstance(decoder_output, tuple):
+                    logits = decoder_output[0]
+                else:
+                    logits = decoder_output # Assume it's just logits
+                
+                next_token_logit = logits[:, -1, :] 
+                next_token_id = next_token_logit.argmax(dim=-1).item()
+                
+                current_token_list.append(next_token_id)
+                model_input_tokens = torch.tensor([current_token_list], device=self.device)
+
+                yield torch.tensor(current_token_list, device=self.device)
+
+                if next_token_id == self.eos_token_id:
+                    break
+
 
 # Simple usage example
 if __name__ == "__main__":

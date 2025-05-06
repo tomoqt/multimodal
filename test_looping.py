@@ -85,7 +85,9 @@ def main():
         'ir_as_prompt': ir_as_prompt,
         'ir_encoder_type': config['model'].get('ir_encoder_type', 'regular'),
         'max_loops': args.max_loops,
-        'loops_representation': args.loops_representation
+        'loops_representation': args.loops_representation,
+        'use_loop_concat': config['model'].get('use_loop_concat', True),
+        'use_rmsnorm': config['model'].get('use_rmsnorm', True)
     }
     if ir_as_prompt:
         if 'ir_vocab_size' in extra_params:
