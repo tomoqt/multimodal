@@ -44,7 +44,7 @@ except ImportError as e:
     MODEL_FILES_AVAILABLE = False
 
 # --- Configuration: Update these paths ---
-CHECKPOINT_PATH = "checkpoints/best_model.pt"
+CHECKPOINT_PATH = "checkpoints/largest_new.pt"
 CONFIG_PATH = "configs/real_config.yaml"
 CURRENT_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 SMILES_VOCAB_PATH = os.path.join(CURRENT_SCRIPT_DIR, 'training/vocab.txt')
@@ -219,8 +219,8 @@ def get_random_beam_entropix():
     beam_b64 = pil_to_base64(best_beam_img)
     bm = beam_metrics_list[best_beam_idx]
     beam_html = f"<h3>Beam Best (Tanimoto={bm['tanimoto']:.4f})</h3>"
-    beam_html += f"<img src='data:image/png;base64,{beam_b64}' style='width:200px;height:200px'/><br>{best_beam_smiles}"
-    beam_metrics_html = "<ul>" + "".join(
+    beam_html += f"<img src='data:image/png;base64,{beam_b64}' style='width:200px;height:200px'/><br><span style='font-size: 1.1em;'>{best_beam_smiles}</span>"
+    beam_metrics_html = "<ul style='font-size: 1.1em;'>" + "".join(
         f"<li>{k}: {bm[k]}</li>" for k in ['valid_pred','exact_match','tanimoto','#mcs/#target','ecfp6_iou']
     ) + "</ul>"
     # Entropix: get top-5 and pick best by Tanimoto
@@ -233,8 +233,8 @@ def get_random_beam_entropix():
     ent_b64 = pil_to_base64(best_ent_img)
     em = ent_metrics_list[best_ent_idx]
     ent_html = f"<h3>Entropix Best (Tanimoto={em['tanimoto']:.4f})</h3>"
-    ent_html += f"<img src='data:image/png;base64,{ent_b64}' style='width:200px;height:200px'/><br>{best_ent_smiles}"
-    ent_metrics_html = "<ul>" + "".join(
+    ent_html += f"<img src='data:image/png;base64,{ent_b64}' style='width:200px;height:200px'/><br><span style='font-size: 1.1em;'>{best_ent_smiles}</span>"
+    ent_metrics_html = "<ul style='font-size: 1.1em;'>" + "".join(
         f"<li>{k}: {em[k]}</li>" for k in ['valid_pred','exact_match','tanimoto','#mcs/#target','ecfp6_iou']
     ) + "</ul>"
     status = "Completed. Showing best Beam and Entropix only."
@@ -254,16 +254,19 @@ with gr.Blocks() as demo:
 
     # Predictions and metrics below
     with gr.Row():
-        with gr.Column():
-            gr.Markdown("### Beam Search Predictions")
-            beam_out = gr.HTML(label="Beam Search Results")
-            gr.Markdown("### Beam Search Metrics")
-            beam_metrics_out = gr.HTML(label="Beam Metrics")
-            gr.Markdown("### Entropix Predictions")
-            ent_out = gr.HTML(label="Entropix Results")
-            gr.Markdown("### Entropix Metrics")
-            ent_metrics_out = gr.HTML(label="Entropix Metrics")
-        with gr.Column():
+        with gr.Column(scale=3): # Column for predictions (will contain two sub-columns)
+            with gr.Row(): # Inner row to make beam and entropix side-by-side
+                with gr.Column(): # Beam column
+                    gr.Markdown("## Beam Search Predictions")
+                    beam_out = gr.HTML(label="Beam Search Results")
+                    gr.Markdown("## Beam Search Metrics")
+                    beam_metrics_out = gr.HTML(label="Beam Metrics")
+                with gr.Column(): # Entropix column
+                    gr.Markdown("## Entropix Predictions")
+                    ent_out = gr.HTML(label="Entropix Results")
+                    gr.Markdown("## Entropix Metrics")
+                    ent_metrics_out = gr.HTML(label="Entropix Metrics")
+        with gr.Column(scale=1): # Column for status
             status_out = gr.Textbox(label="Status", interactive=False)
 
     # Trigger inference and update all outputs

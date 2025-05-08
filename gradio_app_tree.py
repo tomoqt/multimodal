@@ -36,7 +36,7 @@ from test_inference import (
 import animated_inference
 
 # --- Configuration ---
-CHECKPOINT_PATH = "checkpoints/best_model.pt"
+CHECKPOINT_PATH = "checkpoints/largest_new.pt"
 CONFIG_PATH     = "configs/real_config.yaml"
 CURRENT_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 SMILES_VOCAB_PATH  = os.path.join(CURRENT_SCRIPT_DIR, 'training/vocab.txt')

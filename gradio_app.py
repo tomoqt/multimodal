@@ -43,14 +43,14 @@ try:
     from test_inference import load_config as util_load_config
     from test_inference import get_ir_tokenizer as util_get_ir_tokenizer
     from test_inference import detect_ir_as_prompt as util_detect_ir_as_prompt
-    from test_inference import SimpleSpectralSmilesDataset
+    from test_inference import SimpleSpectralSmilesDataset, evaluate_predictions
     MODEL_FILES_AVAILABLE = True
 except ImportError as e:
     print(f"ERROR: Could not import model files: {e}. Please ensure paths are correct and dependencies are installed.")
     MODEL_FILES_AVAILABLE = False
 
 # --- User Configuration: MODIFY THESE PATHS ---
-CHECKPOINT_PATH = "checkpoints/best_model.pt"  # e.g., 'checkpoints/model.pth'
+CHECKPOINT_PATH = "checkpoints/largest_new.pt"  # e.g., 'checkpoints/model.pth'
 CONFIG_PATH = "configs/real_config.yaml"        # e.g., 'configs/test_config.yaml'
 # SMILES_VOCAB_PATH is often relative to the script or a known 'training' dir
 # Defaulting to a common pattern, adjust if your vocab.txt is elsewhere.
@@ -69,7 +69,7 @@ CONFIG = None
 IR_AS_PROMPT = False
 MODEL_LOADED_SUCCESSFULLY = False
 
-GRADIO_MAX_REFINE_LOOPS = 10 # Number of internal model loops to show step-by-step
+GRADIO_MAX_REFINE_LOOPS = 15 # Number of internal model loops to show step-by-step
 GRADIO_MAX_DISPLAY_STEPS = 195 # Max autoregressive steps to show in Gradio
 
 # --- Helper Functions ---
@@ -166,6 +166,27 @@ BLANK_NMR_IMAGE = create_blank_image(text="NMR Input")
 BLANK_IR_IMAGE = create_blank_image(text="IR Input")
 BLANK_MOL_IMAGE = create_blank_image(text="Molecule")
 
+def format_metrics_html(metrics_dict, title="Metrics"):
+    if not metrics_dict:
+        return f"<h3>{title}</h3><p style='font-size: 0.9em;'>N/A</p>"
+    
+    metric_keys_to_display = ['valid_pred', 'exact_match', 'tanimoto', '#mcs/#target', 'ecfp6_iou']
+    html_items = ""
+    for k in metric_keys_to_display:
+        value = metrics_dict.get(k)
+        # Format float values nicely
+        if isinstance(value, float):
+            value_str = f"{value:.4f}"
+        elif isinstance(value, (np.float32, np.float64)): # Numpy floats
+            value_str = f"{float(value):.4f}"
+        else:
+            value_str = str(value)
+        html_items += f"<li>{k}: {value_str}</li>"
+            
+    return f"<h3>{title}</h3><ul style='font-size: 0.9em; margin-top: 0; padding-left: 20px; list-style-type: none;'>{html_items}</ul>"
+
+BLANK_METRICS_HTML = format_metrics_html(None, "Prediction Metrics")
+
 def load_model_and_data_global():
     global MODEL, TOKENIZER, NMR_TOKENIZER, IR_TOKENIZER, INFERENCE, DATASET, DEVICE, CONFIG, IR_AS_PROMPT, MODEL_LOADED_SUCCESSFULLY
 
@@ -250,15 +271,16 @@ def load_model_and_data_global():
         return f"Error loading model/data: {str(e)}"
 
 def predict_step_by_step_gradio(nmr_data_tensor, ir_data_tensor, target_smiles_str):
-    global INFERENCE, CONFIG, TOKENIZER, GRADIO_MAX_DISPLAY_STEPS, BLANK_MOL_IMAGE
+    global INFERENCE, CONFIG, TOKENIZER, GRADIO_MAX_DISPLAY_STEPS, BLANK_MOL_IMAGE, BLANK_METRICS_HTML
 
     # Strip spaces from the displayed target SMILES as well
     target_clean = target_smiles_str.replace(" ", "")
-    yield target_clean, "Starting...", BLANK_MOL_IMAGE, "Target SMILES loaded. Beginning autoregressive generation..."
+    yield target_clean, "Starting...", BLANK_MOL_IMAGE, "Target SMILES loaded. Beginning autoregressive generation...", BLANK_METRICS_HTML
 
     last_valid_image_for_display = BLANK_MOL_IMAGE
     generated_smiles_at_eos = None
     max_generation_len = CONFIG['model'].get('max_seq_length', GRADIO_MAX_DISPLAY_STEPS)
+    current_metrics_html = BLANK_METRICS_HTML
 
     # num_loops=1 for the internal decoder call at each autoregressive step.
     # This means we are not focusing on the model's internal refinement loops here,
@@ -267,7 +289,7 @@ def predict_step_by_step_gradio(nmr_data_tensor, ir_data_tensor, target_smiles_s
         nmr_tokens=nmr_data_tensor,
         ir_data=ir_data_tensor,
         max_len=max_generation_len, 
-        num_loops=1 
+        num_loops=15
     )
 
     for i, current_tokens_tensor in enumerate(step_iterator):
@@ -304,7 +326,7 @@ def predict_step_by_step_gradio(nmr_data_tensor, ir_data_tensor, target_smiles_s
         else:
             img_to_show = last_valid_image_for_display
 
-        yield target_clean, display_smiles, img_to_show, status
+        yield target_clean, display_smiles, img_to_show, status, current_metrics_html
         
         is_eos = (len(current_tokens_list) > 0 and current_tokens_list[-1] == TOKENIZER.sep_token_id)
 
@@ -312,14 +334,26 @@ def predict_step_by_step_gradio(nmr_data_tensor, ir_data_tensor, target_smiles_s
             generated_smiles_at_eos = display_smiles
             status = f"Step {i}: EOS generated. Final: {display_smiles}"
             final_img = get_2d_image(display_smiles) or last_valid_image_for_display
-            yield target_clean, display_smiles, final_img, status
+            # Calculate metrics
+            metrics_list = evaluate_predictions([display_smiles], [target_clean])
+            if metrics_list:
+                current_metrics_html = format_metrics_html(metrics_list[0], "Final Prediction Metrics")
+            else:
+                current_metrics_html = format_metrics_html(None, "Final Prediction Metrics")
+            yield target_clean, display_smiles, final_img, status, current_metrics_html
             break 
 
         if i >= GRADIO_MAX_DISPLAY_STEPS -1: 
             status = f"Reached max display steps ({GRADIO_MAX_DISPLAY_STEPS})."
             if not is_eos : status += " Full generation may differ."
+            # Calculate metrics for the current (possibly incomplete) SMILES
+            metrics_list = evaluate_predictions([display_smiles], [target_clean])
+            if metrics_list:
+                current_metrics_html = format_metrics_html(metrics_list[0], "Metrics at Max Steps")
+            else:
+                current_metrics_html = format_metrics_html(None, "Metrics at Max Steps")
             # Yield current state before breaking display loop
-            yield target_clean, display_smiles, img_to_show, status 
+            yield target_clean, display_smiles, img_to_show, status, current_metrics_html 
             break
         
         time.sleep(0.15) # Adjust for speed
@@ -330,14 +364,21 @@ def predict_step_by_step_gradio(nmr_data_tensor, ir_data_tensor, target_smiles_s
         # The last state was already yielded within the loop.
         # We can add a final status message if needed.
         final_status_message = f"Generation completed after {i+1} steps (max model length or other limit reached without EOS)."
-        # Re-yield the last known state with this new message
-        yield target_clean, display_smiles, img_to_show, final_status_message
+        # Re-calculate metrics for the final state
+        metrics_list = evaluate_predictions([display_smiles], [target_clean])
+        if metrics_list:
+            current_metrics_html = format_metrics_html(metrics_list[0], "Final Prediction Metrics")
+        else:
+            current_metrics_html = format_metrics_html(None, "Final Prediction Metrics")
+        # Re-yield the last known state with this new message and metrics
+        yield target_clean, display_smiles, img_to_show, final_status_message, current_metrics_html
 
 
 def get_random_sample_and_predict_gradio():
-    global DATASET, DEVICE, IR_AS_PROMPT, MODEL_LOADED_SUCCESSFULLY
+    global DATASET, DEVICE, IR_AS_PROMPT, MODEL_LOADED_SUCCESSFULLY, BLANK_METRICS_HTML
     if not MODEL_LOADED_SUCCESSFULLY or DATASET is None:
-        return "Dataset not loaded or model error.", "N/A", BLANK_MOL_IMAGE, "Error: Load data and model first."
+        # Ensure all outputs are updated, including the new metrics display
+        return "Dataset not loaded or model error.", BLANK_MOL_IMAGE, BLANK_NMR_IMAGE, BLANK_IR_IMAGE, "N/A", BLANK_MOL_IMAGE, "Error: Load data and model first.", BLANK_METRICS_HTML
 
     idx = random.randint(0, len(DATASET) - 1)
     
@@ -362,6 +403,7 @@ def get_random_sample_and_predict_gradio():
     target_smiles_str = DATASET.targets[idx] # Assumes DATASET.targets is populated
     # Remove any spaces from the target SMILES
     target_smiles_str = target_smiles_str.replace(" ", "")
+    target_mol_image = get_2d_image(target_smiles_str) or BLANK_MOL_IMAGE # Generate target molecule image
     
     # Initial state to clear previous outputs and show target SMILES and input plots
     nmr_plot_img = plot_token_ids_as_image(nmr_tensor.squeeze(), "NMR Tokens")
@@ -372,15 +414,16 @@ def get_random_sample_and_predict_gradio():
         ir_plot_img = create_blank_image(text="IR Spectrum")
     
     # Yield initial plots and target SMILES before starting step-by-step prediction
-    yield target_smiles_str, nmr_plot_img, ir_plot_img, "Starting...", BLANK_MOL_IMAGE, "Inputs loaded. Starting generation..."
+    # Include BLANK_METRICS_HTML for the new metrics display component
+    yield target_smiles_str, target_mol_image, nmr_plot_img, ir_plot_img, "Starting...", BLANK_MOL_IMAGE, "Inputs loaded. Starting generation...", BLANK_METRICS_HTML
 
     # Now yield from the step-by-step prediction generator
-    # The step-by-step generator yields: target_smiles, predicted_smiles, molecule_image, status
+    # The step-by-step generator now yields: target_smiles, predicted_smiles, molecule_image, status, metrics_html
     # We need to ensure the output structure matches the UI components
     for step_outputs in predict_step_by_step_gradio(nmr_tensor, ir_tensor, target_smiles_str):
-        # step_outputs is expected to be (target_smiles, predicted_smiles, molecule_image, status)
-        step_target_smiles, step_predicted_smiles, step_mol_image, step_status = step_outputs
-        yield step_target_smiles, nmr_plot_img, ir_plot_img, step_predicted_smiles, step_mol_image, step_status
+        # step_outputs is expected to be (target_smiles, predicted_smiles, molecule_image, status, metrics_html)
+        step_target_smiles, step_predicted_smiles, step_mol_image, step_status, step_metrics_html = step_outputs
+        yield step_target_smiles, target_mol_image, nmr_plot_img, ir_plot_img, step_predicted_smiles, step_mol_image, step_status, step_metrics_html
 
 
 # --- Gradio UI Definition ---
@@ -400,17 +443,19 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             nmr_plot_output = gr.Image(label="NMR Data (Tokens Plot)", type="pil", value=BLANK_NMR_IMAGE, interactive=False)
             ir_plot_output = gr.Image(label="IR Spectrum", type="pil", value=BLANK_IR_IMAGE, interactive=False, visible=IR_AS_PROMPT)
             target_smiles_output = gr.Textbox(label="Target SMILES (from Dataset)", interactive=False)
+            target_mol_image_output = gr.Image(label="Target 2D Structure", type="pil", value=BLANK_MOL_IMAGE, interactive=False)
         
         with gr.Column(scale=2):
             gr.Markdown("### Prediction Process")
             predicted_smiles_output = gr.Textbox(label="Predicted SMILES (Step-by-Step)", interactive=False, lines=2)
             molecule_image_output = gr.Image(label="2D Molecular Structure", type="pil", value=BLANK_MOL_IMAGE, interactive=False)
             status_predict_output = gr.Textbox(label="Prediction Status", interactive=False, lines=2)
+            metrics_output = gr.HTML(label="Prediction Metrics", value=BLANK_METRICS_HTML)
 
     sample_button.click(
         fn=get_random_sample_and_predict_gradio,
         inputs=[],
-        outputs=[target_smiles_output, nmr_plot_output, ir_plot_output, predicted_smiles_output, molecule_image_output, status_predict_output]
+        outputs=[target_smiles_output, target_mol_image_output, nmr_plot_output, ir_plot_output, predicted_smiles_output, molecule_image_output, status_predict_output, metrics_output]
     )
 
     # Load model when the app starts
