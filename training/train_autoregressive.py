@@ -239,7 +239,7 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
             if automatic_loop_exit:
                 current_num_loops = max_loops # Use max_loops when auto exit is on
             else:
-                current_num_loops = 1 # Default to 1 loop for standard greedy eval
+                current_num_loops = max_loops # Default to 1 loop for standard greedy eval
 
             predictions = greedy_decode(
                 model=model,

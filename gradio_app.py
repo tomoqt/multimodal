@@ -50,7 +50,7 @@ except ImportError as e:
     MODEL_FILES_AVAILABLE = False
 
 # --- User Configuration: MODIFY THESE PATHS ---
-CHECKPOINT_PATH = "checkpoints/best_model.pt"  # e.g., 'checkpoints/model.pth'
+CHECKPOINT_PATH = "checkpoints/true_recurrent.pt"  # e.g., 'checkpoints/model.pth'
 CONFIG_PATH = "configs/real_config.yaml"        # e.g., 'configs/test_config.yaml'
 # SMILES_VOCAB_PATH is often relative to the script or a known 'training' dir
 # Defaulting to a common pattern, adjust if your vocab.txt is elsewhere.
@@ -365,6 +365,7 @@ def get_random_sample_and_predict_gradio():
     
     # Initial state to clear previous outputs and show target SMILES and input plots
     nmr_plot_img = plot_token_ids_as_image(nmr_tensor.squeeze(), "NMR Tokens")
+    target_mol_img = get_2d_image(target_smiles_str) or BLANK_MOL_IMAGE
     # Plot IR as continuous spectrum
     if IR_AS_PROMPT and ir_tensor is not None:
         ir_plot_img = plot_spectrum(ir_tensor.squeeze(), "IR Spectrum")
@@ -372,7 +373,7 @@ def get_random_sample_and_predict_gradio():
         ir_plot_img = create_blank_image(text="IR Spectrum")
     
     # Yield initial plots and target SMILES before starting step-by-step prediction
-    yield target_smiles_str, nmr_plot_img, ir_plot_img, "Starting...", BLANK_MOL_IMAGE, "Inputs loaded. Starting generation..."
+    yield target_smiles_str, nmr_plot_img, ir_plot_img, "Starting...", BLANK_MOL_IMAGE, "Inputs loaded. Starting generation...", target_mol_img
 
     # Now yield from the step-by-step prediction generator
     # The step-by-step generator yields: target_smiles, predicted_smiles, molecule_image, status
@@ -380,7 +381,7 @@ def get_random_sample_and_predict_gradio():
     for step_outputs in predict_step_by_step_gradio(nmr_tensor, ir_tensor, target_smiles_str):
         # step_outputs is expected to be (target_smiles, predicted_smiles, molecule_image, status)
         step_target_smiles, step_predicted_smiles, step_mol_image, step_status = step_outputs
-        yield step_target_smiles, nmr_plot_img, ir_plot_img, step_predicted_smiles, step_mol_image, step_status
+        yield step_target_smiles, nmr_plot_img, ir_plot_img, step_predicted_smiles, step_mol_image, step_status, target_mol_img
 
 
 # --- Gradio UI Definition ---
@@ -396,10 +397,11 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("### Input Spectra")
+            gr.Markdown("### Input Spectra & Target")
+            target_smiles_output = gr.Textbox(label="Target SMILES (from Dataset)", interactive=False)
+            target_mol_image_output = gr.Image(label="Target Molecule Structure", type="pil", value=BLANK_MOL_IMAGE, interactive=False)
             nmr_plot_output = gr.Image(label="NMR Data (Tokens Plot)", type="pil", value=BLANK_NMR_IMAGE, interactive=False)
             ir_plot_output = gr.Image(label="IR Spectrum", type="pil", value=BLANK_IR_IMAGE, interactive=False, visible=IR_AS_PROMPT)
-            target_smiles_output = gr.Textbox(label="Target SMILES (from Dataset)", interactive=False)
         
         with gr.Column(scale=2):
             gr.Markdown("### Prediction Process")
@@ -410,7 +412,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     sample_button.click(
         fn=get_random_sample_and_predict_gradio,
         inputs=[],
-        outputs=[target_smiles_output, nmr_plot_output, ir_plot_output, predicted_smiles_output, molecule_image_output, status_predict_output]
+        outputs=[target_smiles_output, nmr_plot_output, ir_plot_output, predicted_smiles_output, molecule_image_output, status_predict_output, target_mol_image_output]
     )
 
     # Load model when the app starts

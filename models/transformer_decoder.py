@@ -75,6 +75,16 @@ def stablemax(x, dim=-1, clamp_val=20.0, epsilon=1e-9):
     # 4) Divide
     return s_x / denom
 
+class GatedSiLU(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        # project to 2*d_ff so we can split into gate + candidate
+        self.proj = nn.Linear(d_model, 2 * d_ff, bias=False)
+        self.out  = nn.Linear(d_ff, d_model, bias=False)
+    def forward(self, x):
+        x1, x2 = self.proj(x).chunk(2, dim=-1)
+        return self.out(x1 * F.silu(x2))
+
 class DecoderPromptLayer(nn.Module):
     def __init__(self, d_model: int, memory_dim: int, nhead: int, d_ffn: int=2048, dropout=0.1, use_rope: bool = False, use_stablemax: bool = False, use_rmsnorm: bool = False):
         super().__init__()
@@ -99,12 +109,11 @@ class DecoderPromptLayer(nn.Module):
         # Self attention
         self.q = nn.Linear(d_model, d_model)
         self.k = nn.Linear(d_model, d_model)
-        self.v = nn.Linear(d_model, d_model)
-        self.out = nn.Linear(d_model, d_model)
+        self.v = nn.Linear(d_model, d_model, bias=False)
+        self.out = nn.Linear(d_model, d_model, bias=False)
 
         # FFN
-        self.ffn_w1 = nn.Linear(d_model, d_ffn)
-        self.ffn_w2 = nn.Linear(d_ffn, d_model)
+        self.gated_silu = GatedSiLU(d_model, d_ffn)
 
         # Layer norms (Conditional initialization)
         NormLayer = RMSNorm if use_rmsnorm else LayerNorm
@@ -163,8 +172,8 @@ class DecoderPromptLayer(nn.Module):
 
         # FFN
         xffn = self.mlp_norm1(x)
-        xffn = F.relu(self.ffn_w1(xffn)).square()
-        xffn = self.mlp_dropout(self.ffn_w2(xffn))
+        xffn = self.gated_silu(xffn)
+        xffn = self.mlp_dropout(xffn)
         x = self.mlp_norm2(x + xffn)
 
         return x
@@ -214,11 +223,16 @@ class SMILESDecoder(nn.Module):
         self.smiles_embed = nn.Embedding(smiles_vocab_size, embed_dim)
         self.nmr_embed = nn.Embedding(nmr_vocab_size, embed_dim)
         self.use_loop_concat = use_loop_concat
+
+        # Scale embeddings
+        self.smiles_embed.weight.data.mul_(math.sqrt(self.embed_dim))
+        self.nmr_embed.weight.data.mul_(math.sqrt(self.embed_dim))
+
         if use_loop_concat:
-            self.loop_concat_adapter = nn.Linear(2*embed_dim, embed_dim) #adapts concatenation of original input to input dim of looped block. 
+            self.loop_concat_adapter = nn.Linear(2*embed_dim, embed_dim, bias=False) #adapts concatenation of original input to input dim of looped block. 
         
         # Add input projection for memory if dimensions don't match
-        self.memory_proj = nn.Identity() if ir_as_prompt else (nn.Linear(memory_dim, embed_dim) if memory_dim != embed_dim else nn.Identity())
+        self.memory_proj = nn.Identity() if ir_as_prompt else (nn.Linear(memory_dim, embed_dim, bias=False) if memory_dim != embed_dim else nn.Identity())
         
         # Create decoder layers with stablemax option
         self.layers = nn.ModuleList([
@@ -239,8 +253,30 @@ class SMILESDecoder(nn.Module):
         self.final_norm = NormLayer(embed_dim)
         
         # Output projection to SMILES vocabulary
-        self.out = nn.Linear(embed_dim, smiles_vocab_size)
+        self.out = nn.Linear(embed_dim, smiles_vocab_size, bias=False)
+
+        # Initialize weights
+        self._init_weights()
         
+    def _init_weights(self):
+        h = self.embed_dim
+        # L (effective number of layers) - using num_layers as a proxy
+        # Adjust L if you have a more specific calculation for effective number of layers
+        L = self.num_layers 
+
+        std = math.sqrt(2 / (5 * h))
+        for name, p in self.named_parameters():
+            if p.dim() > 1 and 'out.weight' not in name: # Check name to exclude final output layer
+                nn.init.trunc_normal_(p, std=std, a=-3 * std, b=3 * std)
+        
+        # Special initialization for the final output projection layer
+        if hasattr(self.out, 'weight'):
+            std_out = math.sqrt(1 / (5 * h * L)) if L > 0 else std # Fallback if L is 0
+            nn.init.trunc_normal_(self.out.weight, std=std_out, a=-3 * std_out, b=3 * std_out)
+            # Initialize bias of the output layer to zero, if it exists
+            if self.out.bias is not None:
+                nn.init.zeros_(self.out.bias)
+
     def forward(self, tgt: th.Tensor, memory: th.Tensor, nmr_tokens: th.Tensor = None, num_loops: int = None):
         """ inputs:
             tgt: target sequence tensor, shape (B, T)
