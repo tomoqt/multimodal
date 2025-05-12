@@ -11,8 +11,8 @@ model:
   resample_size: 1000
   use_stablemax: False
   ir_encoder_type: convnext #regular, convnext
-  loop_range: [1, 20]
-  max_loops: 20
+  loop_range: [1, 30]
+  max_loops: 30
   automatic_loop_exit: False
   automatic_loop_exit_threshold: 1.0e-2
   use_loop_concat: True
@@ -59,7 +59,7 @@ optimizer:
 # Scheduler
 scheduler:
   type: cosine
-  warmup_steps: 100
+  warmup_steps: 1000
 
 
 data:

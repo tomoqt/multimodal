@@ -624,7 +624,7 @@ class ModelInference:
     def entropix_decode(self, nmr_tokens, ir_data, mass_data=None, max_len=128, top_k=5, 
                        entropy_threshold=1.0, varentropy_threshold=0.5, max_loops=3, 
                        automatic_loop_exit=False, automatic_loop_exit_threshold=0.01, 
-                       loop_increase_step=1):
+                       loop_increase_step=None):
         """
         Entropix tree search - uses entropy and varentropy to make branching decisions.
         
@@ -647,6 +647,8 @@ class ModelInference:
             the loop count used at each step for the corresponding sequence.
         """
         self.model.eval()
+        if loop_increase_step is None:
+            loop_increase_step = max_loops//3#defaulting to 1/3 in case not specified.
         with torch.no_grad():
             # Prepare inputs (for simplicity, only handle batch size 1)
             (nmr_tokens, ir_data, mass_data), batch_size = self.prepare_inputs(nmr_tokens, ir_data, mass_data)

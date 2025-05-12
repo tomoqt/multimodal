@@ -11,6 +11,7 @@ import pandas as pd
 from tabulate import tabulate
 import time
 from tqdm import tqdm
+import matplotlib.pyplot as plt # Added for plotting distributions
 
 from models.multimodal_to_smiles import MultiModalToSMILESModel
 from models.smiles_tokenizer import SmilesTokenizer
@@ -545,7 +546,7 @@ def combine_metrics(metrics_list):
         metrics_list: List of metrics dictionaries
         
     Returns:
-        Dictionary of combined metrics
+        Dictionary of combined metrics with means and standard deviations
     """
     # Skip empty list
     if not metrics_list:
@@ -568,7 +569,7 @@ def combine_metrics(metrics_list):
                     combined[k] = []
                 combined[k].append(v)
     
-    # Calculate averages - handle non-numeric values correctly
+    # Calculate means and standard deviations - handle non-numeric values correctly
     result = {}
     for k, v in combined.items():
         # Skip empty lists
@@ -577,17 +578,16 @@ def combine_metrics(metrics_list):
             
         # Check if values are numeric or strings
         if all(isinstance(x, (int, float, bool, np.number)) for x in v if x is not None):
-            # For numeric values, calculate mean, ignoring None values
-            # Special handling for 'avg_loops' to avoid averaging averages if already calculated
-            # Assuming avg_loops is already calculated per example
-            valid_values = [x for x in v if x is not None] 
+            # For numeric values, calculate mean and std, ignoring None values
+            valid_values = [x for x in v if x is not None]
             if valid_values:
                 result[k] = np.mean(valid_values)
+                result[f'{k}_std'] = np.std(valid_values)
             else:
-                result[k] = None # Or 0.0, depending on desired behavior for all None
+                result[k] = None
+                result[f'{k}_std'] = None
         else:
             # For non-numeric values (like strings), use the first non-None value
-            # This assumes these values should be the same across all metrics
             first_valid = next((item for item in v if item is not None), None)
             result[k] = first_valid
     
@@ -916,13 +916,13 @@ def main():
                 
                 metrics_rows.append({
                     'Method': strategy.capitalize().replace('_', ' '),
-                    'Valid SMILES': f"{metrics['valid_smiles']:.2%}",
-                    'Exact Match': f"{metrics['exact_match']:.2%}",
-                    'Tanimoto': f"{metrics['avg_tanimoto']:.4f}",
-                    'MCS Ratio': f"{metrics['avg_#mcs/#target']:.4f}",
-                    'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f}",
-                    'Avg Time': duration_str,  # Add timing info
-                    'Avg Loops': avg_loops_str # Add loop info (only for Entropix)
+                    'Valid SMILES': f"{metrics['valid_smiles']:.2%} ± {metrics.get('valid_smiles_std', 0):.2%}",
+                    'Exact Match': f"{metrics['exact_match']:.2%} ± {metrics.get('exact_match_std', 0):.2%}",
+                    'Tanimoto': f"{metrics['avg_tanimoto']:.4f} ± {metrics.get('avg_tanimoto_std', 0):.4f}",
+                    'MCS Ratio': f"{metrics['avg_#mcs/#target']:.4f} ± {metrics.get('avg_#mcs/#target_std', 0):.4f}",
+                    'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f} ± {metrics.get('avg_ecfp6_iou_std', 0):.4f}",
+                    'Avg Time': duration_str,
+                    'Avg Loops': avg_loops_str
                 })
         
         # Convert to DataFrame for nice printing
@@ -936,11 +936,13 @@ def main():
         results_file = output_dir / f"inference_results_{timestamp}.csv"
         # Add the Avg Time column to the DataFrame before saving
         metrics_df_save = metrics_df.copy() # Avoid modifying the printed df
-        metrics_df_save['Avg Time (s)'] = [metrics.get('duration', None) for metrics in aggregate_metrics.values() if metrics] # Add raw seconds for CSV
-        metrics_df_save.drop(columns=['Avg Time'], inplace=True) # Remove formatted string version
+        metrics_df_save['Avg Time (s)'] = [metrics.get('duration', None) for metrics in aggregate_metrics.values() if metrics]
+        metrics_df_save['Avg Time Std (s)'] = [metrics.get('duration_std', None) for metrics in aggregate_metrics.values() if metrics]
+        metrics_df_save.drop(columns=['Avg Time'], inplace=True)
         # Add raw avg_loops for CSV
-        metrics_df_save['Avg Loops (Entropix)'] = [metrics.get('avg_loops', None) for metrics in aggregate_metrics.values() if metrics] 
-        metrics_df_save.drop(columns=['Avg Loops'], inplace=True) # Remove formatted string version
+        metrics_df_save['Avg Loops (Entropix)'] = [metrics.get('avg_loops', None) for metrics in aggregate_metrics.values() if metrics]
+        metrics_df_save['Avg Loops Std (Entropix)'] = [metrics.get('avg_loops_std', None) for metrics in aggregate_metrics.values() if metrics]
+        metrics_df_save.drop(columns=['Avg Loops'], inplace=True)
         metrics_df_save.to_csv(results_file, index=False)
         print(f"\nSaved results to {results_file}")
         
@@ -950,12 +952,19 @@ def main():
             if metrics:
                 raw_metrics[strategy] = {
                     'valid_smiles': metrics['valid_smiles'],
+                    'valid_smiles_std': metrics.get('valid_smiles_std'),
                     'exact_match': metrics['exact_match'],
+                    'exact_match_std': metrics.get('exact_match_std'),
                     'avg_tanimoto': metrics['avg_tanimoto'],
+                    'avg_tanimoto_std': metrics.get('avg_tanimoto_std'),
                     'avg_#mcs/#target': metrics['avg_#mcs/#target'],
+                    'avg_#mcs/#target_std': metrics.get('avg_#mcs/#target_std'),
                     'avg_ecfp6_iou': metrics['avg_ecfp6_iou'],
-                    'avg_duration': metrics.get('duration', None), # Add timing info
-                    'avg_loops': metrics.get('avg_loops', None) # Add loop info (only for Entropix)
+                    'avg_ecfp6_iou_std': metrics.get('avg_ecfp6_iou_std'),
+                    'avg_duration': metrics.get('duration'),
+                    'avg_duration_std': metrics.get('duration_std'),
+                    'avg_loops': metrics.get('avg_loops'),
+                    'avg_loops_std': metrics.get('avg_loops_std')
                 }
         
         raw_file = output_dir / f"inference_raw_metrics_{timestamp}.json"
@@ -963,6 +972,54 @@ def main():
             json.dump(raw_metrics, f, indent=2)
         print(f"Saved raw metrics to {raw_file}")
         
+        # --- Plotting Metric Distributions ---
+        plot_output_dir = output_dir / f"inference_plots_{timestamp}"
+        plot_output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Saving metric distribution plots to {plot_output_dir}")
+
+        metric_keys_to_plot = [
+            'valid_smiles', 'exact_match', 'avg_tanimoto',
+            'avg_#mcs/#target', 'avg_ecfp6_iou', 'duration'
+        ]
+        # Add 'avg_loops' specifically for entropix if it was run
+        if 'entropix' in strategies and 'entropix' in all_strategy_metrics and all_strategy_metrics['entropix']:
+            if any('avg_loops' in m for m in all_strategy_metrics['entropix']):
+                 metric_keys_to_plot.append('avg_loops')
+
+        for strategy, metrics_list in all_strategy_metrics.items():
+            if not metrics_list: # Skip if no metrics for this strategy
+                continue
+            
+            strategy_plot_dir = plot_output_dir / strategy
+            strategy_plot_dir.mkdir(parents=True, exist_ok=True)
+
+            for metric_key in metric_keys_to_plot:
+                # Collect all values for this metric key for the current strategy
+                metric_values = [m[metric_key] for m in metrics_list if m is not None and metric_key in m and m[metric_key] is not None]
+                
+                if not metric_values:
+                    print(f"No data to plot for {metric_key} in {strategy} strategy.")
+                    continue
+
+                plt.figure(figsize=(10, 6))
+                plt.hist(metric_values, bins=50, edgecolor='black')
+                plt.title(f"Distribution of {metric_key} for {strategy.capitalize()} Strategy (N={len(metric_values)})")
+                plt.xlabel(metric_key)
+                plt.ylabel("Frequency")
+                mean_val = np.mean(metric_values)
+                std_val = np.std(metric_values)
+                plt.axvline(mean_val, color='r', linestyle='dashed', linewidth=1, label=f'Mean: {mean_val:.4f}')
+                plt.axvline(mean_val + std_val, color='g', linestyle='dashed', linewidth=1, label=f'Mean+Std: {mean_val+std_val:.4f}')
+                plt.axvline(mean_val - std_val, color='g', linestyle='dashed', linewidth=1, label=f'Mean-Std: {mean_val-std_val:.4f}')
+                plt.legend()
+                plt.grid(True)
+                
+                plot_filename = strategy_plot_dir / f"{strategy}_{metric_key.replace('#', 'num')}_distribution.png"
+                plt.savefig(plot_filename)
+                plt.close() # Close the figure to free memory
+            print(f"Finished plotting distributions for {strategy} strategy.")
+        # --- End Plotting ---
+
         # Print total time
         total_time = time.time() - start_time
         print(f"\nTotal time: {int(total_time // 60)} minutes {int(total_time % 60)} seconds")
@@ -1216,17 +1273,17 @@ def main():
         metrics_df = pd.DataFrame([
             {
                 'Method': method,
-                'Valid SMILES': f"{metrics['valid_smiles']:.2%}",
-                'Exact Match': f"{metrics['exact_match']:.2%}",
-                'Tanimoto': f"{metrics['avg_tanimoto']:.4f}",
-                'MCS Ratio': f"{metrics['avg_#mcs/#target']:.4f}",
-                'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f}",
+                'Valid SMILES': f"{metrics['valid_smiles']:.2%} ± {metrics.get('valid_smiles_std', 0):.2%}",
+                'Exact Match': f"{metrics['exact_match']:.2%} ± {metrics.get('exact_match_std', 0):.2%}",
+                'Tanimoto': f"{metrics['avg_tanimoto']:.4f} ± {metrics.get('avg_tanimoto_std', 0):.4f}",
+                'MCS Ratio': f"{metrics['avg_#mcs/#target']:.4f} ± {metrics.get('avg_#mcs/#target_std', 0):.4f}",
+                'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f} ± {metrics.get('avg_ecfp6_iou_std', 0):.4f}",
                 'Time (s)': f"{all_times.get(method, 0.0):.4f}",
-                'Avg Loops': (f"{metrics.get('avg_loops'):.2f}" 
+                'Avg Loops': (f"{metrics.get('avg_loops'):.2f} ± {metrics.get('avg_loops_std', 0):.2f}" 
                               if method == 'Entropix' and isinstance(metrics.get('avg_loops'), (int, float)) 
                               else "N/A")
             }
-            for method, metrics in all_metrics.items() if method in all_times # Ensure method has timing info
+            for method, metrics in all_metrics.items() if method in all_times
         ])
         
         # Print table

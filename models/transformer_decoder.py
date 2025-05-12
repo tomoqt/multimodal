@@ -215,7 +215,7 @@ class SMILESDecoder(nn.Module):
         self.nmr_embed = nn.Embedding(nmr_vocab_size, embed_dim)
         self.use_loop_concat = use_loop_concat
         if use_loop_concat:
-            self.loop_concat_adapter = nn.Linear(2*embed_dim, embed_dim) #adapts concatenation of original input to input dim of looped block. 
+            self.loop_concat_adapter = nn.Sequential(nn.Linear(2*embed_dim, embed_dim), nn.relu) #adapts concatenation of original input to input dim of looped block. 
         
         # Add input projection for memory if dimensions don't match
         self.memory_proj = nn.Identity() if ir_as_prompt else (nn.Linear(memory_dim, embed_dim) if memory_dim != embed_dim else nn.Identity())
@@ -375,7 +375,7 @@ class SMILESDecoder(nn.Module):
                         noise = th.randn_like(x) * noise_scale
                         # Add noise to the input
                         if self.use_loop_concat:
-                            x = self.loop_concat_adapter(th.cat([x, noise], dim=-1))
+                            x = self.loop_concat_adapter(th.cat([x_original, noise], dim=-1))
                         else:
                             x = x + noise
                         if self.verbose:
