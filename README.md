@@ -2,7 +2,8 @@
 
 ### Introduction
 This work aims at developing a set of models capable of representing the underlying physics of spectral information and utilizing to carry out a set of tasks. The dataset utilized, as well as some of the choices, are taken from https://arxiv.org/pdf/2407.17492 .
-
+[UPDATE] take a look at the 📄 [preprint](./preprint.pdf)
+! 
 ### Spectra to SMILES
 Our current effort is mainly allocated towards building a model that decodes molecular structure, in the shape of SMILES, from spectral information. The current implementation contains a set of convolutional encoders and a transformer-based decoder to autoregressively predict SMILES. 
 Currently, our work is taking the following (rapidly changing) directions: 
