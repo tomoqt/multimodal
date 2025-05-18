@@ -1,4 +1,4 @@
 Token list for PC5 vs PC6 visualization:
 Total tokens: 1
 
-1. [SEP] (pos 34)
+1. [SEP] (pos 54)

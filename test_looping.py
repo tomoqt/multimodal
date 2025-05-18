@@ -30,10 +30,12 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
     parser.add_argument('--config', type=str, default='configs/test_config.yaml', help='Path to configuration YAML file')
     parser.add_argument('--max_samples', type=int, default=5, help='Maximum number of dataset samples to process')
-    parser.add_argument('--max_loops', type=int, default=100, help='Maximum number of loops for greedy loop decoding')
+    parser.add_argument('--max_loops', type=int, default=100, help='Maximum number of loops for greedy loop decoding (used if loop_counts is not specified)')
+    parser.add_argument('--loop_counts', type=int, nargs='+', help='List of specific loop counts to evaluate (e.g., 1 5 15 30)')
     parser.add_argument('--split', type=str, default='test', help='Dataset split to use')
     parser.add_argument('--output_dir', type=str, default='inference_results', help='Directory to save results')
     parser.add_argument('--loops_representation', type=bool, default=False, help='Flag to track and return representations across loops')
+    parser.add_argument('--save_detailed_smiles', action='store_true', help='Save detailed target and predicted SMILES for each sample and loop count for plotting')
     args = parser.parse_args()
 
     # Load configuration
@@ -60,6 +62,14 @@ def main():
     auto_ir_as_prompt, extra_params = detect_ir_as_prompt(checkpoint, config)
     ir_as_prompt = auto_ir_as_prompt
 
+    # Determine loop counts for evaluation
+    if args.loop_counts:
+        loop_values = sorted(list(set(args.loop_counts))) # Use sorted unique values
+        model_max_loops = max(loop_values) if loop_values else args.max_loops
+    else:
+        loop_values = range(args.max_loops)
+        model_max_loops = args.max_loops
+
     # Get IR tokenizer if needed
     ir_tokenizer = None
     if ir_as_prompt:
@@ -84,7 +94,7 @@ def main():
         'use_stablemax': config['model'].get('use_stablemax', False),
         'ir_as_prompt': ir_as_prompt,
         'ir_encoder_type': config['model'].get('ir_encoder_type', 'regular'),
-        'max_loops': args.max_loops,
+        'max_loops': model_max_loops,
         'loops_representation': args.loops_representation,
         'use_loop_concat': config['model'].get('use_loop_concat', True),
         'use_rmsnorm': config['model'].get('use_rmsnorm', True)
@@ -124,10 +134,11 @@ def main():
 
     # Dictionary to hold aggregated metrics for each loop count
     loop_metric_results = {}
+    detailed_smiles_output = [] # To store SMILES strings for plotting
 
     start_time = time.time()
     # Loop over different num_loops values for greedy loop decoding
-    for loop_count in range(args.max_loops):
+    for loop_count in loop_values:
         sample_metrics = []
         print(f"\nTesting Greedy Loop Decoding with num_loops = {loop_count}")
         for idx in tqdm(range(num_samples), desc=f"Loop Count {loop_count}"):
@@ -148,39 +159,72 @@ def main():
             )
             # Evaluate metrics for this sample
             if args.loops_representation:
-                metrics = evaluate_similarity(results[0], target_smiles, f"Greedy Loop (num_loops={loop_count})")
+                prediction_smiles = results[0]
+                metrics = evaluate_similarity(prediction_smiles, target_smiles, f"Greedy Loop (num_loops={loop_count})")
             else:
-                metrics = evaluate_similarity(results, target_smiles, f"Greedy Loop (num_loops={loop_count})")
+                prediction_smiles = results
+                metrics = evaluate_similarity(prediction_smiles, target_smiles, f"Greedy Loop (num_loops={loop_count})")
             sample_metrics.append(metrics)
+
+            if args.save_detailed_smiles:
+                detailed_smiles_output.append({
+                    'loop_count': loop_count,
+                    'sample_index': idx,
+                    'target_smiles': target_smiles,
+                    'predicted_smiles': prediction_smiles,
+                    'is_valid': metrics.get('valid_smiles', 0.0) >= 1.0, # Assuming 1.0 for True
+                    'is_exact_match': metrics.get('exact_match', 0.0) >= 1.0, # Assuming 1.0 for True
+                    'tanimoto_similarity': metrics.get('avg_tanimoto', 0.0) # This should be the Tanimoto for this specific sample
+                })
         # Aggregate metrics over all samples for this loop count
         aggregated = combine_metrics(sample_metrics)
         loop_metric_results[loop_count] = aggregated
 
     total_time = time.time() - start_time
 
-    # Prepare results table
-    rows = []
+    # Prepare results table (Table 1: Detailed Metrics)
+    rows_table1 = []
     for loop_count, metrics in loop_metric_results.items():
-        rows.append({
+        rows_table1.append({
             'Num Loops': loop_count,
-            'Valid SMILES': f"{metrics['valid_smiles']:.2%}",
-            'Exact Match': f"{metrics['exact_match']:.2%}",
-            'Tanimoto': f"{metrics['avg_tanimoto']:.4f}",
-            'MCS Ratio': f"{metrics['avg_#mcs/#target']:.4f}",
-            'ECFP6 IoU': f"{metrics['avg_ecfp6_iou']:.4f}"
+            'Valid SMILES': f"{metrics.get('valid_smiles', 0):.2%} ± {metrics.get('valid_smiles_stderr', 0):.2%}",
+            'Exact Match (Best)': f"{metrics.get('exact_match', 0):.2%} ± {metrics.get('exact_match_stderr', 0):.2%}",
+            'Tanimoto': f"{metrics.get('avg_tanimoto', 0):.4f} ± {metrics.get('avg_tanimoto_stderr', 0):.4f}",
+            'MCS Ratio': f"{metrics.get('avg_#mcs/#target', 0):.4f} ± {metrics.get('avg_#mcs/#target_stderr', 0):.4f}",
+            'ECFP6 IoU': f"{metrics.get('avg_ecfp6_iou', 0):.4f} ± {metrics.get('avg_ecfp6_iou_stderr', 0):.4f}"
         })
-    print("\n===== Aggregate Metrics for Greedy Loop Decoding =====")
-    print(tabulate(rows, headers="keys", tablefmt="psql", showindex=False))
+    print("\n===== Aggregate Metrics for Greedy Loop Decoding (Table 1: Detailed) =====")
+    print(tabulate(rows_table1, headers="keys", tablefmt="psql", showindex=False))
+    
+    # Prepare results table (Table 2: Exact Match All)
+    rows_table2 = []
+    for loop_count, metrics in loop_metric_results.items():
+        rows_table2.append({
+            'Num Loops': loop_count,
+            'Exact Match (All)': f"{metrics.get('exact_match_all', 0):.2%} ± {metrics.get('exact_match_all_stderr', 0):.2%}"
+        })
+    print("\n===== Aggregate Metrics for Greedy Loop Decoding (Table 2: Exact Match - All Predictions) =====")
+    print(tabulate(rows_table2, headers="keys", tablefmt="psql", showindex=False))
+
     print(f"\nTotal time: {int(total_time // 60)} minutes {int(total_time % 60)} seconds")
 
-    # Save results to CSV file
+    # Save results to CSV file (Consider how to save both tables or if the current CSV is sufficient)
+    # For now, the CSV will still be based on the first table's structure.
+    # If you need `exact_match_all` in the CSV, we'll need to adjust this part.
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     results_file = output_dir / f"greedy_loop_full_dataset_{timestamp}.csv"
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows_table1)
     df.to_csv(results_file, index=False)
-    print(f"Saved aggregate metrics to {results_file}")
+    print(f"Saved aggregate metrics (from Table 1) to {results_file}")
+
+    # Save detailed SMILES data if requested
+    if args.save_detailed_smiles:
+        detailed_smiles_df = pd.DataFrame(detailed_smiles_output)
+        detailed_results_file = output_dir / f"detailed_smiles_by_loop_{timestamp}.csv"
+        detailed_smiles_df.to_csv(detailed_results_file, index=False)
+        print(f"Saved detailed SMILES data for plotting to {detailed_results_file}")
 
 if __name__ == '__main__':
     main()

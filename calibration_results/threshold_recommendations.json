@@ -1,32 +1,59 @@
 {
   "entropy": {
     "quantiles": {
-      "0.25": 0.10480140335857868,
-      "0.5": 0.6398797035217285,
-      "0.75": 1.2388595640659332,
-      "0.9": 1.729896092414856
+      "0.25": 0.0019393742841202766,
+      "0.5": 0.011620842386037111,
+      "0.75": 0.18871236965060234,
+      "0.9": 0.6984267234802253
     },
-    "mean": 0.750419169785882,
-    "std": 0.669059154081644,
+    "mean": 0.17796919647432213,
+    "std": 0.32323913545976934,
     "recommended_thresholds": {
-      "conservative": 0.6398797035217285,
-      "moderate": 1.2388595640659332,
-      "aggressive": 1.729896092414856
+      "conservative": 0.011620842386037111,
+      "moderate": 0.18871236965060234,
+      "aggressive": 0.6984267234802253
     }
   },
   "varentropy": {
     "quantiles": {
-      "0.25": 0.6172901690006256,
-      "0.5": 1.250535249710083,
-      "0.75": 2.0395366549491882,
-      "0.9": 2.714863085746765
+      "0.25": 0.02101805154234171,
+      "0.5": 0.08940901607275009,
+      "0.75": 0.4543004184961319,
+      "0.9": 0.884447103738785
     },
-    "mean": 1.4254745325797749,
-    "std": 1.0330717456409009,
+    "mean": 0.28918912267626956,
+    "std": 0.3916929755189949,
     "recommended_thresholds": {
-      "conservative": 1.250535249710083,
-      "moderate": 2.0395366549491882,
-      "aggressive": 2.714863085746765
+      "conservative": 0.08940901607275009,
+      "moderate": 0.4543004184961319,
+      "aggressive": 0.884447103738785
+    }
+  },
+  "entropix_decode_params": {
+    "conservative": {
+      "entropy_threshold": 0.011620842386037111,
+      "varentropy_threshold": 0.08940901607275009,
+      "max_loops": 3,
+      "automatic_loop_exit": false,
+      "top_k": 5,
+      "loop_increase_step": 1
+    },
+    "moderate": {
+      "entropy_threshold": 0.18871236965060234,
+      "varentropy_threshold": 0.4543004184961319,
+      "max_loops": 3,
+      "automatic_loop_exit": false,
+      "top_k": 5,
+      "loop_increase_step": 1
+    },
+    "aggressive": {
+      "entropy_threshold": 0.6984267234802253,
+      "varentropy_threshold": 0.884447103738785,
+      "max_loops": 3,
+      "automatic_loop_exit": true,
+      "automatic_loop_exit_threshold": 0.01,
+      "top_k": 5,
+      "loop_increase_step": 1
     }
   }
 }

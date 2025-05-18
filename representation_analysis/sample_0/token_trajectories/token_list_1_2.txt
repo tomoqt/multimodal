@@ -1,4 +1,4 @@
 Token list for PC1 vs PC2 visualization:
 Total tokens: 1
 
-1. [SEP] (pos 34)
+1. [SEP] (pos 54)

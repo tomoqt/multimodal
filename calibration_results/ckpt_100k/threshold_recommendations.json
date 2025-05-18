@@ -1,0 +1,59 @@
+{
+  "entropy": {
+    "quantiles": {
+      "0.25": 0.0020515344222076237,
+      "0.5": 0.011688848491758108,
+      "0.75": 0.18599820509552956,
+      "0.9": 0.7027553379535675
+    },
+    "mean": 0.1796987789878144,
+    "std": 0.3265950761628682,
+    "recommended_thresholds": {
+      "conservative": 0.011688848491758108,
+      "moderate": 0.18599820509552956,
+      "aggressive": 0.7027553379535675
+    }
+  },
+  "varentropy": {
+    "quantiles": {
+      "0.25": 0.02171451598405838,
+      "0.5": 0.0888521634042263,
+      "0.75": 0.4704253226518631,
+      "0.9": 0.8602061986923217
+    },
+    "mean": 0.28947771619918167,
+    "std": 0.39023568159863997,
+    "recommended_thresholds": {
+      "conservative": 0.0888521634042263,
+      "moderate": 0.4704253226518631,
+      "aggressive": 0.8602061986923217
+    }
+  },
+  "entropix_decode_params": {
+    "conservative": {
+      "entropy_threshold": 0.011688848491758108,
+      "varentropy_threshold": 0.0888521634042263,
+      "max_loops": 3,
+      "automatic_loop_exit": false,
+      "top_k": 5,
+      "loop_increase_step": 1
+    },
+    "moderate": {
+      "entropy_threshold": 0.18599820509552956,
+      "varentropy_threshold": 0.4704253226518631,
+      "max_loops": 3,
+      "automatic_loop_exit": false,
+      "top_k": 5,
+      "loop_increase_step": 1
+    },
+    "aggressive": {
+      "entropy_threshold": 0.7027553379535675,
+      "varentropy_threshold": 0.8602061986923217,
+      "max_loops": 3,
+      "automatic_loop_exit": true,
+      "automatic_loop_exit_threshold": 0.01,
+      "top_k": 5,
+      "loop_increase_step": 1
+    }
+  }
+}

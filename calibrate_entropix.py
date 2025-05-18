@@ -11,10 +11,9 @@ from pathlib import Path
 import yaml
 from tqdm import tqdm
 from scipy import stats
-
+from inference.inference import ModelInference, DecodingStrategy
 from models.multimodal_to_smiles import MultiModalToSMILESModel
 from models.smiles_tokenizer import SmilesTokenizer
-from inference import ModelInference, DecodingStrategy
 
 # Import helper functions from test_inference.py
 from test_inference import load_config, load_raw_spectrum_tokens, load_raw_ir, detect_ir_as_prompt, get_ir_tokenizer
@@ -31,10 +30,12 @@ def parse_args():
     parser.add_argument('--max_seq_steps', type=int, default=90, help='Maximum number of sequence steps to analyze per sample')
     parser.add_argument('--ir_as_prompt', action='store_true', help='Use IR as prompt tokens')
     parser.add_argument('--no_ir_as_prompt', action='store_true', help='Do not use IR as prompt tokens')
+    parser.add_argument('--top_k', type=int, default=5, help='Number of top candidates to consider for threshold analysis')
+    parser.add_argument('--max_loops', type=int, default=3, help='Maximum number of loops to use in analysis')
     return parser.parse_args()
 
 
-def collect_entropy_stats(model, tokenizer, dataset, device, ir_as_prompt, num_samples=0, max_seq_steps=50):
+def collect_entropy_stats(model, tokenizer, dataset, device, ir_as_prompt, num_samples=0, max_seq_steps=50, top_k=5):
     """
     Collect entropy and varentropy statistics from model predictions on a dataset.
     
@@ -46,6 +47,7 @@ def collect_entropy_stats(model, tokenizer, dataset, device, ir_as_prompt, num_s
         ir_as_prompt: Whether IR is used as prompt tokens
         num_samples: Number of samples to analyze (0 for all)
         max_seq_steps: Maximum number of sequence steps to analyze per sample
+        top_k: Number of top candidates to consider
         
     Returns:
         A pandas DataFrame with entropy and varentropy statistics
@@ -163,6 +165,35 @@ def calculate_threshold_recommendations(df):
         }
     }
     
+    # Add example Entropix parameters
+    recommendations['entropix_decode_params'] = {
+        'conservative': {
+            'entropy_threshold': entropy_quantiles[0.5],
+            'varentropy_threshold': varentropy_quantiles[0.5],
+            'max_loops': 3,
+            'automatic_loop_exit': False,
+            'top_k': 5,
+            'loop_increase_step': 1
+        },
+        'moderate': {
+            'entropy_threshold': entropy_quantiles[0.75],
+            'varentropy_threshold': varentropy_quantiles[0.75],
+            'max_loops': 3,
+            'automatic_loop_exit': False,
+            'top_k': 5,
+            'loop_increase_step': 1
+        },
+        'aggressive': {
+            'entropy_threshold': entropy_quantiles[0.9],
+            'varentropy_threshold': varentropy_quantiles[0.9],
+            'max_loops': 3,
+            'automatic_loop_exit': True,
+            'automatic_loop_exit_threshold': 0.01,
+            'top_k': 5,
+            'loop_increase_step': 1
+        }
+    }
+    
     return recommendations
 
 
@@ -267,7 +298,7 @@ def main():
     
     # Initialize tokenizers
     current_dir = os.path.dirname(os.path.realpath(__file__))
-    vocab_path = os.path.join(current_dir, 'vocab.txt')
+    vocab_path = 'training/vocab.txt'
     tokenizer = SmilesTokenizer(vocab_file=vocab_path)
     
     nmr_vocab_path = Path(config['data']['tokenized_dir']).parent / 'vocab.json'
@@ -321,7 +352,8 @@ def main():
         'use_stablemax': config['model'].get('use_stablemax', False),
         'ir_as_prompt': ir_as_prompt,
         'ir_encoder_type': config['model'].get('ir_encoder_type', 'regular'),
-        'max_loops': 3  # Default value, not important for calibration
+        'max_loops': args.max_loops,
+        'use_rmsnorm': config['model'].get('use_rmsnorm', True)
     }
     
     # Add ir_vocab_size if needed
@@ -367,7 +399,8 @@ def main():
         device=device,
         ir_as_prompt=ir_as_prompt,
         num_samples=args.num_samples,
-        max_seq_steps=args.max_seq_steps
+        max_seq_steps=args.max_seq_steps,
+        top_k=args.top_k
     )
     
     # Save raw statistics
@@ -403,6 +436,12 @@ def main():
     print(f"  Conservative: {recommendations['varentropy']['recommended_thresholds']['conservative']:.4f}")
     print(f"  Moderate: {recommendations['varentropy']['recommended_thresholds']['moderate']:.4f}")
     print(f"  Aggressive: {recommendations['varentropy']['recommended_thresholds']['aggressive']:.4f}")
+    
+    # Print example command for using Entropix decoding
+    entropy_threshold = recommendations['entropy']['recommended_thresholds']['moderate']
+    varentropy_threshold = recommendations['varentropy']['recommended_thresholds']['moderate']
+    print("\nExample command for Entropix decoding with moderate thresholds:")
+    print(f"python inference.py --checkpoint {args.checkpoint} --config {args.config} --strategy entropix --entropy_threshold {entropy_threshold:.4f} --varentropy_threshold {varentropy_threshold:.4f} --max_loops {args.max_loops}")
     
     print("\nCalibration complete! Use these threshold values with the Entropix decoding strategy.")
 

@@ -660,7 +660,7 @@ def plot_zoomed_trajectory(pca_results, tokens, output_dir, token_to_visualize, 
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze Loop Representations and Generate PCA Visualizations")
-    parser.add_argument('--checkpoint', type=str,default = 'checkpoints/best_model.pt', help='Path to model checkpoint')
+    parser.add_argument('--checkpoint', type=str,default = 'checkpoints/100k.pt', help='Path to model checkpoint')
     parser.add_argument('--config', type=str, default='configs/test_config.yaml', help='Path to configuration YAML file')
     parser.add_argument('--max_loops', type=int, default=30, help='Maximum number of loops for representation analysis')
     parser.add_argument('--sample_idx', type=int, default=0, help='Index of the sample to analyze in the dataset')
@@ -718,7 +718,8 @@ def main():
         'ir_as_prompt': ir_as_prompt,
         'ir_encoder_type': config['model'].get('ir_encoder_type', 'regular'),
         'max_loops': args.max_loops,
-        'loops_representation': True  # Enable representation tracking
+        'loops_representation': True,  # Enable representation tracking
+        'use_rmsnorm': True
     }
     if ir_as_prompt:
         if 'ir_vocab_size' in extra_params:

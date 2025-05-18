@@ -50,7 +50,7 @@ except ImportError as e:
     MODEL_FILES_AVAILABLE = False
 
 # --- User Configuration: MODIFY THESE PATHS ---
-CHECKPOINT_PATH = "checkpoints/largest_new.pt"  # e.g., 'checkpoints/model.pth'
+CHECKPOINT_PATH = "checkpoints/100k.pt"  # e.g., 'checkpoints/model.pth'
 CONFIG_PATH = "configs/real_config.yaml"        # e.g., 'configs/test_config.yaml'
 # SMILES_VOCAB_PATH is often relative to the script or a known 'training' dir
 # Defaulting to a common pattern, adjust if your vocab.txt is elsewhere.
@@ -69,7 +69,7 @@ CONFIG = None
 IR_AS_PROMPT = False
 MODEL_LOADED_SUCCESSFULLY = False
 
-GRADIO_MAX_REFINE_LOOPS = 15 # Number of internal model loops to show step-by-step
+GRADIO_MAX_REFINE_LOOPS = 30 # Number of internal model loops to show step-by-step
 GRADIO_MAX_DISPLAY_STEPS = 195 # Max autoregressive steps to show in Gradio
 
 # --- Helper Functions ---
@@ -282,7 +282,6 @@ def predict_step_by_step_gradio(nmr_data_tensor, ir_data_tensor, target_smiles_s
     max_generation_len = CONFIG['model'].get('max_seq_length', GRADIO_MAX_DISPLAY_STEPS)
     current_metrics_html = BLANK_METRICS_HTML
 
-    # num_loops=1 for the internal decoder call at each autoregressive step.
     # This means we are not focusing on the model's internal refinement loops here,
     # but on the token-by-token generation.
     step_iterator = INFERENCE.greedy_decode_step_by_step(
@@ -390,14 +389,23 @@ def get_random_sample_and_predict_gradio():
          target_tokens, nmr_data, _ = DATASET[idx] # Assuming this structure if IR is missing
          ir_data = None
 
-    nmr_tensor = nmr_data.unsqueeze(0).to(DEVICE) if nmr_data.ndim == 1 else nmr_data.to(DEVICE)
-    if nmr_tensor.ndim == 1: nmr_tensor = nmr_tensor.unsqueeze(0)
+    # NMR DATA
+    nmr_tensor = nmr_data.to(DEVICE) # Assuming nmr_data from dataset is a tensor
+    if nmr_tensor.ndim == 0: # Was scalar
+        nmr_tensor = nmr_tensor.view(1, 1) # Reshape to [1,1]
+    elif nmr_tensor.ndim == 1: # Was 1D array [S]
+        nmr_tensor = nmr_tensor.unsqueeze(0) # Reshape to [1,S]
+    # If nmr_tensor.ndim >= 2, assume it's already like [1,S] for a single sample.
 
-
+    # IR DATA
     ir_tensor = None
     if IR_AS_PROMPT and ir_data is not None:
-        ir_tensor = ir_data.unsqueeze(0).to(DEVICE) if ir_data.ndim == 1 else ir_data.to(DEVICE)
-        if ir_tensor.ndim == 1: ir_tensor = ir_tensor.unsqueeze(0)
+        ir_tensor = ir_data.to(DEVICE) # Assuming ir_data from dataset is a tensor
+        if ir_tensor.ndim == 0: # Was scalar
+            ir_tensor = ir_tensor.view(1, 1) # Reshape to [1,1]
+        elif ir_tensor.ndim == 1: # Was 1D array [S]
+            ir_tensor = ir_tensor.unsqueeze(0) # Reshape to [1,S]
+        # If ir_tensor.ndim >= 2, assume it's already like [1,S] for a single sample.
 
 
     target_smiles_str = DATASET.targets[idx] # Assumes DATASET.targets is populated

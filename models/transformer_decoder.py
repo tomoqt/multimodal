@@ -364,6 +364,9 @@ class SMILESDecoder(nn.Module):
                 # Store the original input to the middle layer
                 x_original = x.clone()
                 
+                # Initialize prev_diff_norm for the difference of differences calculation
+                prev_diff_norm = None
+                
                 # Loop through the middle layer num_loops times
                 for loop_idx in range(num_loops):
                     
@@ -391,11 +394,21 @@ class SMILESDecoder(nn.Module):
                     # automatically exit loop if we converge.
                     if self.automatic_loop_exit:
                         x_new = layer(x,mask)
-                        diff_norm = th.norm(x_new - x, dim=-1)
-                        if (diff_norm.max() < self.automatic_loop_exit_threshold): # take max difference to indicate convergence.
-                            break
-                        else:
-                            x = x_new
+                        current_diff_norm_tensor = th.norm(x_new - x, dim=-1)
+                        current_diff_norm = current_diff_norm_tensor.mean(dim=-1) # Get a scalar value per batch item
+
+                        #print(f"Current diff norm: {current_diff_norm}")
+
+                        if prev_diff_norm is not None and loop_idx > 1: # Need at least two diff_norms to compare
+                            diff_of_diffs = th.abs(current_diff_norm - prev_diff_norm)
+                            #print(f"Diff of diffs: {diff_of_diffs}")
+                            if (diff_of_diffs < self.automatic_loop_exit_threshold):
+                                #print(f"Converged at loop {loop_idx} with diff_of_diffs {diff_of_diffs.item():.6f} (threshold {self.automatic_loop_exit_threshold:.6f})")
+                                x = x_new # Make sure to use the latest x
+                                break
+                        
+                        prev_diff_norm = current_diff_norm
+                        x = x_new
 
                     else:
                         x = layer(x, mask)
