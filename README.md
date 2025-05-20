@@ -34,7 +34,7 @@ The dataset and several design choices are based on the paper at <https://arxiv.
        --out_path tokenized_baseline \
        --h_nmr --c_nmr --ir --formula
    ```
-4. **Fetch pre-tokenized data and build the vocabulary**
+Alternatively **Fetch pre-tokenized data and build the vocabulary**
    ```bash
    python3 data/download_tokenized_dataset.py
    python3 data/build_vocab.py
