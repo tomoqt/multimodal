@@ -66,6 +66,7 @@ class GRPO:
         use_ecfp6_reward=False,
         use_valid_smiles_reward=False,
         use_mcs_ratio_reward=False,
+        use_cot_reward=False,
         temperature=1,
         device=None,
         use_kl=True,
@@ -127,9 +128,17 @@ class GRPO:
         self.use_ecfp6_reward = use_ecfp6_reward
         self.use_valid_smiles_reward = use_valid_smiles_reward
         self.use_mcs_ratio_reward = use_mcs_ratio_reward
+        self.use_cot_reward = use_cot_reward
         
         # Ensure at least one reward is active
-        assert self.use_exact_match_reward or self.use_tanimoto_reward or self.use_ecfp6_reward or self.use_valid_smiles_reward or self.use_mcs_ratio_reward, "At least one reward function must be enabled"
+        assert (
+            self.use_exact_match_reward
+            or self.use_tanimoto_reward
+            or self.use_ecfp6_reward
+            or self.use_valid_smiles_reward
+            or self.use_mcs_ratio_reward
+            or self.use_cot_reward
+        ), "At least one reward function must be enabled"
         
         # Print reward configuration
         print(f"[GRPO] 🎯 Active rewards:")
@@ -138,6 +147,7 @@ class GRPO:
         print(f"  - ECFP6 reward: {'✓' if self.use_ecfp6_reward else '✗'}")
         print(f"  - Valid SMILES reward: {'✓' if self.use_valid_smiles_reward else '✗'}")
         print(f"  - MCS Ratio reward: {'✓' if self.use_mcs_ratio_reward else '✗'}")
+        print(f"  - CoT structure reward: {'✓' if self.use_cot_reward else '✗'}")
 
         # For the MultiModal model, we're not using LoRA adapters
         self.using_lora = False
@@ -418,19 +428,31 @@ class GRPO:
         total_tanimoto = 0.0
         total_ecfp6 = 0.0
         total_mcs_ratio = 0.0
+        total_cot = 0.0
         
         # Match generated SMILES with their targets based on group position
         for i, generated in enumerate(generated_smiles):
             target_idx = i % batch_size  # Cycle through targets based on group position
             target = original_targets[target_idx]
-            
+
+            # Extract potential answer from CoT formatted string
+            parsed_answer = parse_cot_answer(generated)
+            gen_for_eval = parsed_answer if parsed_answer else generated
+
             # Initialize reward for this sample
             reward = 0.0
-            
+
+            # CoT structure reward
+            cot_score = 0.0
+            if self.use_cot_reward:
+                cot_score = cot_structure_reward(generated)
+                reward += cot_score
+                total_cot += cot_score
+
             # Apply exact match reward if enabled
             exact_match_score = 0.0
             if self.use_exact_match_reward:
-                exact_match_score = exact_match_reward(target, generated)
+                exact_match_score = exact_match_reward(target, gen_for_eval)
                 reward += exact_match_score
                 if exact_match_score > 0:
                     exact_matches += 1
@@ -438,21 +460,21 @@ class GRPO:
             # Apply Tanimoto similarity reward if enabled
             tanimoto_score = 0.0
             if self.use_tanimoto_reward:
-                tanimoto_score = tanimoto_reward(target, generated)
+                tanimoto_score = tanimoto_reward(target, gen_for_eval)
                 reward += tanimoto_score
                 total_tanimoto += tanimoto_score
             
             # Apply ECFP6 reward if enabled
             ecfp6_score = 0.0
             if self.use_ecfp6_reward:
-                ecfp6_score = ecfp6_reward(target, generated)
+                ecfp6_score = ecfp6_reward(target, gen_for_eval)
                 reward += ecfp6_score
                 total_ecfp6 += ecfp6_score
             
             # Apply MCS ratio reward if enabled
             mcs_ratio_score = 0.0
             if self.use_mcs_ratio_reward:
-                mcs_ratio_score = mcs_ratio_reward(target, generated)
+                mcs_ratio_score = mcs_ratio_reward(target, gen_for_eval)
                 reward += mcs_ratio_score
                 total_mcs_ratio += mcs_ratio_score
             
@@ -460,7 +482,7 @@ class GRPO:
             mol = None
             valid_smiles_score = 0.0
             try:
-                mol = Chem.MolFromSmiles(generated)
+                mol = Chem.MolFromSmiles(gen_for_eval)
                 if mol is not None:
                     valid_count += 1
                     valid_smiles_score = 1.0
@@ -486,6 +508,8 @@ class GRPO:
                     self.metrics["valid_smiles_rewards"].append(valid_smiles_score)
                 if self.use_mcs_ratio_reward:
                     self.metrics["mcs_ratio_rewards"].append(mcs_ratio_score)
+                if self.use_cot_reward:
+                    self.metrics["cot_rewards"].append(cot_score)
                 
                 if mol is not None:
                     self.metrics["valid_molecule"].append(1.0)
@@ -499,6 +523,7 @@ class GRPO:
         avg_tanimoto = total_tanimoto / total if self.use_tanimoto_reward else 0.0
         avg_ecfp6 = total_ecfp6 / total if self.use_ecfp6_reward else 0.0
         avg_mcs_ratio = total_mcs_ratio / total if self.use_mcs_ratio_reward else 0.0
+        avg_cot = total_cot / total if self.use_cot_reward else 0.0
         
         print(f"[GRPO] 📊 Reward stats:")
         print(f"  - Valid SMILES: {valid_count}/{total} ({valid_pct:.2f}%)")
@@ -510,6 +535,8 @@ class GRPO:
             print(f"  - Avg ECFP6 IoU: {avg_ecfp6:.4f}")
         if self.use_mcs_ratio_reward:
             print(f"  - Avg MCS ratio: {avg_mcs_ratio:.4f}")
+        if self.use_cot_reward:
+            print(f"  - CoT format rate: {avg_cot:.4f}")
         
         print(f"[DEBUG] Exact match rate: {exact_matches}/{total} = {exact_matches/total:.4f}")
         
@@ -528,6 +555,8 @@ class GRPO:
                 self.metrics["avg_ecfp6"].append(avg_ecfp6)
             if self.use_mcs_ratio_reward:
                 self.metrics["avg_mcs_ratio"].append(avg_mcs_ratio)
+            if self.use_cot_reward:
+                self.metrics["avg_cot"].append(avg_cot)
         
         return rewards.tolist()
 
@@ -1002,6 +1031,23 @@ def mcs_ratio_reward(target, generated):
     except:
         return 0.0
 
+def parse_cot_answer(text: str) -> str:
+    """Extract the answer portion from a CoT-formatted string."""
+    if "<answer>" in text and "</answer>" in text:
+        return text.split("<answer>")[1].split("</answer>")[0].strip()
+    return ""
+
+
+def cot_structure_reward(text: str) -> float:
+    """Reward if the text follows the <thinking>...</thinking><answer>...</answer> template."""
+    required_tags = ["<thinking>", "</thinking>", "<answer>", "</answer>"]
+    if all(tag in text for tag in required_tags):
+        if text.count("<thinking>") == 1 and text.count("</thinking>") == 1 and text.count("<answer>") == 1 and text.count("</answer>") == 1:
+            if text.index("</thinking>") < text.index("<answer>"):
+                if text.split("</answer>")[1].strip() == "":
+                    return 1.0
+    return 0.0
+
 def load_pretrained_model(checkpoint_path, config, device):
     """Load a pretrained model from a checkpoint"""
     print(f"Loading pretrained model from {checkpoint_path}")
@@ -1064,6 +1110,7 @@ def main():
     parser.add_argument('--ecfp6-reward', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Use ECFP6 IoU reward (true/false)')
     parser.add_argument('--valid-smiles-reward', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Use valid SMILES reward (true/false)')
     parser.add_argument('--mcs-ratio-reward', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Use MCS ratio reward (true/false)')
+    parser.add_argument('--cot-reward', type=lambda s: s.lower() in ["true", "1", "yes"], default=None, help='Reward correct CoT format (true/false)')
     parser.add_argument('--log-frequency', type=int, default=None, help='Number of iterations between metric logging')
     parser.add_argument('--validation-frequency', type=int, default=None, help='Number of iterations between validations')
 
@@ -1111,8 +1158,10 @@ def main():
                                             else config['rl']['grpo'].get('ecfp6_reward', True))
     config['rl']['grpo']['valid_smiles_reward'] = (args.valid_smiles_reward if args.valid_smiles_reward is not None 
                                                     else config['rl']['grpo'].get('valid_smiles_reward', True))
-    config['rl']['grpo']['mcs_ratio_reward'] = (args.mcs_ratio_reward if args.mcs_ratio_reward is not None 
+    config['rl']['grpo']['mcs_ratio_reward'] = (args.mcs_ratio_reward if args.mcs_ratio_reward is not None
                                                  else config['rl']['grpo'].get('mcs_ratio_reward', True))
+    config['rl']['grpo']['cot_reward'] = (args.cot_reward if args.cot_reward is not None
+                                          else config['rl']['grpo'].get('cot_reward', False))
 
     log_frequency = (args.log_frequency if args.log_frequency is not None 
                      else config['training'].get('logging_frequency', 10))
@@ -1196,14 +1245,16 @@ def main():
     print(f"- ECFP6 reward: {'ENABLED' if config['rl']['grpo']['ecfp6_reward'] else 'DISABLED'}")
     print(f"- Valid SMILES reward: {'ENABLED' if config['rl']['grpo']['valid_smiles_reward'] else 'DISABLED'}")
     print(f"- MCS Ratio reward: {'ENABLED' if config['rl']['grpo']['mcs_ratio_reward'] else 'DISABLED'}")
+    print(f"- CoT format reward: {'ENABLED' if config['rl']['grpo']['cot_reward'] else 'DISABLED'}")
     print(f"==================================\n")
     
     # Ensure at least one reward is active
     if not (config['rl']['grpo']['exact_match_reward'] or 
             config['rl']['grpo']['tanimoto_reward'] or 
             config['rl']['grpo']['ecfp6_reward'] or 
-            config['rl']['grpo']['valid_smiles_reward'] or 
-            config['rl']['grpo']['mcs_ratio_reward']):
+            config['rl']['grpo']['valid_smiles_reward'] or
+            config['rl']['grpo']['mcs_ratio_reward'] or
+            config['rl']['grpo']['cot_reward']):
         print("ERROR: At least one reward function must be enabled!")
         return
 
@@ -1235,6 +1286,7 @@ def main():
         use_ecfp6_reward=config['rl']['grpo']['ecfp6_reward'],
         use_valid_smiles_reward=config['rl']['grpo']['valid_smiles_reward'],
         use_mcs_ratio_reward=config['rl']['grpo']['mcs_ratio_reward'],
+        use_cot_reward=config['rl']['grpo']['cot_reward'],
         log_wandb=config['rl']['grpo']['log_wandb'],
         lr=config['rl']['grpo']['learning_rate'],
         beta=config['rl']['grpo']['beta'],
