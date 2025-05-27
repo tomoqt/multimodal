@@ -63,7 +63,8 @@ def compute_pca_for_representations(representations, n_components=6):
     
     return pca, transformed_reps
 
-def plot_pca_trajectories(pca_results, tokens, output_dir, token_to_visualize=None, tokenizer=None):
+def plot_pca_trajectories(pca_results, tokens, output_dir, token_to_visualize=None, tokenizer=None,
+                          early_exit_loop_index=None, plot_early_exit_point_flag=True):
     """
     Plot PCA trajectories of representations across loops.
     
@@ -73,6 +74,8 @@ def plot_pca_trajectories(pca_results, tokens, output_dir, token_to_visualize=No
         output_dir: Directory to save the plots
         token_to_visualize: Specific token ID to visualize, or None for all tokens
         tokenizer: Tokenizer to convert token IDs to strings for the legend
+        early_exit_loop_index: Index of the loop where the early exit condition is met, or None (ignored in this function now)
+        plot_early_exit_point_flag: Whether to highlight the early exit point (ignored in this function now)
     """
     num_loops = len(pca_results)
     n_components = pca_results[0].shape[2]
@@ -191,13 +194,6 @@ def plot_pca_trajectories(pca_results, tokens, output_dir, token_to_visualize=No
                     point_alpha = token_alpha * 1.1  # Slightly more visible
                     edgecolor = 'black'
                     linewidth = 0.5
-                # elif i == len(trajectory) - 1: # Removed special handling for the last point
-                #     marker = '*'  # Star for last point
-                #     z_order = 4
-                #     point_alpha = token_alpha * 1.1
-                #     size += 10  # Make last point a bit larger
-                #     edgecolor = 'black'
-                #     linewidth = 0.5
                 else:
                     marker = '.'  # Dot for intermediate and last points
                     z_order = 3
@@ -227,16 +223,6 @@ def plot_pca_trajectories(pca_results, tokens, output_dir, token_to_visualize=No
                     textcoords='offset points',
                     color=token_color
                 )
-                
-                # Removed annotation for the end point
-                # ax.annotate(
-                #     f"{len(trajectory)-1}",  # Use step number instead of "end"
-                #     (trajectory[-1, 0], trajectory[-1, 1]),
-                #     fontsize=7,
-                #     xytext=(3, 3),
-                #     textcoords='offset points',
-                #     color=token_color
-                # )
         
         # Create a colorbar to show loop progression
         sm = plt.cm.ScalarMappable(cmap=loop_cmap, norm=plt.Normalize(0, num_loops-1))
@@ -260,22 +246,24 @@ def plot_pca_trajectories(pca_results, tokens, output_dir, token_to_visualize=No
             step = max(1, len(all_trajectories) // max_legend_entries)
             handles, labels = ax.get_legend_handles_labels()
             
-            # Add a "..." entry if we're showing a subset
+            num_actual_token_labels = len(labels) # No early exit label in this plot
+
             if step > 1:
-                sample_indices = list(range(0, len(handles), step))
-                legend_handles = [handles[i] for i in sample_indices]
-                legend_labels = [labels[i] for i in sample_indices]
+                sample_indices = list(range(0, num_actual_token_labels, step))
+                legend_handles = [handles[i] for i in sample_indices if i < len(handles)]
+                legend_labels = [labels[i] for i in sample_indices if i < len(labels)]
                 
-                if len(legend_handles) > 0:
-                    # Add an entry indicating there are more tokens
-                    legend_labels[-1] = f"{legend_labels[-1]} (+ {len(handles) - len(sample_indices)} more)"
+                if len(legend_handles) > 0 and num_actual_token_labels > len(sample_indices):
+                    more_count = num_actual_token_labels - len(legend_handles)
+                    if more_count > 0:
+                        legend_labels[-1] += f" (+ {more_count} more)"
                 
                 ax.legend(
                     legend_handles, 
                     legend_labels,
                     loc='upper right', 
                     fontsize=8, 
-                    title=f"Showing {len(legend_handles)} of {len(handles)} tokens"
+                    title=f"Showing subset of {num_actual_token_labels} tokens"
                 )
             else:
                 ax.legend(
@@ -302,7 +290,8 @@ def plot_pca_trajectories(pca_results, tokens, output_dir, token_to_visualize=No
         plt.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches='tight')
         plt.close()
 
-def plot_all_token_trajectories(pca_results, tokens, tokenizer, output_dir, num_tokens_to_plot=5):
+def plot_all_token_trajectories(pca_results, tokens, tokenizer, output_dir, num_tokens_to_plot=5,
+                                early_exit_loop_index=None, plot_early_exit_point_flag=True):
     """
     Generate separate plots for individual tokens.
     
@@ -312,6 +301,8 @@ def plot_all_token_trajectories(pca_results, tokens, tokenizer, output_dir, num_
         tokenizer: The tokenizer to convert token IDs to strings
         output_dir: Directory to save the plots
         num_tokens_to_plot: Number of tokens to plot individually
+        early_exit_loop_index: Index of the loop where the early exit condition is met, or None
+        plot_early_exit_point_flag: Whether to highlight the early exit point
     """
     # Create a directory for token-specific plots
     token_plots_dir = os.path.join(output_dir, "token_trajectories")
@@ -420,11 +411,14 @@ def plot_all_token_trajectories(pca_results, tokens, tokenizer, output_dir, num_
         token_str = tokenizer.decode([token_id])
         try:
             print(f"  Plotting full trajectory for token: '{token_str}' (ID: {token_id})")
-            plot_pca_trajectories(pca_results, tokens, token_plots_dir, token_to_visualize=token_id, tokenizer=tokenizer)
+            plot_pca_trajectories(pca_results, tokens, token_plots_dir, token_to_visualize=token_id, tokenizer=tokenizer,
+                                  early_exit_loop_index=early_exit_loop_index,
+                                  plot_early_exit_point_flag=plot_early_exit_point_flag)
             
             # Also create a zoomed plot for the last 15 steps
             print(f"  Plotting zoomed trajectory for token: '{token_str}' (ID: {token_id})")
-            plot_zoomed_trajectory(pca_results, tokens, token_plots_dir, token_to_visualize=token_id, tokenizer=tokenizer, num_last_steps=15)
+            plot_zoomed_trajectory(pca_results, tokens, token_plots_dir, token_to_visualize=token_id, tokenizer=tokenizer, num_last_steps=20,
+                                   early_exit_loop_index=early_exit_loop_index, plot_early_exit_point_flag=plot_early_exit_point_flag)
             
         except Exception as e:
             print(f"Error plotting token {token_id}: {e}")
@@ -529,7 +523,8 @@ def plot_distance_metrics(metrics, output_dir):
     plt.savefig(os.path.join(output_dir, 'euclidean_distances.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
-def plot_zoomed_trajectory(pca_results, tokens, output_dir, token_to_visualize, tokenizer, num_last_steps=15):
+def plot_zoomed_trajectory(pca_results, tokens, output_dir, token_to_visualize, tokenizer, num_last_steps=15,
+                             early_exit_loop_index=None, plot_early_exit_point_flag=True):
     """
     Plot a zoomed-in view of the last N steps of a token's trajectory.
 
@@ -540,6 +535,8 @@ def plot_zoomed_trajectory(pca_results, tokens, output_dir, token_to_visualize, 
         token_to_visualize: Specific token ID to visualize
         tokenizer: Tokenizer to convert token ID to string
         num_last_steps: Number of final steps to include in the zoom
+        early_exit_loop_index: Index of the loop where early exit is met
+        plot_early_exit_point_flag: Whether to plot the early exit point
     """
     num_loops = len(pca_results)
     if num_loops <= num_last_steps:
@@ -637,6 +634,36 @@ def plot_zoomed_trajectory(pca_results, tokens, output_dir, token_to_visualize, 
                 xytext=(4, 4),
                 textcoords='offset points'
             )
+
+        # Highlight the early exit point if it's in the zoomed window
+        if plot_early_exit_point_flag and early_exit_loop_index is not None and zoom_start_loop <= early_exit_loop_index < num_loops:
+            # Calculate the index relative to the zoomed_trajectory array
+            relative_exit_idx = early_exit_loop_index - zoom_start_loop
+            if 0 <= relative_exit_idx < len(zoomed_trajectory):
+                early_exit_point_zoomed = zoomed_trajectory[relative_exit_idx]
+                ax.scatter(
+                    early_exit_point_zoomed[0],
+                    early_exit_point_zoomed[1],
+                    s=200,  # Larger size for emphasis in zoom
+                    marker='X',
+                    color='red',
+                    edgecolor='black',
+                    linewidth=1.5,
+                    alpha=1.0,
+                    zorder=6, # Ensure it's on top
+                    label=f'Early Exit @ Loop {early_exit_loop_index}'
+                )
+                ax.annotate(
+                    f"Exit@{early_exit_loop_index}",
+                    (early_exit_point_zoomed[0], early_exit_point_zoomed[1]),
+                    fontsize=9,
+                    xytext=(5, -5),
+                    textcoords='offset points',
+                    color='red',
+                    bbox=dict(boxstyle='round,pad=0.3', fc='yellow', alpha=0.8)
+                )
+                ax.legend(loc='best', fontsize=8) # Add legend if exit point shown
+
             
         # Add title and labels
         title = f"Zoomed Trajectory (Loops {zoom_start_loop}-{num_loops-1}) for Token '{token_str}' (pos {token_pos})\nPC{pc1+1} vs PC{pc2+1}"
@@ -667,6 +694,11 @@ def main():
     parser.add_argument('--split', type=str, default='test', help='Dataset split to use')
     parser.add_argument('--output_dir', type=str, default='representation_analysis', help='Directory to save results')
     
+    # Arguments for early exit point plotting
+    parser.add_argument('--plot_early_exit_point', type=lambda x: (str(x).lower() == 'true'), default=True, help='Whether to highlight the early exit point (default: True)')
+    parser.add_argument('--early_exit_threshold', type=float, default=0.001, help='Convergence threshold for early exit (default: 0.01)')
+    parser.add_argument('--early_exit_metric', type=str, default='euclidean', choices=['cosine', 'euclidean'], help='Distance metric for early exit (cosine or euclidean, default: cosine)')
+
     args = parser.parse_args()
     
     # Load configuration
@@ -795,18 +827,35 @@ def main():
     metrics = analyze_representation_distances(representations)
     all_metrics[args.max_loops] = metrics
     
+    # Determine early exit loop index
+    early_exit_loop_index = None
+    if args.plot_early_exit_point and metrics:
+        distance_key = f'{args.early_exit_metric}_distances'
+        if distance_key in metrics:
+            distances = metrics[distance_key]
+            for i, dist in enumerate(distances):
+                if dist < args.early_exit_threshold:
+                    early_exit_loop_index = i + 1 # Exit happens after this loop (i.e., at loop i+1)
+                    print(f"Early exit condition met at loop {early_exit_loop_index} (distance {dist:.4f} < threshold {args.early_exit_threshold}) using {args.early_exit_metric} metric.")
+                    break
+            if early_exit_loop_index is None:
+                print(f"Early exit condition not met within {args.max_loops} loops with threshold {args.early_exit_threshold} using {args.early_exit_metric} metric.")
+        else:
+            print(f"Warning: Distance metric '{distance_key}' not found in metrics. Cannot determine early exit point.")
+
     # Compute PCA for all representations
     pca, transformed_reps = compute_pca_for_representations(all_representations, n_components=6)
     
-    # The transformed representations already correspond to all loops
-    # No need to create a dictionary for different loop counts
-    
     # Plot PCA trajectories for all loops with all tokens in the same plot
     print("Generating main PCA visualization with all tokens...")
-    plot_pca_trajectories(transformed_reps, target_tokens, output_dir, tokenizer=tokenizer)
+    plot_pca_trajectories(transformed_reps, target_tokens, output_dir, tokenizer=tokenizer,
+                          early_exit_loop_index=early_exit_loop_index,
+                          plot_early_exit_point_flag=args.plot_early_exit_point)
     
     # Plot individual token trajectories
-    plot_all_token_trajectories(transformed_reps, target_tokens, tokenizer, output_dir, num_tokens_to_plot=5)
+    plot_all_token_trajectories(transformed_reps, target_tokens, tokenizer, output_dir, num_tokens_to_plot=5,
+                                early_exit_loop_index=early_exit_loop_index,
+                                plot_early_exit_point_flag=args.plot_early_exit_point)
     
     # Plot distance metrics
     if all_metrics:

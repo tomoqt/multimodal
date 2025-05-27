@@ -1,0 +1,66 @@
+# Spectral VLM Training Configuration
+
+# Model Architecture
+model:
+  spectral_encoder_type: 'convnext'  # 'convnext' or 'regular'
+  ir_as_prompt: false  # Whether to use IR data as text tokens
+  max_length: 1024  # Maximum sequence length
+  include_images: false  # Whether to include molecular images
+  generation_max_new_tokens: 1000 # Max tokens for qualitative generation logging
+
+# VLM Checkpoint Configuration
+vlm_checkpoint:
+  path: "checkpoints/nanoVLM-222M"
+  resume_from_checkpoint: true  # Start from pretrained VLM
+  load_backbone: true
+
+# Training Parameters
+training:
+  epochs: 5
+  batch_size: 1  # Per-device batch size
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  compile: false
+  data_cutoff_idx: null  # Limit dataset size for testing (null for full dataset)
+  val_ratio: 0.1  # Validation split ratio
+
+# Learning Rates
+learning_rates:
+  spectral: 1.0e-4  # Learning rate for spectral components (IR encoder, projector)
+  backbones: 1.0e-4  # Learning rate for vision/language backbones
+
+# Optimizer Configuration
+optimizer:
+  type: "AdamW"
+  weight_decay: 0.01
+
+# Data Configuration
+data:
+  data_dir: "data/reshaped_tokenized_data/data"  # Directory with tokenized spectral data
+  nmr_vocab_path: "tokenized_baseline/vocab.json"  # NMR vocabulary path
+
+# Evaluation Configuration
+evaluation:
+  eval_interval: 100  # Steps between validation evaluations
+  generate_during_training: true
+  generation_interval: 500  # Steps between generation evaluations
+  generation_samples: 20  # Number of samples for generation evaluation
+  final_generation_samples: 100  # Number of samples for final evaluation
+  log_qualitative_generations: True  # Set to True to enable
+  qualitative_generation_interval: 1000 # Log every 1000 global steps
+  num_qualitative_generation_samples: 3  # Number of samples to log each time
+  generation_temperature: 0.7 # Temperature for qualitative generation
+  generation_greedy: True     # Whether to use greedy decoding for qualitative generation
+
+# Checkpointing
+checkpointing:
+  save_interval: 1000  # Steps between checkpoint saves
+  save_local: true  # Save checkpoints locally
+  save_best: true  # Save best model based on validation loss
+
+# Logging
+logging:
+  log_wandb: true
+  wandb_entity: "aisparks"  # Replace with your wandb entity
+  wandb_project: "SpectralVLM"
+  log_generation_metrics: true 

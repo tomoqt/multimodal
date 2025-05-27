@@ -18,3 +18,5 @@ py3Dmol
 gradio_molecule3d
 tabulate
 pydot
+pillow
+huggingface-hub 
