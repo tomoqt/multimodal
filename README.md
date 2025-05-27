@@ -163,6 +163,15 @@ python train_spectral_vlm.py --data_dir tokenized_baseline/data
 torchrun --nproc_per_node=2 train_spectral_vlm.py --data_dir tokenized_baseline/data
 ```
 
+#### GRPO Fine-Tuning:
+```bash
+# Fine-tune a pretrained Spectral VLM using GRPO
+cd training
+python train_spectral_grpo.py --config configs/spectral_grpo_config.yaml --checkpoint path/to/spectral_checkpoint.pt
+```
+The `spectral_grpo_config.yaml` file enables `cot_reward` to encourage the `<thinking>...</thinking><answer>...</answer>` output format.
+
+
 ### Model Checkpoints
 
 #### Pretrained Models:

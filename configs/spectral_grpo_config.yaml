@@ -1,0 +1,36 @@
+# Spectral VLM GRPO Fine-tuning Configuration
+model:
+  spectral_encoder_type: 'convnext'
+  ir_as_prompt: false
+  max_length: 1024
+  include_images: false
+
+vlm_checkpoint:
+  path: "checkpoints/nanoVLM-222M"
+  load_backbone: true
+
+data:
+  data_dir: "data/reshaped_tokenized_data/data"
+
+training:
+  batch_size: 1
+  logging_frequency: 10
+  validation_frequency: 50
+
+rl:
+  grpo:
+    group_size: 8
+    micro_group_size: 1
+    batch_size: 1
+    max_iterations: 1000
+    learning_rate: 1.0e-5
+    epsilon: 1
+    beta: 0.1
+    temperature: 1
+    log_wandb: false
+    exact_match_reward: true
+    tanimoto_reward: true
+    ecfp6_reward: true
+    valid_smiles_reward: true
+    mcs_ratio_reward: true
+    cot_reward: true
