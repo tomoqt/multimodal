@@ -173,10 +173,13 @@ class SpectralVisionLanguageModel(nn.Module):
                 print(f"DEBUG: reshaped_targets shape: {reshaped_targets.shape}")
             # --- END DEBUG ---
 
-            # Calculate loss
+            # Shift for next-token prediction to avoid label leakage
+            shift_logits = target_logits[:, :-1, :].contiguous()
+            shift_targets = targets[:, 1:].contiguous()
+
             loss = F.cross_entropy(
-                target_logits.reshape(-1, target_logits.size(-1)), 
-                targets.reshape(-1), 
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                shift_targets.reshape(-1),
                 ignore_index=-100
             )
 
