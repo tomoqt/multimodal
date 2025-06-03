@@ -18,6 +18,7 @@ import yaml
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+from utils.optimization.muon import Muon # Import Muon optimizer
 
 # Add parent directory to path for imports
 sys.path.append(str(Path(__file__).parent.parent))
@@ -110,12 +111,15 @@ def get_run_name(train_cfg):
     dataset_size = "full_ds" if train_cfg.training.data_cutoff_idx is None else f"{train_cfg.training.data_cutoff_idx}samples"
     batch_size = f"bs{int(train_cfg.training.batch_size*get_world_size()*train_cfg.training.gradient_accumulation_steps)}"
     epochs = f"ep{train_cfg.training.epochs}"
-    learning_rate = f"lr{train_cfg.learning_rates.backbones}-{train_cfg.learning_rates.spectral}"
+    # Updated learning rate logging for muon_mix
+    lr_adamw = train_cfg.training.learning_rate
+    lr_muon = train_cfg.optimizer.muon.lr
+    learning_rate_str = f"lrAdam{lr_adamw}-lrMuon{lr_muon}"
     num_gpus = f"{get_world_size()}xGPU"
     encoder_type = f"{train_cfg.model.spectral_encoder_type}enc"
     date = time.strftime("%m%d")
 
-    return f"SpectralVLM_{encoder_type}_{num_gpus}_{dataset_size}_{batch_size}_{epochs}_{learning_rate}_{date}"
+    return f"SpectralVLM_{encoder_type}_{num_gpus}_{dataset_size}_{batch_size}_{epochs}_{learning_rate_str}_{date}"
 
 
 def get_dataloaders(train_cfg, vlm_cfg):
@@ -523,9 +527,14 @@ def train(train_cfg, vlm_cfg):
     # Initialize wandb
     if train_cfg.logging.log_wandb and is_master():
         run_name = get_run_name(train_cfg)
-        if train_cfg.training.data_cutoff_idx is None:
+        # Corrected run_name update based on total_dataset_size
+        if train_cfg.training.data_cutoff_idx is None and 'total_dataset_size' in locals():
+            run_name = run_name.replace(f"{total_dataset_size}samples", f"{total_dataset_size}samples") # Placeholder, ensure total_dataset_size is defined earlier or handle
+        elif train_cfg.training.data_cutoff_idx is None:
+             # Fallback if total_dataset_size is not available when expected
             run_name = run_name.replace("full_ds", f"{total_dataset_size}samples")
-        
+
+
         run = wandb.init(
             entity=train_cfg.logging.wandb_entity,
             project=train_cfg.logging.wandb_project,
@@ -557,28 +566,67 @@ def train(train_cfg, vlm_cfg):
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"SpectralVLM initialized with {total_params:,} total parameters")
         print(f"Trainable parameters: {trainable_params:,}")
-        print(f"Training summary{' (global)' if is_dist() else ''}: {len(train_loader.dataset)} samples, {int(len(train_loader)*get_world_size())} batches/epoch")
+        print(f"Training summary{{\' (global)\' if is_dist() else \'\'}}: {len(train_loader.dataset)} samples, {int(len(train_loader)*get_world_size())} batches/epoch")
     
-    # Define optimizer groups
-    # Separate learning rates for different components
-    param_groups = [
-        # Spectral components (IR encoder and projector)
-        {
-            'params': list(model.ir_encoder.parameters()) + list(model.ir_projector.parameters()),
-            'lr': train_cfg.learning_rates.spectral
-        },
-        # Vision and language backbones
-        {
-            'params': list(model.vision_encoder.parameters()) + 
-                     list(model.decoder.parameters()) + 
-                     list(model.vision_projector.parameters()),
-            'lr': train_cfg.learning_rates.backbones
-        }
-    ]
-    
-    optimizer = optim.AdamW(param_groups, weight_decay=train_cfg.optimizer.weight_decay)
-    all_params = [p for group in optimizer.param_groups for p in group['params']]
-    
+    # Optimizer setup for muon_mix
+    optimizers = []
+    all_params_list = [] # To collect all parameters for gradient clipping
+
+    matrix_params = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
+    vector_params = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
+
+    if is_master():
+        matrix_param_count = sum(p.numel() for p in matrix_params)
+        vector_param_count = sum(p.numel() for p in vector_params)
+        total_model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[Optimizer] Parameter distribution for 'muon_mix':")
+        if total_model_params > 0 :
+            print(f"  - Muon (matrix_params >=2D): {matrix_param_count:,} parameters ({matrix_param_count/total_model_params:.1%})")
+            print(f"  - AdamW (vector_params <2D): {vector_param_count:,} parameters ({vector_param_count/total_model_params:.1%})")
+        else:
+            print(f"  - Muon (matrix_params >=2D): {matrix_param_count:,} parameters")
+            print(f"  - AdamW (vector_params <2D): {vector_param_count:,} parameters")
+
+
+    if matrix_params:
+        muon_optimizer = Muon(
+            matrix_params,
+            lr=train_cfg.optimizer.muon.lr,
+            momentum=train_cfg.optimizer.muon.get('momentum', 0.95),
+            nesterov=train_cfg.optimizer.muon.get('nesterov', True),
+            weight_decay=train_cfg.optimizer.muon.get('weight_decay', 0.01), # Added weight decay for Muon
+            # ns_steps and other Muon specific params can be added from train_cfg if available
+            # rank=get_rank(), # Important for some Muon versions, ensure it's used if needed
+            # world_size=get_world_size() # Important for some Muon versions
+        )
+        optimizers.append(muon_optimizer)
+        all_params_list.extend(matrix_params)
+        if is_master():
+            print(f"  Muon optimizer initialized with LR: {train_cfg.optimizer.muon.lr}, WD: {train_cfg.optimizer.muon.get('weight_decay', 0.01)}")
+
+
+    if vector_params:
+        adamw_optimizer = optim.AdamW(
+            vector_params,
+            lr=train_cfg.training.learning_rate, # General LR for AdamW components
+            betas=train_cfg.optimizer.adamw.get('betas', (0.9, 0.999)),
+            eps=train_cfg.optimizer.adamw.get('eps', 1.0e-8),
+            weight_decay=train_cfg.optimizer.adamw.weight_decay
+        )
+        optimizers.append(adamw_optimizer)
+        all_params_list.extend(vector_params)
+        if is_master():
+            print(f"  AdamW optimizer initialized with LR: {train_cfg.training.learning_rate}, WD: {train_cfg.optimizer.adamw.weight_decay}")
+
+    if not optimizers:
+        raise ValueError("No parameters found for optimization. Check model parameter dimensions and requires_grad settings.")
+
+    # The scheduler will primarily control the AdamW part. Muon might have its own internal schedule or fixed LR.
+    # For simplicity, we'll use the first optimizer (likely AdamW if vector_params exist, or Muon if only matrix_params) for the scheduler.
+    # Or, more robustly, create a scheduler for AdamW if it exists, and handle Muon LR separately if needed.
+    # Let's assume the primary scheduler targets AdamW learning rate.
+    primary_optimizer_for_scheduler = next((opt for opt in optimizers if isinstance(opt, optim.AdamW)), optimizers[0])
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
@@ -598,8 +646,10 @@ def train(train_cfg, vlm_cfg):
         model.train()
         total_train_loss = 0
         total_tokens_processed = 0
-        optimizer.zero_grad()
-        
+        # optimizer.zero_grad() # Zero grad for each optimizer in the loop
+        for opt in optimizers:
+            opt.zero_grad()
+
         for i, batch in enumerate(train_loader):
             batch_start_time = time.time()
             
@@ -664,18 +714,35 @@ def train(train_cfg, vlm_cfg):
             # Optimizer step
             if (i + 1) % train_cfg.training.gradient_accumulation_steps == 0 or i + 1 == len(train_loader):
                 if train_cfg.training.max_grad_norm is not None:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=train_cfg.training.max_grad_norm)
-                
+                    grad_norm = torch.nn.utils.clip_grad_norm_(all_params_list, max_norm=train_cfg.training.max_grad_norm) # Use all_params_list
+
                 # Update learning rates
-                total_steps = len(train_loader) * train_cfg.training.epochs
-                adj_lr_spectral = get_lr(global_step, train_cfg.learning_rates.spectral, total_steps)
-                adj_lr_backbones = get_lr(global_step, train_cfg.learning_rates.backbones, total_steps)
-                
-                optimizer.param_groups[0]['lr'] = adj_lr_spectral
-                optimizer.param_groups[1]['lr'] = adj_lr_backbones
-                
-                optimizer.step()
-                optimizer.zero_grad()
+                # The main scheduler affects the AdamW part primarily.
+                # Muon's LR is typically managed differently or kept constant/handled internally after init.
+                # Here, we adjust the LR for the primary_optimizer_for_scheduler (AdamW).
+                # If Muon needs scheduled LR, it has to be handled explicitly.
+                total_steps = len(train_loader) * train_cfg.training.epochs // train_cfg.training.gradient_accumulation_steps # Correct total_steps for scheduler
+
+                current_lr_adamw = get_lr(global_step, train_cfg.training.learning_rate, total_steps)
+                # Assuming Muon LR is also scheduled, or keeping it fixed as per its config
+                current_lr_muon = get_lr(global_step, train_cfg.optimizer.muon.lr, total_steps) # Or keep fixed: train_cfg.optimizer.muon.lr
+
+                for opt in optimizers:
+                    if isinstance(opt, optim.AdamW):
+                        for param_group in opt.param_groups:
+                            param_group['lr'] = current_lr_adamw
+                    elif isinstance(opt, Muon): # Check if it's Muon optimizer
+                         for param_group in opt.param_groups: # Muon also has param_groups
+                            param_group['lr'] = current_lr_muon
+
+
+                # optimizer.step()
+                # optimizer.zero_grad()
+                for opt in optimizers:
+                    opt.step()
+                for opt in optimizers:
+                    opt.zero_grad()
+
                 global_step += 1
             
             batch_loss = loss.item()
@@ -814,12 +881,23 @@ def train(train_cfg, vlm_cfg):
             
             # Logging
             if train_cfg.logging.log_wandb and is_master():
-                run.log({
+                log_payload = {
                     "train_loss": batch_loss,
                     "tokens_per_second": tokens_per_second,
-                    "lr_spectral": adj_lr_spectral if global_step > 0 else train_cfg.learning_rates.spectral,
-                    "lr_backbones": adj_lr_backbones if global_step > 0 else train_cfg.learning_rates.backbones,
-                }, step=global_step)
+                    # "lr_spectral": adj_lr_spectral if global_step > 0 else train_cfg.learning_rates.spectral,
+                    # "lr_backbones": adj_lr_backbones if global_step > 0 else train_cfg.learning_rates.backbones,
+                }
+                if 'current_lr_adamw' in locals() and global_step > 0 :
+                    log_payload["lr_adamw"] = current_lr_adamw
+                else:
+                    log_payload["lr_adamw"] = train_cfg.training.learning_rate # Initial LR for AdamW
+                
+                if 'current_lr_muon' in locals() and global_step > 0 :
+                     log_payload["lr_muon"] = current_lr_muon
+                else:
+                    log_payload["lr_muon"] = train_cfg.optimizer.muon.lr # Initial LR for Muon
+
+                run.log(log_payload, step=global_step)
         
         # End of epoch
         avg_train_loss = total_train_loss / len(train_loader)
@@ -873,8 +951,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
     parser.add_argument('--data_dir', type=str, help='Path to tokenized data directory')
-    parser.add_argument('--lr_spectral', type=float, help='Learning rate for spectral components')
-    parser.add_argument('--lr_backbones', type=float, help='Learning rate for backbones')
+    parser.add_argument('--lr_adamw', type=float, help='Learning rate for AdamW components')
+    parser.add_argument('--lr_muon', type=float, help='Learning rate for Muon components')
     parser.add_argument('--batch_size', type=int, help='Batch size')
     parser.add_argument('--epochs', type=int, help='Number of epochs')
     parser.add_argument('--compile', action='store_true', help='Use torch.compile')
@@ -889,10 +967,10 @@ def main():
     # Override from command line
     if args.data_dir:
         train_cfg.data.data_dir = args.data_dir
-    if args.lr_spectral:
-        train_cfg.learning_rates.spectral = args.lr_spectral
-    if args.lr_backbones:
-        train_cfg.learning_rates.backbones = args.lr_backbones
+    if args.lr_adamw:
+        train_cfg.training.learning_rate = args.lr_adamw
+    if args.lr_muon:
+        train_cfg.optimizer.muon.lr = args.lr_muon
     if args.batch_size:
         train_cfg.training.batch_size = args.batch_size
     if args.epochs:

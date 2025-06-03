@@ -8,10 +8,25 @@ def get_tokenizer(model_name="HuggingFaceTB/cosmo2-tokenizer"):
     """Get tokenizer for language model"""
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Ensure we have necessary special tokens
+    # Ensure PAD token is set, falling back to EOS if not present
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+            print(f"[get_tokenizer] tokenizer.pad_token was None. Set to eos_token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
+        else:
+            # If both pad_token and eos_token are None, this is an issue.
+            # For now, we'll let it proceed and it might fail later if padding is needed,
+            # or a default from transformers library might be used.
+            print("[get_tokenizer] Warning: tokenizer.pad_token and tokenizer.eos_token are None.")
+
+    # Verify BOS token ID is available, as per the provided tokenizer map
+    if tokenizer.bos_token_id is None:
+        # This should not happen with "HuggingFaceTB/cosmo2-tokenizer" given its map
+        print("ERROR: tokenizer.bos_token_id is None despite the tokenizer map indicating a bos_token. Please check tokenizer configuration and Hugging Face library version.")
+        # Optionally, could raise an error here: raise ValueError("bos_token_id is None for a tokenizer that should have one.")
     
+    print(f"[get_tokenizer] Using BOS token: '{tokenizer.bos_token}' (ID: {tokenizer.bos_token_id}), EOS token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id}), PAD token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
+
     return tokenizer
 
 

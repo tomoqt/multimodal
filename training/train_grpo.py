@@ -273,151 +273,218 @@ class GRPO:
 
     def sample_batch(self):
         """
-        Sample a batch of data and generate outputs for training.
-        Adapted for the MultiModalToSMILESModel's data format.
-        Uses temperature-based sampling to increase exploration.
+        Sample a batch of data, generate SMILES, and compute rewards.
+        Returns:
+            original_target_tokens (Tensor): Original target SMILES tokens.
+            ir_data (Tensor): IR data from the batch.
+            nmr_tokens (Tensor): NMR prompt tokens used for generation.
+            generated_smiles_tokens (Tensor): Generated SMILES tokens from the model.
+            rewards (list): List of rewards for each generated SMILES.
+            loss_mask (Tensor): Mask for the loss computation.
         """
-        print(f"\n[GRPO] ⏱️ Starting batch sampling at {datetime.datetime.now().strftime('%H:%M:%S')}")
-        start_time = time.time()
-        
-        # Reset the iterator if needed
+        # Fetch next batch from training data
         try:
-            batch = next(self.train_loader_iter)
+            target_tokens, ir_data, nmr_tokens, _ = next(self.train_loader_iter)
         except StopIteration:
-            self.train_loader_iter = iter(self.train_loader)
-            batch = next(self.train_loader_iter)
-            
-        # Unpack the batch
-        target_tokens, ir_data, nmr_tokens, _ = batch
-        print(f"[GRPO] 📊 Batch size: {target_tokens.size(0)}, Target seq length: {target_tokens.size(1)}")
-        
-        # Move data to device
-        print(f"[GRPO] 🔄 Moving data to device: {self.device}")
+            self.train_loader_iter = iter(self.train_loader)  # Reset iterator
+            target_tokens, ir_data, nmr_tokens, _ = next(self.train_loader_iter)
+
         target_tokens = target_tokens.to(self.device)
+        nmr_tokens = nmr_tokens.to(self.device)
         if ir_data is not None:
             ir_data = ir_data.to(self.device)
-        if nmr_tokens is not None:
-            nmr_tokens = nmr_tokens.to(self.device)
-            
-        # We'll replicate each sample group_size times for exploration
-        batch_size = target_tokens.size(0)
-        expanded_batch_size = batch_size * self.group_size
-        print(f"[GRPO] 📈 Expanding batch: {batch_size} samples x {self.group_size} groups = {expanded_batch_size} total samples")
+
+        # Determine prompt length (e.g., half of NMR tokens or a fixed length)
+        # This needs to be chosen carefully based on how prompts are structured.
+        # For now, let's assume a simple strategy, e.g., taking a portion of nmr_tokens.
+        # Ensure nmr_prompt_len is at least 1 to avoid empty prompts.
+        nmr_prompt_len = max(1, nmr_tokens.size(1) // 2) 
         
-        # Expand the inputs
-        expanded_target_tokens = target_tokens.repeat(self.group_size, 1)
-        expanded_ir_data = ir_data.repeat(self.group_size, 1) if ir_data is not None else None
-        expanded_nmr_tokens = nmr_tokens.repeat(self.group_size, 1) if nmr_tokens is not None else None
+        # Create prompt from NMR tokens
+        nmr_tokens_prompt = nmr_tokens[:, :nmr_prompt_len]
         
-        # Store original targets for reward calculation
-        original_targets = []
-        for tgt in target_tokens:
-            # Get target without special tokens
-            try:
-                eos_idx = tgt.tolist().index(self.tokenizer.sep_token_id)
-                tgt = tgt[:eos_idx]  # Exclude EOS token
-            except ValueError:
-                pass
-            decoded = self.tokenizer.decode(tgt[1:])  # Skip BOS token
-            original_targets.append(decoded)
+        # Create attention mask for the nmr_tokens_prompt
+        # 1 for actual tokens, 0 for padding.
+        nmr_attention_mask_prompt = (nmr_tokens_prompt != self.tokenizer.pad_token_id).type(torch.long)
+
+
+        # Max generation length for SMILES
+        # This should align with how the model expects to generate.
+        # If decoder.max_seq_length is the total length, subtract prompt length.
+        max_len = self.model.decoder.max_seq_length - nmr_tokens_prompt.size(1)
+        if max_len <= 0:
+            # This indicates an issue: prompt is too long or max_seq_length too short.
+            # Default to a small positive number to avoid errors, but this needs review.
+            print(f"Warning: max_len for generation is {max_len}. Prompt length: {nmr_tokens_prompt.size(1)}, Decoder max_seq_length: {self.model.decoder.max_seq_length}. Clamping max_len to 10.")
+            max_len = 10 # Fallback, should be reviewed based on tokenizer and model
+
+        # Generate SMILES using the model's generate method
+        print(f"[GRPO.sample_batch] Generating with prompt shape: {nmr_tokens_prompt.shape}, IR data shape: {ir_data.shape if ir_data is not None else 'None'}, max_new_tokens: {max_len}")
         
-        # Generate responses with the model
-        print(f"[GRPO] 🧪 Starting SMILES generation for {expanded_batch_size} samples with temperature {self.temperature}...")
-        gen_start = time.time()
-        with torch.no_grad():
-            # Set the model to eval mode for generation
-            self.model.eval()
-            
-            # Use our modified greedy_decode function with sampling for generation
-            generated_smiles = greedy_decode(
-                model=self.model,
-                nmr_tokens=expanded_nmr_tokens,
-                ir_data=expanded_ir_data,
-                tokenizer=self.tokenizer,
-                max_len=self.model.decoder.max_seq_length,
-                device=self.device,
-                temperature=self.temperature,
-                sample=True  # Enable sampling
+        # Ensure the model is in eval mode for generation if it has dropout, etc.
+        # However, GRPO typically keeps the model in train mode for policy updates.
+        # Let's assume self.model.generate() handles its internal state appropriately
+        # or that keeping it in train() mode is intended for RL.
+        with torch.no_grad(): # Generation should not accumulate gradients here
+            generated_smiles_tokens = self.model.generate(
+                input_ids=nmr_tokens_prompt,
+                image=None,  # No images in SpectralVLMRLDataset
+                ir_data=ir_data, # Pass full IR data for each sample in batch
+                attention_mask=nmr_attention_mask_prompt,
+                max_new_tokens=max_len,
+                temperature=self.temperature, # Use GRPO's temperature
+                greedy=True # Mimicking the original greedy_decode behavior
             )
-            
-            # Set model back to train mode
-            self.model.train()
         
-        gen_end = time.time()
-        gen_time = gen_end - gen_start
-        avg_gen_time = gen_time / expanded_batch_size if expanded_batch_size > 0 else 0
-        print(f"[GRPO] ⌛ Generation completed in {gen_time:.2f}s ({avg_gen_time:.4f}s per sample)")
+        print(f"[GRPO.sample_batch] Generated tokens shape: {generated_smiles_tokens.shape}")
+
+        # The generated_smiles_tokens are the token IDs.
+        # The original greedy_decode returned (generated_smiles, smiles_probs=None)
+        # We now have generated_smiles_tokens. We need to ensure this shape is compatible
+        # with reward computation and loss computation.
+
+        # Compute rewards based on generated SMILES and original targets
+        # For reward computation, we need the string representation of target and generated SMILES.
         
-        # Compute rewards based on generated outputs
-        print(f"[GRPO] 💯 Calculating rewards...")
-        reward_start = time.time()
-        rewards = self.compute_rewards(original_targets, generated_smiles)
-        reward_end = time.time()
-        print(f"[GRPO] ⌛ Reward calculation completed in {reward_end - reward_start:.2f}s")
+        # Decode original target tokens to string (excluding padding and special tokens)
+        original_target_smiles_str = []
+        for i in range(target_tokens.size(0)):
+            valid_tokens = target_tokens[i][target_tokens[i] != self.tokenizer.pad_token_id]
+            original_target_smiles_str.append(self.tokenizer.decode(valid_tokens, skip_special_tokens=True))
+
+        # Decode generated SMILES tokens to string
+        generated_smiles_str = []
+        for i in range(generated_smiles_tokens.size(0)):
+            # generated_smiles_tokens might also have padding if max_new_tokens is fixed
+            # and generation stops early (e.g., via EOS).
+            # However, model.generate usually returns up to max_new_tokens without EOS handling here.
+            valid_generated_tokens = generated_smiles_tokens[i][generated_smiles_tokens[i] != self.tokenizer.pad_token_id]
+            # Further, need to handle potential EOS token if model.generate includes it and skip_special_tokens=True doesn't remove it as desired.
+            # For now, let's assume skip_special_tokens=True is sufficient.
+            decoded_gen = self.tokenizer.decode(valid_generated_tokens, skip_special_tokens=True)
+            generated_smiles_str.append(decoded_gen)
+            if i < 3: # Log a few examples
+                 print(f"  Sample {i} - Target SMILES (str): {original_target_smiles_str[i]}")
+                 print(f"  Sample {i} - Generated SMILES (str): {decoded_gen}")
+
+
+        rewards = self.compute_rewards(original_target_smiles_str, generated_smiles_str)
+
+        # For loss computation, GRPO needs the full sequence that led to the reward.
+        # This would be [nmr_tokens_prompt] + [generated_smiles_tokens]
+        # The 'target_seq' for get_per_token_logps should be this combined sequence.
+        # However, the original code used `target_tokens` (the ground truth) for computing logps
+        # with `old_policy_log_probs` and `policy_log_probs`.
+        # This implies an on-policy setup where we evaluate the probability of the *generated* sequence.
         
-        # Print some examples of generated SMILES and rewards
-        print(f"\n[GRPO] 📝 Sample generations (first 3):")
-        for i in range(min(3, len(generated_smiles))):
-            target_idx = i % batch_size
-            print(f"  Target:     {original_targets[target_idx]}")
-            print(f"  Generated:  {generated_smiles[i]}")
-            print(f"  Reward:     {rewards[i]:.4f}")
-            print()
+        # Let's align with the typical PPO/GRPO: the loss is computed based on the actions taken (generated_smiles_tokens)
+        # and the log_probs of taking those actions.
+        # The `old_policy_log_probs` should be for `nmr_tokens_prompt + generated_smiles_tokens`.
         
-        # Re-encode the generated outputs to get targets for training...
-        print(f"[GRPO] 🔄 Re-encoding generated SMILES for training...")
-        encode_start = time.time()
-        encoded_outputs = []
-        for smiles in generated_smiles:
-            tokens = self.tokenizer.encode(
-                smiles,
-                add_special_tokens=True,
-                max_length=self.model.decoder.max_seq_length,
-                truncation=True
-            )
-            encoded_outputs.append(tokens)
-
-        # Pad the encoded outputs
-        max_len = max(len(seq) for seq in encoded_outputs)
-        padded_outputs = []
-        for seq in encoded_outputs:
-            pad_amount = max_len - len(seq)
-            if pad_amount > 0:
-                padded_seq = seq + [self.tokenizer.pad_token_id] * pad_amount
-            else:
-                padded_seq = seq
-            padded_outputs.append(padded_seq)
-
-        output_tokens = torch.tensor(padded_outputs, dtype=torch.long, device=self.device)
-        encode_end = time.time()
-        print(f"[GRPO] ⌛ Re-encoding completed in {encode_end - encode_start:.2f}s")
-
-        # Create loss mask (ignore padding tokens)
-        print(f"[GRPO] 🎭 Creating loss mask...")
-        loss_mask = torch.ones(output_tokens.size(0), output_tokens.size(1) - 1, 
-                               dtype=torch.bool, device=self.device)
-
-        for i, tgt in enumerate(output_tokens):
-            try:
-                eos_idx = tgt.tolist().index(self.tokenizer.sep_token_id)
-                if eos_idx < output_tokens.size(1) - 1:
-                    loss_mask[i, eos_idx:] = False
-            except ValueError:
-                pass
-
-            pad_mask = tgt[1:] != self.tokenizer.pad_token_id
-            loss_mask[i] = loss_mask[i] & pad_mask
-            
-        total_time = time.time() - start_time
-        print(f"[GRPO] ⏱️ Total batch preparation time: {total_time:.2f}s")
+        # For now, to minimize changes to compute_loss, let's see if we can adapt.
+        # The original `greedy_decode` output `generated_smiles` which was then used.
+        # `generated_smiles_tokens` is now the direct output.
         
-        return expanded_target_tokens, expanded_ir_data, expanded_nmr_tokens, output_tokens, torch.tensor(rewards, device=self.device), loss_mask
+        # The loss_mask was originally based on `target_tokens`.
+        # If we are evaluating the generated sequence, the mask should correspond to it.
+        # The length of the sequence for logp calculation will be nmr_tokens_prompt.size(1) + generated_smiles_tokens.size(1).
+        # The mask should apply to the generated part.
 
-    def compute_rewards(self, original_targets, generated_smiles) -> list:
+        # Create the full sequence for which log_probs will be calculated.
+        # This is what the policy *actually* produced.
+        policy_generated_sequence = torch.cat((nmr_tokens_prompt, generated_smiles_tokens), dim=1)
+        
+        # The loss_mask should apply to the generated part of this sequence.
+        # It needs to be of the same length as the sequence for which log_probs are calculated (-1 for the shift).
+        # So, policy_generated_sequence.size(1) - 1.
+        # The mask indicates which tokens' log_probs contribute to the loss.
+        # Typically, only the generated tokens.
+        
+        # The original loss_mask was `(target_tokens[:, 1:] != self.tokenizer.pad_token_id).float()`
+        # This implies the loss was calculated over the ground truth target tokens.
+        # This is more like behavior cloning with rewards, or a specific form of REINFORCE.
+        
+        # Sticking to the original structure of compute_loss which expects `target_seq`
+        # to be the ground truth `target_tokens`:
+        # `old_policy_log_probs` and `policy_log_probs` will be calculated for `target_tokens`.
+        # This means we are evaluating how well the policy *would have predicted the ground truth*,
+        # weighted by the reward obtained from the *actual generation*. This is a bit non-standard for PPO.
+        
+        # For now, let's keep `target_tokens` as the sequence for logp calculation as per original structure.
+        # `generated_smiles_tokens` is primarily used for reward calculation.
+        
+        loss_mask = (target_tokens[:, 1:] != self.tokenizer.pad_token_id).float()
+
+        # Return what's needed by the train loop, ensuring `generated_smiles_tokens` is used where appropriate.
+        # The train loop uses `output_tokens` (which was `generated_smiles` before) for `old_policy_log_probs`.
+        # So, we should return `policy_generated_sequence` as the `output_tokens` if we want to be on-policy.
+        # Or, if sticking to original, `generated_smiles_tokens` might be what's expected by `compute_loss` if it expects only the generated part.
+        
+        # Let's assume `compute_loss` takes `target_seq` as the sequence whose log_probs are computed.
+        # The `old_policy_log_probs` are computed in the main train loop using `output_tokens`.
+        # If `output_tokens` is `policy_generated_sequence`, then `old_policy_log_probs` are for the generated seq.
+        # Then `policy_log_probs` in `compute_loss` should also be for `policy_generated_sequence`.
+        
+        # For minimum change to train loop and compute_loss, let's try to pass `generated_smiles_tokens`
+        # as the "generated tokens" part, and `target_tokens` as the sequence for logp calculation.
+        # The train loop will need adjustment if `output_tokens` role changes.
+
+        # Let's name the returned generated tokens clearly.
+        # `output_tokens` in the main loop is used for `old_policy_log_probs`.
+        # It appears `output_tokens` should be `target_tokens` according to how `get_per_token_logps` is used.
+        # This implies the rewards are used to re-weight the loss on the *target* sequence.
+        
+        # If the original code called:
+        # old_policy_log_probs = self.get_per_token_logps(self.ref_model, output_tokens, nmr_tokens, ir_data)
+        # And output_tokens was `generated_smiles` (token IDs of generated SMILES).
+        # This means `get_per_token_logps` needs to be able to take the prompt + generated part.
+
+        # Okay, to be consistent with typical RL, `output_tokens` (for which `old_policy_log_probs` are calculated)
+        # should be the sequence actually generated by the policy: `policy_generated_sequence`.
+        # And the `compute_loss` function's `target_seq` argument should also be this `policy_generated_sequence`.
+
+        # So, we return:
+        # 1. `target_tokens` (original ground truth for reference, and for reward calculation along with generated_smiles_str)
+        # 2. `ir_data` (original from batch)
+        # 3. `nmr_tokens_prompt` (the prompt part of NMR tokens)
+        # 4. `policy_generated_sequence` (this is `nmr_prompt + generated_smiles_tokens`, for `get_per_token_logps`)
+        # 5. `rewards`
+        # 6. `loss_mask` (this should now correspond to `policy_generated_sequence`, specifically the generated part)
+        
+        # Create loss_mask for the generated part of policy_generated_sequence
+        # Mask should be 1 for generated tokens, 0 for prompt tokens and padding in generated part.
+        prompt_part_len = nmr_tokens_prompt.size(1)
+        # The part of policy_generated_sequence for which we want to calculate loss is the generated_smiles_tokens part.
+        # The logps are calculated for `policy_generated_sequence[:, 1:]`.
+        # So mask should be for `policy_generated_sequence[:, 1:]`.
+        
+        # Mask for generated tokens (excluding prompt, used in loss calculation)
+        # The loss_mask should align with the sequence for which log_probs are computed and gradients are applied.
+        # This is policy_generated_sequence[:, 1:]
+        
+        loss_mask_for_generated = torch.zeros_like(policy_generated_sequence, dtype=torch.float)
+        # Mask is 1 for the generated tokens part
+        loss_mask_for_generated[:, prompt_part_len:] = 1
+        # Further, mask out padding tokens within the generated part
+        loss_mask_for_generated = loss_mask_for_generated * (policy_generated_sequence != self.tokenizer.pad_token_id).float()
+        # Shift mask to align with logps (which are for seq[:, 1:])
+        final_loss_mask = loss_mask_for_generated[:, 1:]
+
+
+        # Return:
+        # target_tokens: Original ground truth SMILES (for reward computation).
+        # ir_data: Original IR data.
+        # nmr_tokens_prompt: The NMR prompt used for generation.
+        # policy_generated_sequence: The full sequence (prompt + generated) for logp calculation.
+        # rewards: Calculated rewards.
+        # final_loss_mask: Mask for the loss, applying to the generated part of policy_generated_sequence.
+        return target_tokens, ir_data, nmr_tokens_prompt, policy_generated_sequence, rewards, final_loss_mask
+
+    def compute_rewards(self, original_targets, generated_smiles_list) -> list:
         """
         Compute rewards for generated outputs.
         """
-        print(f"[GRPO] 🎯 Computing rewards for {len(generated_smiles)} generated SMILES...")
+        print(f"[GRPO] 🎯 Computing rewards for {len(generated_smiles_list)} generated SMILES...")
         rewards = []
         batch_size = len(original_targets)
         
@@ -431,7 +498,7 @@ class GRPO:
         total_cot = 0.0
         
         # Match generated SMILES with their targets based on group position
-        for i, generated in enumerate(generated_smiles):
+        for i, generated in enumerate(generated_smiles_list):
             target_idx = i % batch_size  # Cycle through targets based on group position
             target = original_targets[target_idx]
 
@@ -517,7 +584,7 @@ class GRPO:
                     self.metrics["valid_molecule"].append(0.0)
         
         # Print reward statistics
-        total = len(generated_smiles)
+        total = len(generated_smiles_list)
         valid_pct = valid_count / total * 100
         exact_pct = exact_matches / total * 100
         avg_tanimoto = total_tanimoto / total if self.use_tanimoto_reward else 0.0
@@ -606,13 +673,16 @@ class GRPO:
             
             # Sample batch and generate outputs
             sample_start = time.perf_counter()
-            target_tokens, ir_data, nmr_tokens, generated_tokens, rewards, loss_mask = self.sample_batch()
+            target_tokens, ir_data, nmr_tokens_prompt, policy_generated_sequence, rewards_list, final_loss_mask = self.sample_batch()
             sample_time = time.perf_counter() - sample_start
             
+            # Convert rewards list to a tensor for calculations
+            rewards_tensor = torch.tensor(rewards_list, device=self.device, dtype=torch.float32)
+
             # Calculate mean and std of rewards for advantage normalization
-            mean_rewards = rewards.mean().item()
-            std_rewards = rewards.std().item()
-            print(f"[GRPO] 📊 Rewards: mean={mean_rewards:.4f}, std={std_rewards:.4f}, max={rewards.max().item():.4f}")
+            mean_rewards = rewards_tensor.mean().item()
+            std_rewards = rewards_tensor.std().item()
+            print(f"[GRPO] 📊 Rewards: mean={mean_rewards:.4f}, std={std_rewards:.4f}, max={rewards_tensor.max().item():.4f}")
             
             # Skip update if rewards are all the same (no learning signal)
             if std_rewards < 1e-6:
@@ -625,8 +695,8 @@ class GRPO:
             with torch.no_grad():
                 old_policy_log_probs = self.get_per_token_logps(
                     self.model,
-                    target_seq=generated_tokens,
-                    nmr_tokens=nmr_tokens,
+                    target_seq=policy_generated_sequence,
+                    nmr_tokens=nmr_tokens_prompt,
                     ir_data=ir_data
                 )
             logprob_time = time.perf_counter() - logprob_start
@@ -647,11 +717,11 @@ class GRPO:
             group_start = time.perf_counter()
             grouped_target_tokens = reshape_into_groups(target_tokens)
             grouped_ir_data = reshape_into_groups(ir_data)
-            grouped_nmr_tokens = reshape_into_groups(nmr_tokens)
-            grouped_generated_tokens = reshape_into_groups(generated_tokens)
+            grouped_nmr_tokens = reshape_into_groups(nmr_tokens_prompt)
+            grouped_generated_tokens = reshape_into_groups(policy_generated_sequence)
             grouped_old_policy_log_probs = reshape_into_groups(old_policy_log_probs)
-            grouped_rewards = reshape_into_groups(rewards)
-            grouped_loss_mask = reshape_into_groups(loss_mask)
+            grouped_rewards = reshape_into_groups(rewards_tensor)
+            grouped_loss_mask = reshape_into_groups(final_loss_mask)
             group_time = time.perf_counter() - group_start
             print(f"[GRPO] ⌛ Group reshaping completed in {group_time:.2f}s")
             
@@ -668,7 +738,7 @@ class GRPO:
                 # Get the group
                 target_tokens_g = grouped_target_tokens[group_idx]
                 ir_data_g = grouped_ir_data[group_idx] if grouped_ir_data is not None else None
-                nmr_tokens_g = grouped_nmr_tokens[group_idx] if grouped_nmr_tokens is not None else None
+                nmr_tokens_g = grouped_nmr_tokens[group_idx]
                 generated_tokens_g = grouped_generated_tokens[group_idx]
                 old_policy_log_probs_g = grouped_old_policy_log_probs[group_idx]
                 rewards_g = grouped_rewards[group_idx]
@@ -692,7 +762,7 @@ class GRPO:
                     # Get the micro-batch
                     target_tokens_mb = target_tokens_g[mb_idx:mb_end]
                     ir_data_mb = ir_data_g[mb_idx:mb_end] if ir_data_g is not None else None
-                    nmr_tokens_mb = nmr_tokens_g[mb_idx:mb_end] if nmr_tokens_g is not None else None
+                    nmr_tokens_mb = nmr_tokens_g[mb_idx:mb_end]
                     generated_tokens_mb = generated_tokens_g[mb_idx:mb_end]
                     old_policy_log_probs_mb = old_policy_log_probs_g[mb_idx:mb_end]
                     rewards_mb = rewards_g[mb_idx:mb_end]

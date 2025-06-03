@@ -23,16 +23,20 @@ training:
   compile: false
   data_cutoff_idx: null  # Limit dataset size for testing (null for full dataset)
   val_ratio: 0.1  # Validation split ratio
-
-# Learning Rates
-learning_rates:
-  spectral: 1.0e-4  # Learning rate for spectral components (IR encoder, projector)
-  backbones: 1.0e-4  # Learning rate for vision/language backbones
+  learning_rate: 1.0e-4 # General learning rate, used by AdamW components (e.g., spectral parts)
 
 # Optimizer Configuration
 optimizer:
-  type: "AdamW"
-  weight_decay: 0.01
+  type: "muon_mix"
+  adamw:
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.01   # Previously top-level optimizer.weight_decay
+  muon:
+    lr: 1.0e-3          # From previous learning_rates.backbones (e.g., for vision/language backbones)
+    momentum: 0.95
+    nesterov: true
+    weight_decay: 0.01  # Added weight decay for Muon
 
 # Data Configuration
 data:
@@ -63,4 +67,20 @@ logging:
   log_wandb: true
   wandb_entity: "aisparks"  # Replace with your wandb entity
   wandb_project: "SpectralVLM"
-  log_generation_metrics: true 
+  log_generation_metrics: true
+
+# Reinforcement Learning (RL) Configuration
+rl:
+  grpo:
+    group_size: 8              # Number of sequences in a group for GRPO
+    micro_group_size: 1        # Micro batch size within a group
+    batch_size: 1              # Effective batch size for GRPO optimizer step (distinct from dataloader batch_size)
+    max_iterations: 1000       # Total number of GRPO training iterations
+    log_wandb: true            # Whether to log GRPO metrics to WandB (ensure wandb is configured in 'logging' section too)
+    learning_rate: 1.0e-5      # Learning rate for the GRPO optimizer
+    beta: 0.1                  # Beta parameter for KL divergence in GRPO
+    epsilon: 1.0               # Epsilon for GRPO (purpose depends on specific GRPO variant, often for clipping)
+    temperature: 1.0           # Temperature for sampling during GRPO policy generation
+    cot_reward: false          # Whether to use Chain-of-Thought reward (if applicable to your GRPO setup)
+    # Note: log_frequency and validation_frequency for GRPO are typically sourced from the main 'training' section
+    # e.g., training.logging_frequency and training.validation_frequency 

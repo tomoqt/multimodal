@@ -28,7 +28,28 @@ class SpectralVLMRLDataset(Dataset):
         ir_path = self.data_dir / f"ir-{self.split}.npy"
         self.ir = None
         if ir_path.exists():
-            self.ir = np.load(ir_path, mmap_mode="r")
+            try:
+                # Load IR data using np.memmap, similar to SpectralVLMDataset
+                self.ir = np.memmap(ir_path, dtype='float32', mode='r')
+                
+                # Reshape if the loaded array is 1D
+                array_shape = self.ir.shape
+                if len(array_shape) == 1:
+                    num_samples = len(self.smiles) # num_samples derived from loaded SMILES data
+                    if num_samples > 0 and array_shape[0] % num_samples == 0:
+                        feature_dim = array_shape[0] // num_samples
+                        self.ir = self.ir.reshape(num_samples, feature_dim)
+                        print(f"[SpectralVLMRLDataset - {self.split}] Reshaped IR data to: {self.ir.shape}")
+                    else:
+                        print(f"[SpectralVLMRLDataset - {self.split}] Warning: IR data is 1D but cannot be reshaped based on SMILES count ({num_samples}). Original shape: {array_shape}")
+                        # Not raising an error, but this could be problematic later.
+                        # Consider if this case needs more specific handling, e.g., setting self.ir to None or raising error.
+                else:
+                    print(f"[SpectralVLMRLDataset - {self.split}] Loaded IR data with shape: {self.ir.shape}")
+
+            except Exception as e:
+                print(f"[SpectralVLMRLDataset - {self.split}] Warning: Failed to load or process IR data using memmap: {e}")
+                self.ir = None
 
     def __len__(self):
         return len(self.smiles)
@@ -44,7 +65,8 @@ class SpectralVLMRLDataset(Dataset):
         )
         ir_tensor = None
         if self.ir is not None:
-            ir_tensor = torch.tensor(self.ir[idx], dtype=torch.float32)
+            # Use .copy() when creating tensor from memmapped array slice
+            ir_tensor = torch.tensor(self.ir[idx].copy(), dtype=torch.float32)
         return (
             torch.tensor(tgt_ids, dtype=torch.long),
             ir_tensor,
@@ -89,12 +111,39 @@ def create_data_loaders(tokenizer, cfg):
     return train_loader, val_loader
 
 
-def load_model(checkpoint_path, cfg, spectral_cfg, device):
-    with open(Path(cfg["vlm_checkpoint"]["path"]) / "config.json") as f:
-        vlm_conf = VLMConfig(**json.load(f).get("vlm_config", {}))
-    model = SpectralVisionLanguageModel(vlm_conf, load_backbone=True, spectral_cfg=spectral_cfg)
-    state = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state["model_state_dict"])
+def load_model(cfg, spectral_cfg, device):
+    """
+    Loads the SpectralVLM model, initializing from the base VLM checkpoint 
+    specified in cfg["vlm_checkpoint"]["path"], similar to how train_spectral_vlm.py 
+    initializes its model from the base nanoVLM.
+    """
+    
+    base_vlm_checkpoint_dir = Path(cfg["vlm_checkpoint"]["path"]) # e.g., "checkpoints/nanoVLM-222M"
+
+    # Initialize a default VLMConfig. 
+    # The architecture details will be default, but SpectralVisionLanguageModel 
+    # will attempt to load weights from vlm_conf.vlm_checkpoint_path.
+    vlm_conf = VLMConfig()
+    
+    # Set the vlm_checkpoint_path attribute on vlm_conf so SpectralVisionLanguageModel 
+    # knows where to load the base VLM weights from.
+    vlm_conf.vlm_checkpoint_path = str(base_vlm_checkpoint_dir)
+    
+    # Determine if the backbone should be loaded from the GRPO config, defaulting to True.
+    # This controls whether weights from vlm_conf.vlm_checkpoint_path are actually loaded.
+    should_load_backbone = cfg["vlm_checkpoint"].get("load_backbone", True)
+
+    if should_load_backbone:
+        print(f"[train_spectral_grpo] Initializing model and loading backbone from: {base_vlm_checkpoint_dir}")
+    else:
+        print(f"[train_spectral_grpo] Initializing model without loading backbone from: {base_vlm_checkpoint_dir}")
+
+    model = SpectralVisionLanguageModel(
+        vlm_conf, 
+        load_backbone=should_load_backbone,
+        spectral_cfg=spectral_cfg
+    )
+    
     model.to(device)
     return model
 
@@ -102,7 +151,8 @@ def load_model(checkpoint_path, cfg, spectral_cfg, device):
 def main():
     parser = argparse.ArgumentParser(description="GRPO fine-tuning for SpectralVLM")
     parser.add_argument("--config", default="configs/spectral_grpo_config.yaml")
-    parser.add_argument("--checkpoint", required=True, help="Path to pretrained SpectralVLM checkpoint")
+    # The --checkpoint argument is no longer needed as it's specified in the config.
+    # parser.add_argument("--checkpoint", required=True, help="Path to pretrained SpectralVLM checkpoint")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -111,13 +161,16 @@ def main():
 
     train_loader, val_loader = create_data_loaders(tokenizer, cfg)
 
+    # Construct spectral_cfg based on the GRPO config.
+    # This configuration must be compatible with the checkpoint being loaded.
     spectral_cfg = {
-        "embed_dim": cfg.get("embed_dim", 768),
+        "embed_dim": cfg.get("embed_dim", 768), # Ensure this matches the trained model's spectral embed_dim
         "encoder_type": cfg["model"].get("spectral_encoder_type", "convnext"),
         "ir_as_prompt": cfg["model"].get("ir_as_prompt", False),
     }
 
-    model = load_model(args.checkpoint, cfg, spectral_cfg, device)
+    # Load the model using the path from the configuration file
+    model = load_model(cfg, spectral_cfg, device)
 
     grpo_cfg = cfg["rl"]["grpo"]
     grpo = GRPO(

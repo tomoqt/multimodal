@@ -208,6 +208,7 @@ class LanguageModel(nn.Module):
         self.cfg = cfg
         self.lm_use_tokens = cfg.lm_use_tokens
         self.lm_tie_weights = cfg.lm_tie_weights
+        self.max_seq_length = cfg.lm_max_position_embeddings
 
         self.token_embedding = nn.Embedding(cfg.lm_vocab_size, cfg.lm_hidden_dim)
         self.rotary_embd = RotaryEmbedding(cfg)
