@@ -50,6 +50,21 @@ torchrun --nproc_per_node=1 train_autoregressive.py --config configs/test_config
 
 Configuration files in `configs/` control model size, dataset paths and optimization parameters.
 
+### RL Training with Verifiers
+
+To fine-tune a model using Grouped Relative Policy Optimization provided by the
+[verifiers](https://github.com/willccbb/verifiers) library on raw NMR spectra
+you can run:
+
+```bash
+python training/train_verifiers_nmr.py --data-path /path/to/data \
+    --model-name Qwen/Qwen2.5-1.5B-Instruct
+```
+
+`data-path` should contain `train.jsonl` and `val.jsonl` files with `nmr` and
+`smiles` keys. The script computes rewards using Tanimoto similarity between the
+predicted and target molecules.
+
 ## Inference
 
 After training you can test different decoding strategies using:
