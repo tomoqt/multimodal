@@ -1,0 +1,323 @@
+import argparse
+import os
+import sys
+from pprint import pprint
+import wandb  # Added for explicit logging
+
+import torch
+from datasets import Dataset, load_dataset
+from rdkit import Chem, RDLogger
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from trl import SFTConfig, SFTTrainer
+
+# Disable RDKit logging
+RDLogger.DisableLog("rdApp.*")
+
+# Add project root to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Fine-tune a model on NMR data using SFTTrainer.")
+    parser.add_argument("--model_name", type=str, default="futurehouse/ether0", help="The pre-trained model to fine-tune.")
+    parser.add_argument("--data_dir", type=str, default="data/reshaped_tokenized_data/data", help="Directory containing the data files (src-train.txt, src-val.txt).")
+    parser.add_argument("--output_dir", type=str, default="checkpoints_sft_nmr", help="Directory to save checkpoints and final model.")
+    parser.add_argument("--max_seq_length", type=int, default=512, help="Maximum sequence length for the model.")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
+    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate for training.")
+    parser.add_argument("--num_train_epochs", type=int, default=1, help="Number of training epochs.")
+    parser.add_argument("--warmup_steps", type=int, default=100, help="Number of warmup steps.")
+    parser.add_argument("--logging_steps", type=int, default=50, help="Log every X updates steps.")
+    parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every X updates steps.")
+    
+    # New arguments for Hugging Face Hub
+    parser.add_argument("--push_to_hub", action="store_true", help="Whether to push the model to the Hugging Face Hub after training.")
+    parser.add_argument("--hf_repo_id", type=str, default=None, help="The repository ID on the Hugging Face Hub (e.g., 'your-username/your-model').")
+    parser.add_argument("--hf_token", type=str, default=None, help="The Hugging Face hub token. If not set, will use HUGGING_FACE_HUB_TOKEN env var or cached token.")
+    
+    args = parser.parse_args()
+    return args
+
+def create_templated_dataset(data_dir, split):
+    """Creates a dataset with a prompt template for NMR to SMILES prediction."""
+    prompt_template = "Given the following NMR data, predict the corresponding SMILES string.\n\nNMR data: {nmr_data}\n\nSMILES:"
+    
+    src_path = os.path.join(data_dir, f"src-{split}.txt")
+    tgt_path = os.path.join(data_dir, f"tgt-{split}.txt")
+
+    if not os.path.exists(src_path) or not os.path.exists(tgt_path):
+        print(f"Error: Data files not found for split '{split}' in {data_dir}", file=sys.stderr)
+        print(f"Please ensure src-{split}.txt and tgt-{split}.txt exist.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(src_path, "r") as f:
+        nmr_lines = [line.strip() for line in f]
+    with open(tgt_path, "r") as f:
+        # From train_autoregressive.py: remove spaces from SMILES
+        smiles_lines = [line.strip().replace(" ", "") for line in f]
+
+    data = []
+    for nmr, smiles in zip(nmr_lines, smiles_lines):
+        prompt = prompt_template.format(nmr_data=nmr)
+        # Format for SFTTrainer: the 'text' field should contain prompt and completion
+        text = prompt + " " + smiles
+        data.append({"text": text})
+
+    return Dataset.from_dict({"text": [item["text"] for item in data]})
+
+def canonicalize_smiles(smiles):
+    """Convert a SMILES string to its canonical form using RDKit. Removes extra spaces before conversion. Returns the canonical SMILES if possible, otherwise returns the cleaned string."""
+    # Remove spaces and strip leading/trailing whitespace
+    cleaned = smiles.replace(' ', '').strip()
+    try:
+        mol = Chem.MolFromSmiles(cleaned)
+        if mol is None:
+            return cleaned
+        return Chem.MolToSmiles(mol, canonical=True)
+    except Exception:
+        return cleaned
+
+def evaluate_predictions(predictions, targets):
+    """
+    Computes detailed metrics for predictions against targets.
+    - Valid SMILES rate
+    - Exact match rate
+    - Tanimoto similarity
+    - MCS (Maximum Common Substructure) based metrics
+    - ECFP6 fingerprint based IoU (Jaccard)
+    """
+    from rdkit.Chem import AllChem, DataStructs, rdFMCS
+
+    results = []
+    for pred, target in zip(predictions, targets):
+        pred_mol = Chem.MolFromSmiles(pred)
+        target_mol = Chem.MolFromSmiles(target)
+        
+        metrics = {
+            "prediction": pred,
+            "target": target,
+            "valid_smiles": 1 if pred_mol else 0,
+            "exact_match": 0,
+            "tanimoto": 0.0,
+            "#mcs/#target": 0.0,
+            "ecfp6_iou": 0.0,
+        }
+
+        if pred_mol and target_mol:
+            # Exact Match
+            if pred == target:
+                metrics["exact_match"] = 1
+
+            # Tanimoto Similarity
+            fp_pred = AllChem.GetMorganFingerprintAsBitVect(pred_mol, 2, nBits=2048)
+            fp_target = AllChem.GetMorganFingerprintAsBitVect(target_mol, 2, nBits=2048)
+            metrics["tanimoto"] = DataStructs.TanimotoSimilarity(fp_pred, fp_target)
+
+            # MCS Ratio
+            mcs_result = rdFMCS.FindMCS([pred_mol, target_mol], timeout=1)
+            if mcs_result.numAtoms > 0:
+                mcs_mol = Chem.MolFromSmarts(mcs_result.smartsString)
+                if mcs_mol:
+                    metrics["#mcs/#target"] = mcs_mol.GetNumAtoms() / target_mol.GetNumAtoms()
+            
+            # ECFP6 IoU
+            ecfp6_pred = AllChem.GetMorganFingerprint(pred_mol, 3)
+            ecfp6_target = AllChem.GetMorganFingerprint(target_mol, 3)
+            intersection = len(set(ecfp6_pred.GetNonzeroElements()) & set(ecfp6_target.GetNonzeroElements()))
+            union = len(set(ecfp6_pred.GetNonzeroElements()) | set(ecfp6_target.GetNonzeroElements()))
+            if union > 0:
+                metrics["ecfp6_iou"] = intersection / union
+
+        results.append(metrics)
+    return results
+
+def aggregate_metrics(detailed_results):
+    """Aggregates detailed evaluation results into summary metrics."""
+    if not detailed_results:
+        return {}
+
+    total = len(detailed_results)
+    valid_smiles = sum(r["valid_smiles"] for r in detailed_results) / total
+    exact_match = sum(r["exact_match"] for r in detailed_results) / total
+    
+    # Only calculate averages for valid SMILES pairs
+    valid_pairs = [r for r in detailed_results if r["valid_smiles"] and Chem.MolFromSmiles(r["target"])]
+    if valid_pairs:
+        avg_tanimoto = sum(r["tanimoto"] for r in valid_pairs) / len(valid_pairs)
+        avg_mcs_ratio = sum(r["#mcs/#target"] for r in valid_pairs) / len(valid_pairs)
+        avg_ecfp6_iou = sum(r["ecfp6_iou"] for r in valid_pairs) / len(valid_pairs)
+    else:
+        avg_tanimoto = 0.0
+        avg_mcs_ratio = 0.0
+        avg_ecfp6_iou = 0.0
+
+    return {
+        "valid_smiles": valid_smiles,
+        "exact_match": exact_match,
+        "avg_tanimoto": avg_tanimoto,
+        "avg_#mcs/#target": avg_mcs_ratio,
+        "avg_ecfp6_iou": avg_ecfp6_iou
+    }
+
+def compute_metrics(eval_pred, tokenizer, prompt_template):
+    """Computes metrics for SFTTrainer."""
+    predictions, labels = eval_pred
+    
+    # Decode predictions. The model outputs the full sequence including prompt.
+    # We set skip_special_tokens=True to remove padding and EOS tokens.
+    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+
+    # Decode labels, replacing -100 with pad_token_id
+    labels[labels == -100] = tokenizer.pad_token_id
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    # The prompt part to be removed. We only need the part that is constant.
+    # The NMR data is variable. The template is "Given...SMILES:"
+    prompt_end = prompt_template.split("{nmr_data}")[1].strip() # This gives "\n\nSMILES:"
+
+    # Extract only the completion part
+    preds_completion = [pred.split(prompt_end)[-1].strip() for pred in decoded_preds]
+    labels_completion = [label.split(prompt_end)[-1].strip() for label in decoded_labels]
+    
+    # Canonicalize SMILES strings
+    canon_preds = [canonicalize_smiles(s) for s in preds_completion]
+    canon_labels = [canonicalize_smiles(s) for s in labels_completion]
+
+    # Compute metrics
+    detailed_results = evaluate_predictions(canon_preds, canon_labels)
+    metrics = aggregate_metrics(detailed_results)
+
+    return metrics
+
+def evaluate_model(model, tokenizer, dataset, batch_size: int = 4, max_new_tokens: int = 128):
+    """Run model.generate on prompts in `dataset` and compute evaluation metrics.
+
+    This function is intended to be called outside the training loop so that
+    evaluation results reflect inference-time behaviour. Metrics are computed
+    with the same helpers already defined in the script.
+    """
+
+    model.eval()
+    prompt_end = "\n\nSMILES:"
+
+    preds, targets = [], []
+
+    for start_idx in range(0, len(dataset), batch_size):
+        batch_texts = dataset[start_idx : start_idx + batch_size]["text"]
+
+        prompts, batch_targets = [], []
+        for txt in batch_texts:
+            if prompt_end not in txt:
+                # Skip malformed sample
+                continue
+            prompt_part, target_part = txt.split(prompt_end, 1)
+            prompts.append(prompt_part + prompt_end)  # keep delimiter
+            batch_targets.append(target_part.strip())
+
+        if not prompts:
+            continue
+
+        inputs = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(model.device)
+
+        with torch.no_grad():
+            gen_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+
+        decoded = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+        batch_preds = [d.split(prompt_end)[-1].strip() for d in decoded]
+
+        preds.extend(batch_preds)
+        targets.extend(batch_targets)
+
+    # Canonicalize SMILES prior to metric computation
+    canon_preds = [canonicalize_smiles(s) for s in preds]
+    canon_targets = [canonicalize_smiles(s) for s in targets]
+
+    detailed = evaluate_predictions(canon_preds, canon_targets)
+    return aggregate_metrics(detailed)
+
+def main():
+    """Main training function."""
+    args = parse_args()
+
+    print("--- Configuration ---")
+    pprint(vars(args))
+    print("---------------------")
+    
+    if args.push_to_hub and not args.hf_repo_id:
+        print("Error: --hf_repo_id is required when --push_to_hub is set.", file=sys.stderr)
+        sys.exit(1)
+
+    # 1. Load and template dataset
+    print(f"Loading and templating dataset from {args.data_dir}")
+    train_dataset = create_templated_dataset(args.data_dir, "train")
+    val_dataset = create_templated_dataset(args.data_dir, "val")
+    
+    print("Dataset loaded and formatted:")
+    print(train_dataset)
+    print(val_dataset)
+    print("Example data point:")
+    print(train_dataset[0])
+    
+    # 2. Load model and tokenizer
+    print(f"Loading model and tokenizer for {args.model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if tokenizer.pad_token is None:
+        print("Tokenizer does not have a pad token, setting it to eos_token.")
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    model = AutoModelForCausalLM.from_pretrained(args.model_name)
+
+    # 3. Configure SFT training
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        num_train_epochs=args.num_train_epochs,
+        warmup_steps=args.warmup_steps,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        push_to_hub=args.push_to_hub,
+        hub_model_id=args.hf_repo_id,
+        hub_token=args.hf_token,
+        remove_unused_columns=False,
+        report_to=["wandb"],  # Explicitly report to Weights & Biases
+    )
+
+    # 4. Initialize SFTTrainer
+    print("Initializing SFTTrainer...")
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+    )
+
+    # 5. Start training
+    print("Starting training...")
+    trainer.train()
+
+    # 6. Save final model locally
+    print("Training finished. Saving final model.")
+    trainer.save_model(args.output_dir)
+    print(f"Model saved to {args.output_dir}")
+    
+    # 7. Separate evaluation using `model.generate` and explicit W&B logging
+    print("Running evaluation with model.generate ...")
+    eval_metrics = evaluate_model(model, tokenizer, val_dataset, batch_size=args.batch_size)
+    print("Evaluation metrics:")
+    pprint(eval_metrics)
+
+    # Log metrics to wandb (will attach to the same run initiated by HF integration)
+    try:
+        wandb.log(eval_metrics)
+    except Exception as e:
+        print(f"wandb logging failed: {e}")
+
+if __name__ == "__main__":
+    main() 
