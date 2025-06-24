@@ -1,0 +1,317 @@
+import argparse
+import os
+import sys
+from pprint import pprint
+
+import torch
+from datasets import Dataset
+from rdkit import Chem, RDLogger, DataStructs
+from rdkit.Chem import AllChem
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import GRPOConfig, GRPOTrainer
+
+# Disable RDKit warnings
+RDLogger.DisableLog("rdApp.*")
+
+# Add project root to path so we can import utils if needed
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+SYSTEM_PROMPT = (
+    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
+    "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+    "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, "
+    "i.e., <think> reasoning process here </think><answer> answer here </answer>"
+)
+
+PROMPT_TEMPLATE = (
+    SYSTEM_PROMPT
+    + "\n\nUser: Given the following NMR data, predict the corresponding SMILES string.\n\n"
+    + "NMR data: {nmr_data}\n\nAssistant:"
+)
+
+PROMPT_END = "Assistant:"
+
+# -----------------------------------------------------------------------------
+# Helper chemistry utilities (minimal subset to keep the script self-contained)
+# -----------------------------------------------------------------------------
+
+def canonicalize_smiles(smiles: str) -> str:
+    """Return canonical RDKit SMILES or cleaned string if invalid."""
+    s = smiles.replace(" ", "").strip()
+    mol = Chem.MolFromSmiles(s)
+    if mol is None:
+        return s
+    return Chem.MolToSmiles(mol, canonical=True)
+
+def tanimoto_similarity(smiles_a: str, smiles_b: str) -> float:
+    """Compute Tanimoto similarity between two SMILES. Returns 0 if invalid."""
+    mol_a, mol_b = Chem.MolFromSmiles(smiles_a), Chem.MolFromSmiles(smiles_b)
+    if not mol_a or not mol_b:
+        return 0.0
+    fp_a = AllChem.GetMorganFingerprintAsBitVect(mol_a, 2, nBits=2048)
+    fp_b = AllChem.GetMorganFingerprintAsBitVect(mol_b, 2, nBits=2048)
+    return DataStructs.TanimotoSimilarity(fp_a, fp_b)
+
+# -----------------------------------------------------------------------------
+# Dataset helpers
+# -----------------------------------------------------------------------------
+
+def load_nmr_dataset(data_dir: str, split: str) -> Dataset:
+    """Load src/tgt pairs and return Dataset with 'prompt' and 'target' fields."""
+    src_path = os.path.join(data_dir, f"src-{split}.txt")
+    tgt_path = os.path.join(data_dir, f"tgt-{split}.txt")
+    if not os.path.exists(src_path) or not os.path.exists(tgt_path):
+        raise FileNotFoundError(
+            f"Expected files src-{split}.txt and tgt-{split}.txt inside {data_dir}"
+        )
+
+    with open(src_path) as f:
+        src_lines = [l.strip() for l in f]
+    with open(tgt_path) as f:
+        tgt_lines = [l.strip().replace(" ", "") for l in f]
+
+    prompts, targets = [], []
+    for nmr, tgt in zip(src_lines, tgt_lines):
+        prompts.append(PROMPT_TEMPLATE.format(nmr_data=nmr))
+        targets.append(tgt)
+
+    return Dataset.from_dict({"prompt": prompts, "target": targets})
+
+# -----------------------------------------------------------------------------
+# Reward functions
+# -----------------------------------------------------------------------------
+
+def reward_format(completions, **kwargs):
+    """Reward completions that have both <think>...</think> and <answer>...</answer> blocks."""
+    rewards = []
+    for c in completions:
+        has_think = "<think>" in c and "</think>" in c
+        has_answer = "<answer>" in c and "</answer>" in c
+        rewards.append(1.0 if has_think and has_answer else -1.0)
+    return rewards
+
+
+def reward_tanimoto(completions, **kwargs):
+    """Reward completions based on Tanimoto similarity to the reference target SMILES.
+
+    The reference targets are expected to be passed by the trainer via **kwargs.
+    We try a few common key names ("target", "targets", "reference", "samples").
+    """
+    # Extract potential target(s) from kwargs – they should align with completions length
+    targets = None
+    # Direct names
+    for key in ["target", "targets", "reference", "references"]:
+        if key in kwargs:
+            targets = kwargs[key]
+            break
+
+    # Fallback to samples dict if provided
+    if targets is None and "samples" in kwargs and isinstance(kwargs["samples"], dict):
+        targets = kwargs["samples"].get("target")
+
+    # If we still couldn't find targets, assign neutral reward
+    if targets is None:
+        return [0.0 for _ in completions]
+
+    # Ensure targets is list-like and matches completions length
+    if not isinstance(targets, (list, tuple)):
+        targets = [targets] * len(completions)
+
+    rewards = []
+    for comp, tgt in zip(completions, targets):
+        tgt_can = canonicalize_smiles(tgt)
+
+        # Remove <think>...</think> and <answer>...</answer> wrappers
+        comp_stripped = comp
+        # Keep only text inside <answer> if present; else full string
+        if "<answer>" in comp_stripped and "</answer>" in comp_stripped:
+            comp_stripped = comp_stripped.split("<answer>")[-1].split("</answer>")[0]
+        # Fallback to remove think tags
+        comp_stripped = comp_stripped.replace("<think>", "").replace("</think>", "")
+        comp_smiles = comp_stripped.strip()
+
+        comp_can = canonicalize_smiles(comp_smiles)
+        rewards.append(tanimoto_similarity(comp_can, tgt_can))
+
+    return rewards
+
+# -----------------------------------------------------------------------------
+# Argument parser
+# -----------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Fine-tune a language model on NMR→SMILES using GRPOTrainer"
+    )
+    parser.add_argument("--model_name", type=str, default="gpt2")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="data/reshaped_tokenized_data/data",
+        help="Directory containing src-*.txt and tgt-*.txt pairs",
+    )
+    parser.add_argument("--output_dir", type=str, default="checkpoints_grpo_nmr")
+    parser.add_argument("--max_length", type=int, default=3000)
+    parser.add_argument(
+        "--batch_size",
+        "--per_device_batch_size",
+        dest="batch_size",
+        type=int,
+        default=4,
+        help="Per-device batch size for training and evaluation.",
+    )
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--num_train_epochs", type=int, default=1)
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=0.1,
+        help="KL coefficient beta for GRPO (0 disables reference model)",
+    )
+    parser.add_argument("--number_of_generations", type = int , default = 4)
+    parser.add_argument("--logging_steps", type=int, default=50)
+    parser.add_argument("--save_steps", type=int, default=500)
+    # Hugging Face hub args
+    parser.add_argument("--push_to_hub", action="store_true")
+    parser.add_argument("--hf_repo_id", type=str, default=None)
+    parser.add_argument("--hf_token", type=str, default=None)
+    # Prompt/completion length controls
+    parser.add_argument("--max_prompt_length", type=int, default=512,
+                        help="Maximum token length for the prompt passed to the model.")
+    parser.add_argument("--max_completion_length", type=int, default=512,
+                        help="Maximum number of tokens the model can generate per completion.")
+
+    return parser.parse_args()
+
+# -----------------------------------------------------------------------------
+# Evaluation helper (greedy generation)
+# -----------------------------------------------------------------------------
+
+def evaluate_model(model, tokenizer, dataset, batch_size=4, max_new_tokens=128):
+    model.eval()
+    preds, tgts = [], []
+
+    for i in range(0, len(dataset), batch_size):
+        batch = dataset[i : i + batch_size]
+        prompts = batch["prompt"]
+        tgts.extend(batch["target"])
+
+        inputs = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(model.device)
+
+        with torch.no_grad():
+            gen_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+
+        decoded = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+        # Extract completion part
+        comps = []
+        for d in decoded:
+            if PROMPT_END in d:
+                comps.append(d.split(PROMPT_END)[-1].strip())
+            else:
+                comps.append(d)
+        preds.extend(comps)
+
+    # Compute average Tanimoto
+    sims = [tanimoto_similarity(canonicalize_smiles(p), canonicalize_smiles(t)) for p, t in zip(preds, tgts)]
+    return {"avg_tanimoto": sum(sims) / len(sims)}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+def main():
+    args = parse_args()
+
+    print("--- Configuration ---")
+    pprint(vars(args))
+    print("---------------------")
+
+    # 1. Load dataset (prompts include system prompt automatically)
+    print("Loading dataset ...")
+    train_ds = load_nmr_dataset(args.data_dir, "train")
+    val_ds = load_nmr_dataset(args.data_dir, "val")
+
+    # 2. Load model & tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(args.model_name)
+
+    # 3. Configure GRPO
+    # ------------------------------------------------------------------
+    # Respect model's absolute maximum sequence length to avoid CUDA/shape
+    # errors during generation & log-prob computations.
+    # ------------------------------------------------------------------
+    model_max_len = getattr(model.config, "n_positions", getattr(model.config, "max_position_embeddings", 2048))
+
+    desired_total_len = args.max_prompt_length + args.max_completion_length
+    if desired_total_len > model_max_len:
+        print(
+            f"[WARNING] Requested max_prompt_length+max_completion_length ({desired_total_len}) exceeds model capability ({model_max_len}). "
+            f"Reducing max_completion_length to keep total ≤ {model_max_len}."
+        )
+        args.max_completion_length = max(1, model_max_len - args.max_prompt_length)
+
+    tokenizer.model_max_length = args.max_prompt_length + args.max_completion_length
+
+    grpo_args = GRPOConfig(
+        output_dir=args.output_dir,
+        per_device_train_batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        num_train_epochs=args.num_train_epochs,
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        push_to_hub=args.push_to_hub,
+        hub_model_id=args.hf_repo_id,
+        hub_token=args.hf_token,
+        beta=args.beta,
+        remove_unused_columns=False,
+        report_to=["wandb"],
+        max_prompt_length=args.max_prompt_length,
+        max_completion_length=args.max_completion_length,
+        num_generations=args.number_of_generations,
+    )
+
+    # 4. Instantiate trainer. We pass both reward functions.
+    reward_fns = [reward_format, reward_tanimoto]
+
+    trainer = GRPOTrainer(
+        model=model,
+        args=grpo_args,
+        reward_funcs=reward_fns,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+    )
+
+    # 5. Train
+    print("Starting GRPO training ...")
+    trainer.train()
+
+    # 6. Save model
+    trainer.save_model(args.output_dir)
+
+    # 7. Evaluate via generation
+    metrics = evaluate_model(
+        model,
+        tokenizer,
+        val_ds,
+        batch_size=args.batch_size,
+        max_new_tokens=args.max_completion_length,
+    )
+    print("Evaluation metrics:")
+    pprint(metrics)
+    try:
+        import wandb
+
+        wandb.log(metrics)
+    except Exception as e:
+        print(f"wandb logging failed: {e}")
+
+
+if __name__ == "__main__":
+    main() 
