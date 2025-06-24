@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument("--data_dir", type=str, default="data/reshaped_tokenized_data/data", help="Directory containing the data files (src-train.txt, src-val.txt).")
     parser.add_argument("--output_dir", type=str, default="checkpoints_sft_nmr", help="Directory to save checkpoints and final model.")
     parser.add_argument("--max_seq_length", type=int, default=512, help="Maximum sequence length for the model.")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training.")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training.")
     parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate for training.")
     parser.add_argument("--num_train_epochs", type=int, default=1, help="Number of training epochs.")
     parser.add_argument("--warmup_steps", type=int, default=100, help="Number of warmup steps.")
