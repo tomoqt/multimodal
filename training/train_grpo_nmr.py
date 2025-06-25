@@ -168,7 +168,7 @@ def parse_args():
         default=0.1,
         help="KL coefficient beta for GRPO (0 disables reference model)",
     )
-    parser.add_argument("--number_of_generations", type = int , default = 4)
+    parser.add_argument("--number_of_generations", type = int , default = 2)
     parser.add_argument("--logging_steps", type=int, default=50)
     parser.add_argument("--save_steps", type=int, default=500)
     # Hugging Face hub args
@@ -180,6 +180,8 @@ def parse_args():
                         help="Maximum token length for the prompt passed to the model.")
     parser.add_argument("--max_completion_length", type=int, default=512,
                         help="Maximum number of tokens the model can generate per completion.")
+    # Verbose/debug flag
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging and print example samples.")
 
     return parser.parse_args()
 
@@ -235,6 +237,15 @@ def main():
     print("Loading dataset ...")
     train_ds = load_nmr_dataset(args.data_dir, "train")
     val_ds = load_nmr_dataset(args.data_dir, "val")
+
+    # ------------------------------------------------------------------
+    # Verbose mode: print a handful of formatted samples for inspection
+    # ------------------------------------------------------------------
+    if args.verbose:
+        print("\n--- Verbose sample inspection (first 3 training samples) ---")
+        for i in range(min(3, len(train_ds))):
+            print(f"Prompt {i}: {train_ds[i]['prompt']}")
+            print(f"Target {i}: {train_ds[i]['target']}\n{'-'*80}")
 
     # 2. Load model & tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)

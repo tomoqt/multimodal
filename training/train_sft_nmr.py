@@ -34,6 +34,8 @@ def parse_args():
     parser.add_argument("--push_to_hub", action="store_true", help="Whether to push the model to the Hugging Face Hub after training.")
     parser.add_argument("--hf_repo_id", type=str, default=None, help="The repository ID on the Hugging Face Hub (e.g., 'your-username/your-model').")
     parser.add_argument("--hf_token", type=str, default=None, help="The Hugging Face hub token. If not set, will use HUGGING_FACE_HUB_TOKEN env var or cached token.")
+    # Verbose/debug flag
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging and print example samples.")
     
     args = parser.parse_args()
     return args
@@ -263,6 +265,15 @@ def main():
     print("Example data point:")
     print(train_dataset[0])
     
+    # ------------------------------------------------------------------
+    # Verbose mode: print a handful of formatted samples for inspection
+    # ------------------------------------------------------------------
+    if args.verbose:
+        print("\n--- Verbose sample inspection (first 3 training samples) ---")
+        for i in range(min(3, len(train_dataset))):
+            sample_text = train_dataset[i]["text"]
+            print(f"Sample {i}:\n{sample_text}\n{'-'*80}")
+
     # 2. Load model and tokenizer
     print(f"Loading model and tokenizer for {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)

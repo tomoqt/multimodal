@@ -31,13 +31,14 @@
 #   --extra-sft "<args>"     Extra args passed verbatim to train_sft_nmr.py
 #   --extra-grpo "<args>"    Extra args passed verbatim to train_grpo_nmr.py
 #   --accel-args "<args>"    Extra flags passed to `accelerate launch` (e.g. "--multi_gpu")
+#   --verbose                Pass verbose flag to training stages
 # ===============================================================
 set -euo pipefail
 
 # -------- default values --------
 RUN_SFT=1
 RUN_GRPO=1
-MODEL_NAME="gpt2"
+MODEL_NAME="futurehouse/ether0"
 SFT_DATA="data/reshaped_tokenized_data/data"
 GRPO_DATA="data/reshaped_tokenized_data/data"
 SFT_OUT="checkpoints_sft_nmr"
@@ -47,6 +48,7 @@ HF_TOKEN=""
 EXTRA_SFT=""
 EXTRA_GRPO=""
 ACCEL_ARGS=""
+VERBOSE=0
 
 # -------- arg parsing --------
 while [[ $# -gt 0 ]]; do
@@ -63,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --extra-sft)       EXTRA_SFT="$2"; shift 2 ;;
     --extra-grpo)      EXTRA_GRPO="$2"; shift 2 ;;
     --accel-args)      ACCEL_ARGS="$2"; shift 2 ;;
+    --verbose)         VERBOSE=1; shift ;;
     -h|--help)
       grep -E "^#( |$)" "$0" | sed -E 's/^# ?//'; exit 0 ;;
     *)
@@ -79,6 +82,12 @@ function hf_flags() {
     fi
   fi
 }
+
+# -------- propagate verbose flag to extra args --------
+if [[ $VERBOSE -eq 1 ]]; then
+  EXTRA_SFT="$EXTRA_SFT --verbose"
+  EXTRA_GRPO="$EXTRA_GRPO --verbose"
+fi
 
 # -------- run SFT --------
 if [[ $RUN_SFT -eq 1 ]]; then
