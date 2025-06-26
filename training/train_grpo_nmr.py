@@ -189,6 +189,12 @@ def parse_args():
     # Verbose/debug flag
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging and print example samples.")
 
+    # vLLM arguments
+    parser.add_argument("--use_vllm", action="store_true", help="Enable vLLM for faster generation.")
+    parser.add_argument("--vllm_server_host", type=str, default="localhost", help="Hostname for the vLLM server.")
+    parser.add_argument("--vllm_server_port", type=int, default=8000, help="Port for the vLLM server.")
+    parser.add_argument("--vllm_server_endpoint", type=str, default="/v1/completions", help="Endpoint for the vLLM server.")
+
     return parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -311,6 +317,10 @@ def main():
         max_prompt_length=args.max_prompt_length,
         max_completion_length=args.max_completion_length,
         num_generations=args.number_of_generations,
+        use_vllm=args.use_vllm,
+        vllm_server_host=args.vllm_server_host,
+        vllm_server_port=args.vllm_server_port,
+        vllm_server_endpoint=args.vllm_server_endpoint,
     )
 
     # 4. Instantiate trainer. We pass both reward functions.
@@ -324,6 +334,13 @@ def main():
         eval_dataset=val_ds,
         processing_class = tokenizer #that's how it should be aaprently
     )
+
+    # Handle PEFT+FSDP case
+    if getattr(trainer.accelerator.state, "fsdp_plugin", None) and peft_config:
+        from peft.utils.other import fsdp_auto_wrap_policy
+        print("Applying FSDP auto wrap policy for PEFT")
+        fsdp_plugin = trainer.accelerator.state.fsdp_plugin
+        fsdp_plugin.auto_wrap_policy = fsdp_auto_wrap_policy(trainer.model)
 
     # 5. Train
     print("Starting GRPO training ...")
