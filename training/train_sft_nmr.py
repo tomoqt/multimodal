@@ -9,6 +9,7 @@ from datasets import Dataset, load_dataset
 from rdkit import Chem, RDLogger
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from trl import SFTConfig, SFTTrainer
+from peft import LoraConfig
 
 # Disable RDKit logging
 RDLogger.DisableLog("rdApp.*")
@@ -37,6 +38,12 @@ def parse_args():
     # Verbose/debug flag
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging and print example samples.")
     
+    # PEFT arguments
+    parser.add_argument("--use_peft", action="store_true", help="Enable PEFT for fine-tuning.")
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA r parameter.")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha parameter.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout parameter.")
+
     args = parser.parse_args()
     return args
 
@@ -283,7 +290,19 @@ def main():
         
     model = AutoModelForCausalLM.from_pretrained(args.model_name)
 
-    # 3. Configure SFT training
+    # 3. Configure PEFT if requested
+    peft_config = None
+    if args.use_peft:
+        print("PEFT enabled. Using LoRA configuration.")
+        peft_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+
+    # 4. Configure SFT training
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.batch_size,
@@ -300,27 +319,36 @@ def main():
         report_to=["wandb"],  # Explicitly report to Weights & Biases
     )
 
-    # 4. Initialize SFTTrainer
+    # 5. Initialize SFTTrainer
     print("Initializing SFTTrainer...")
     trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
+        peft_config=peft_config,
     )
 
-    # 5. Start training
+    # 6. Start training
     print("Starting training...")
     trainer.train()
 
-    # 6. Save final model locally
+    # 7. Save final model locally
     print("Training finished. Saving final model.")
     trainer.save_model(args.output_dir)
     print(f"Model saved to {args.output_dir}")
     
-    # 7. Separate evaluation using `model.generate` and explicit W&B logging
+    # 8. Separate evaluation using `model.generate` and explicit W&B logging
     print("Running evaluation with model.generate ...")
-    eval_metrics = evaluate_model(model, tokenizer, val_dataset, batch_size=args.batch_size)
+    eval_model = trainer.model
+    if args.use_peft:
+        try:
+            eval_model = trainer.model.merge_and_unload()
+            print("Successfully merged PEFT adapters for evaluation.")
+        except Exception as e:
+            print(f"Could not merge PEFT adapters: {e}. Evaluating with adapters loaded.")
+
+    eval_metrics = evaluate_model(eval_model, tokenizer, val_dataset, batch_size=args.batch_size)
     print("Evaluation metrics:")
     pprint(eval_metrics)
 

@@ -9,14 +9,16 @@
 #
 # USAGE EXAMPLES
 #   bash run_nmr_pipeline.sh                       # run both stages with defaults
-#   bash run_nmr_pipeline.sh --no-sft              # skip SFT, only GRPO
-#   bash run_nmr_pipeline.sh --no-grpo             # only run SFT
+#   bash run_nmr_pipeline.sh --no-sft              # skip SFT, only GRPO (lora)
+#   bash run_nmr_pipeline.sh --no-grpo             # only run SFT (full-finetune)
+#   bash run_nmr_pipeline.sh --sft-peft --grpo-full-finetune # sft-lora, grpo-full
 #   bash run_nmr_pipeline.sh --model mistralai/Mistral-7B-v0.1 \
 #        --sft-data path/to/sft_data \
 #        --grpo-data path/to/grpo_data \
 #        --hf-repo myuser/nmr-model \
 #        --extra-sft "--num_train_epochs 3" \
-#        --extra-grpo "--num_train_epochs 1 --beta 0.05"
+#        --extra-grpo "--num_train_epochs 1 --beta 0.05" \
+#        --lora-r 32
 #
 # OPTIONS
 #   --no-sft                 Skip SFT stage
@@ -28,6 +30,11 @@
 #   --grpo-out <dir>         Checkpoint location for GRPO
 #   --hf-repo  <repo_id>     Push final stage(s) to HuggingFace Hub repo
 #   --hf-token <token>       HF token (if not already logged-in)
+#   --sft-peft               Use PEFT/LoRA for SFT stage (default: full finetune)
+#   --grpo-full-finetune     Use full fine-tuning for GRPO (default: PEFT/LoRA)
+#   --lora-r <int>           LoRA 'r' parameter
+#   --lora-alpha <int>       LoRA 'alpha' parameter
+#   --lora-dropout <float>   LoRA 'dropout'
 #   --extra-sft "<args>"     Extra args passed verbatim to train_sft_nmr.py
 #   --extra-grpo "<args>"    Extra args passed verbatim to train_grpo_nmr.py
 #   --accel-args "<args>"    Extra flags passed to `accelerate launch` (e.g. "--multi_gpu")
@@ -45,6 +52,11 @@ SFT_OUT="checkpoints_sft_nmr"
 GRPO_OUT="checkpoints_grpo_nmr"
 HF_REPO=""
 HF_TOKEN=""
+SFT_PEFT=0
+GRPO_FULL_FINETUNE=0
+LORA_R=16
+LORA_ALPHA=32
+LORA_DROPOUT=0.05
 EXTRA_SFT=""
 EXTRA_GRPO=""
 ACCEL_ARGS=""
@@ -53,19 +65,24 @@ VERBOSE=0
 # -------- arg parsing --------
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --no-sft)          RUN_SFT=0; shift ;;
-    --no-grpo)         RUN_GRPO=0; shift ;;
-    --model)           MODEL_NAME="$2"; shift 2 ;;
-    --sft-data)        SFT_DATA="$2"; shift 2 ;;
-    --grpo-data)       GRPO_DATA="$2"; shift 2 ;;
-    --sft-out)         SFT_OUT="$2"; shift 2 ;;
-    --grpo-out)        GRPO_OUT="$2"; shift 2 ;;
-    --hf-repo)         HF_REPO="$2"; shift 2 ;;
-    --hf-token)        HF_TOKEN="$2"; shift 2 ;;
-    --extra-sft)       EXTRA_SFT="$2"; shift 2 ;;
-    --extra-grpo)      EXTRA_GRPO="$2"; shift 2 ;;
-    --accel-args)      ACCEL_ARGS="$2"; shift 2 ;;
-    --verbose)         VERBOSE=1; shift ;;
+    --no-sft)               RUN_SFT=0; shift ;;
+    --no-grpo)              RUN_GRPO=0; shift ;;
+    --model)                MODEL_NAME="$2"; shift 2 ;;
+    --sft-data)             SFT_DATA="$2"; shift 2 ;;
+    --grpo-data)            GRPO_DATA="$2"; shift 2 ;;
+    --sft-out)              SFT_OUT="$2"; shift 2 ;;
+    --grpo-out)             GRPO_OUT="$2"; shift 2 ;;
+    --hf-repo)              HF_REPO="$2"; shift 2 ;;
+    --hf-token)             HF_TOKEN="$2"; shift 2 ;;
+    --sft-peft)             SFT_PEFT=1; shift ;;
+    --grpo-full-finetune)   GRPO_FULL_FINETUNE=1; shift ;;
+    --lora-r)               LORA_R="$2"; shift 2 ;;
+    --lora-alpha)           LORA_ALPHA="$2"; shift 2 ;;
+    --lora-dropout)         LORA_DROPOUT="$2"; shift 2 ;;
+    --extra-sft)            EXTRA_SFT="$2"; shift 2 ;;
+    --extra-grpo)           EXTRA_GRPO="$2"; shift 2 ;;
+    --accel-args)           ACCEL_ARGS="$2"; shift 2 ;;
+    --verbose)              VERBOSE=1; shift ;;
     -h|--help)
       grep -E "^#( |$)" "$0" | sed -E 's/^# ?//'; exit 0 ;;
     *)
@@ -89,6 +106,24 @@ if [[ $VERBOSE -eq 1 ]]; then
   EXTRA_GRPO="$EXTRA_GRPO --verbose"
 fi
 
+# -------- construct PEFT args string --------
+PEFT_ARGS="--lora_r $LORA_R --lora_alpha $LORA_ALPHA --lora_dropout $LORA_DROPOUT"
+SFT_PEFT_FLAG=""
+if [[ $SFT_PEFT -eq 1 ]]; then
+  SFT_PEFT_FLAG="--use_peft"
+fi
+GRPO_PEFT_FLAG=""
+if [[ $GRPO_FULL_FINETUNE -eq 1 ]]; then
+  GRPO_PEFT_FLAG="--full_finetune"
+fi
+
+# -------- determine model for GRPO stage --------
+GRPO_MODEL_NAME="$MODEL_NAME"
+if [[ $RUN_SFT -eq 1 ]]; then
+  echo "SFT stage is enabled. GRPO will use its output from '$SFT_OUT'."
+  GRPO_MODEL_NAME="$SFT_OUT"
+fi
+
 # -------- run SFT --------
 if [[ $RUN_SFT -eq 1 ]]; then
   echo "==================== Stage 1: SFT ===================="
@@ -96,6 +131,8 @@ if [[ $RUN_SFT -eq 1 ]]; then
     --model_name "$MODEL_NAME" \
     --data_dir "$SFT_DATA" \
     --output_dir "$SFT_OUT" \
+    $SFT_PEFT_FLAG \
+    $PEFT_ARGS \
     $(hf_flags) \
     $EXTRA_SFT
 fi
@@ -104,9 +141,11 @@ fi
 if [[ $RUN_GRPO -eq 1 ]]; then
   echo "==================== Stage 2: GRPO ===================="
   accelerate launch $ACCEL_ARGS training/train_grpo_nmr.py \
-    --model_name "$MODEL_NAME" \
+    --model_name "$GRPO_MODEL_NAME" \
     --data_dir "$GRPO_DATA" \
     --output_dir "$GRPO_OUT" \
+    $GRPO_PEFT_FLAG \
+    $PEFT_ARGS \
     $(hf_flags) \
     $EXTRA_GRPO
 fi

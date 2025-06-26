@@ -9,6 +9,7 @@ from rdkit import Chem, RDLogger, DataStructs
 from rdkit.Chem import AllChem
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
+from peft import LoraConfig
 
 # Disable RDKit warnings
 RDLogger.DisableLog("rdApp.*")
@@ -157,7 +158,7 @@ def parse_args():
         "--per_device_batch_size",
         dest="batch_size",
         type=int,
-        default=4,
+        default=2,
         help="Per-device batch size for training and evaluation.",
     )
     parser.add_argument("--learning_rate", type=float, default=2e-5)
@@ -180,6 +181,11 @@ def parse_args():
                         help="Maximum token length for the prompt passed to the model.")
     parser.add_argument("--max_completion_length", type=int, default=512,
                         help="Maximum number of tokens the model can generate per completion.")
+    # PEFT arguments (PEFT is on by default for GRPO)
+    parser.add_argument("--full_finetune", action="store_true", help="Disable PEFT and run full fine-tuning.")
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA r parameter.")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha parameter.")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout parameter.")
     # Verbose/debug flag
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging and print example samples.")
 
@@ -248,10 +254,28 @@ def main():
             print(f"Target {i}: {train_ds[i]['target']}\n{'-'*80}")
 
     # 2. Load model & tokenizer
+    print(f"Loading model and tokenizer for {args.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(args.model_name)
+
+    peft_config = None
+    if not args.full_finetune:
+        print("PEFT enabled (default). Using LoRA.")
+        peft_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            peft_config=peft_config,
+        )
+    else:
+        print("PEFT disabled. Using full fine-tuning.")
+        model = AutoModelForCausalLM.from_pretrained(args.model_name)
 
     # 3. Configure GRPO
     # ------------------------------------------------------------------
@@ -297,6 +321,7 @@ def main():
         reward_funcs=reward_fns,
         train_dataset=train_ds,
         eval_dataset=val_ds,
+        processing_class = tokenizer #that's how it should be aaprently
     )
 
     # 5. Train
@@ -307,8 +332,16 @@ def main():
     trainer.save_model(args.output_dir)
 
     # 7. Evaluate via generation
+    eval_model = trainer.model
+    if not args.full_finetune:
+        try:
+            eval_model = trainer.model.merge_and_unload()
+            print("Successfully merged PEFT adapters for evaluation.")
+        except Exception as e:
+            print(f"Could not merge PEFT adapters: {e}. Evaluating with adapters loaded.")
+
     metrics = evaluate_model(
-        model,
+        eval_model,
         tokenizer,
         val_ds,
         batch_size=args.batch_size,
