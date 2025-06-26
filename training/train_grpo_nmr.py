@@ -193,7 +193,7 @@ def parse_args():
     parser.add_argument("--use_vllm", action="store_true", help="Enable vLLM for faster generation.")
     parser.add_argument("--vllm_server_host", type=str, default="localhost", help="Hostname for the vLLM server.")
     parser.add_argument("--vllm_server_port", type=int, default=8000, help="Port for the vLLM server.")
-    parser.add_argument("--vllm_server_endpoint", type=str, default="/v1/completions", help="Endpoint for the vLLM server.")
+    #parser.add_argument("--vllm_server_endpoint", type=str, default="/v1/completions", help="Endpoint for the vLLM server.")
 
     return parser.parse_args()
 
@@ -320,7 +320,7 @@ def main():
         use_vllm=args.use_vllm,
         vllm_server_host=args.vllm_server_host,
         vllm_server_port=args.vllm_server_port,
-        vllm_server_endpoint=args.vllm_server_endpoint,
+        #vllm_server_endpoint=args.vllm_server_endpoint,
     )
 
     # 4. Instantiate trainer. We pass both reward functions.
