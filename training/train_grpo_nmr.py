@@ -273,7 +273,7 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(args.model_name)
         from peft import get_peft_model
         model = get_peft_model(model,peft_config)
-        lora_model.print_trainable_parameters()
+        model.print_trainable_parameters()
     else:
         print("PEFT disabled. Using full fine-tuning.")
         model = AutoModelForCausalLM.from_pretrained(args.model_name)
