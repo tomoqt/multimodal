@@ -270,7 +270,7 @@ def main():
             task_type="CAUSAL_LM",
         )
         model = AutoModelForCausalLM.from_pretrained(args.model_name)
-        from peft import get_perft_model
+        from peft import get_peft_model
         model = get_perft_model(model,peft_config)
         lora_model.print_trainable_parameters()
     else:
