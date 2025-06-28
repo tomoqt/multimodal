@@ -40,6 +40,10 @@
 #   --accel-args "<args>"    Extra flags passed to `accelerate launch` (e.g. "--multi_gpu")
 #   --verbose                Pass verbose flag to training stages
 # ===============================================================
+
+#./run_nmr_pipeline.sh --sft-peft --accel-args "--config_file fsdp_config.yaml"
+
+
 set -euo pipefail
 
 # -------- default values --------
@@ -54,9 +58,9 @@ HF_REPO=""
 HF_TOKEN=""
 SFT_PEFT=0
 GRPO_FULL_FINETUNE=0
-LORA_R=16
-LORA_ALPHA=32
-LORA_DROPOUT=0.05
+LORA_R=32
+LORA_ALPHA=64
+LORA_DROPOUT=0.00
 EXTRA_SFT=""
 EXTRA_GRPO=""
 ACCEL_ARGS=""

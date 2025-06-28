@@ -300,6 +300,8 @@ def main():
             lora_dropout=args.lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
+            target_modules=["q_proj", "v_proj","out_proj", "fc_in", "fc_out", "wte"],
+
         )
 
     # 4. Configure SFT training
