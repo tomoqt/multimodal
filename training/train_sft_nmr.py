@@ -331,6 +331,13 @@ def main():
         peft_config=peft_config,
     )
 
+    # Handle PEFT+FSDP case, inspired by train_grpo_nmr.py
+    if getattr(trainer.accelerator.state, "fsdp_plugin", None) and peft_config:
+        from peft.utils.other import fsdp_auto_wrap_policy
+        print("Applying FSDP auto wrap policy for PEFT")
+        fsdp_plugin = trainer.accelerator.state.fsdp_plugin
+        fsdp_plugin.auto_wrap_policy = fsdp_auto_wrap_policy(trainer.model)
+
     # 6. Start training
     print("Starting training...")
     trainer.train()
