@@ -272,14 +272,7 @@ def main():
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            target_modules=[ 
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj"],
+            target_modules="all-linear",
             bias="none",
             task_type="CAUSAL_LM",
         )
