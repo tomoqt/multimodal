@@ -10,10 +10,6 @@ from rdkit import Chem, RDLogger
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from trl import SFTConfig, SFTTrainer
 from peft import LoraConfig
-from torch.nn import Embedding
-from accelerate.utils import FullyShardedDataParallelPlugin
-from torch.distributed.fsdp.wrap import always_wrap_policy
-from functools import partial
 
 # Disable RDKit logging
 RDLogger.DisableLog("rdApp.*")
@@ -253,16 +249,6 @@ def evaluate_model(model, tokenizer, dataset, batch_size: int = 4, max_new_token
     detailed = evaluate_predictions(canon_preds, canon_targets)
     return aggregate_metrics(detailed)
 
-def no_flat_embedding_policy(module, recurse, nonwrapped_numel):
-    # Wrap every Embedding (or Qwen dynamic NTK embedding) on its own
-    if isinstance(module, (Embedding, type(model.embed_tokens))):
-        return True   # separate FSDP wrapper, no flatten
-    # otherwise fall back to the usual transformer block rule
-    return transformer_auto_wrap_policy(
-        module, recurse, nonwrapped_numel,
-        transformer_layer_cls=(type(model.model.layers[0]),)
-    )
-
 def main():
     """Main training function."""
     args = parse_args()
@@ -349,7 +335,7 @@ def main():
         from peft.utils.other import fsdp_auto_wrap_policy
         print("Applying FSDP auto wrap policy for PEFT")
         fsdp_plugin = trainer.accelerator.state.fsdp_plugin
-        fsdp_plugin.auto_wrap_policy = no_flat_embedding_policy
+        fsdp_plugin.auto_wrap_policy = fsdp_auto_wrap_policy(trainer.model)
 
     # 6. Start training
     print("Starting training...")
