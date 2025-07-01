@@ -343,6 +343,8 @@ def main():
 
     # 7. Save final model locally
     print("Training finished. Saving final model.")
+    if trainer.is_fsdp_enabled:
+        trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
     trainer.save_model(args.output_dir)
     print(f"Model saved to {args.output_dir}")
     

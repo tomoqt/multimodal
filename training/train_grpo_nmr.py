@@ -347,6 +347,8 @@ def main():
     trainer.train()
 
     # 6. Save model
+    if trainer.is_fsdp_enabled:
+        trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
     trainer.save_model(args.output_dir)
 
     # 7. Evaluate via generation
