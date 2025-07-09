@@ -4,11 +4,12 @@
 # ---------------------------------------------------------------
 # Convenience launcher that can (optionally) run the two training
 # stages we have implemented:
+#   0) Pre-tokenization for SFT (scripts/pretokenize_sft_data.py)
 #   1) Supervised fine-tuning (training/train_sft_nmr.py)
 #   2) GRPO RL post-training (training/train_grpo_nmr.py)
 #
 # USAGE EXAMPLES
-#   bash run_nmr_pipeline.sh                       # run both stages with defaults
+#   bash run_nmr_pipeline.sh                       # run all stages with defaults
 #   bash run_nmr_pipeline.sh --no-sft              # skip SFT, only GRPO (lora)
 #   bash run_nmr_pipeline.sh --no-grpo             # only run SFT (full-finetune)
 #   bash run_nmr_pipeline.sh --sft-peft --grpo-full-finetune # sft-lora, grpo-full
@@ -23,6 +24,7 @@
 # OPTIONS
 #   --no-sft                 Skip SFT stage
 #   --no-grpo                Skip GRPO stage
+#   --skip-sft-tokenization  Skip the SFT pre-tokenization step (assumes it's done)
 #   --model  <name_or_path>  Base model to fine-tune (passed to both stages)
 #   --sft-data <dir>         Directory containing src/tgt pairs for SFT
 #   --grpo-data <dir>        Directory containing src/tgt pairs for GRPO
@@ -49,8 +51,10 @@ set -euo pipefail
 # -------- default values --------
 RUN_SFT=1
 RUN_GRPO=1
+SKIP_SFT_TOKENIZATION=0
 MODEL_NAME="futurehouse/ether0"
 SFT_DATA="data/reshaped_tokenized_data/data"
+SFT_TOKENIZED_DATA="data/tokenized_sft_data/$(basename "$MODEL_NAME")" # Model-specific tokenized data
 GRPO_DATA="data/reshaped_tokenized_data/data"
 SFT_OUT="checkpoints_sft_nmr"
 GRPO_OUT="checkpoints_grpo_nmr"
@@ -71,7 +75,8 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --no-sft)               RUN_SFT=0; shift ;;
     --no-grpo)              RUN_GRPO=0; shift ;;
-    --model)                MODEL_NAME="$2"; shift 2 ;;
+    --skip-sft-tokenization) SKIP_SFT_TOKENIZATION=1; shift ;;
+    --model)                MODEL_NAME="$2"; SFT_TOKENIZED_DATA="data/tokenized_sft_data/$(basename "$2")"; shift 2 ;;
     --sft-data)             SFT_DATA="$2"; shift 2 ;;
     --grpo-data)            GRPO_DATA="$2"; shift 2 ;;
     --sft-out)              SFT_OUT="$2"; shift 2 ;;
@@ -128,12 +133,23 @@ if [[ $RUN_SFT -eq 1 ]]; then
   GRPO_MODEL_NAME="$SFT_OUT"
 fi
 
+# -------- run SFT Tokenization --------
+if [[ $RUN_SFT -eq 1 && $SKIP_SFT_TOKENIZATION -eq 0 ]]; then
+  echo "==================== Stage 0: SFT Pre-tokenization ===================="
+  # This is a CPU-bound task, run with python directly, not accelerate
+  python scripts/pretokenize_sft_data.py \
+    --model_name "$MODEL_NAME" \
+    --data_dir "$SFT_DATA" \
+    --output_dir "$SFT_TOKENIZED_DATA"
+    # max_seq_length is defaulted in the script
+fi
+
 # -------- run SFT --------
 if [[ $RUN_SFT -eq 1 ]]; then
   echo "==================== Stage 1: SFT ===================="
   accelerate launch $ACCEL_ARGS training/train_sft_nmr.py \
     --model_name "$MODEL_NAME" \
-    --data_dir "$SFT_DATA" \
+    --tokenized_data_dir "$SFT_TOKENIZED_DATA" \
     --output_dir "$SFT_OUT" \
     $SFT_PEFT_FLAG \
     $PEFT_ARGS \

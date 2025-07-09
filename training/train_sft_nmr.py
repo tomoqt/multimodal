@@ -5,7 +5,7 @@ from pprint import pprint
 import wandb  # Added for explicit logging
 
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, load_from_disk
 from rdkit import Chem, RDLogger
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from trl import SFTConfig, SFTTrainer
@@ -21,7 +21,7 @@ def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Fine-tune a model on NMR data using SFTTrainer.")
     parser.add_argument("--model_name", type=str, default="futurehouse/ether0", help="The pre-trained model to fine-tune.")
-    parser.add_argument("--data_dir", type=str, default="data/reshaped_tokenized_data/data", help="Directory containing the data files (src-train.txt, src-val.txt).")
+    parser.add_argument("--tokenized_data_dir", type=str, required=True, help="Directory containing the pre-tokenized data files (output of pretokenize_sft_data.py).")
     parser.add_argument("--output_dir", type=str, default="checkpoints_sft_nmr", help="Directory to save checkpoints and final model.")
     parser.add_argument("--max_seq_length", type=int, default=512, help="Maximum sequence length for the model.")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training.")
@@ -45,34 +45,10 @@ def parse_args():
     parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout parameter.")
 
     args = parser.parse_args()
+    # For SFTTrainer, we don't need to pass this if the data is already tokenized and truncated
+    # but our evaluate_model function might need it. Let's keep it.
+    # args.max_seq_length = tokenizer.model_max_length 
     return args
-
-def create_templated_dataset(data_dir, split):
-    """Creates a dataset with a prompt template for NMR to SMILES prediction."""
-    prompt_template = "Given the following NMR data, predict the corresponding SMILES string.\n\nNMR data: {nmr_data}\n\nSMILES:"
-    
-    src_path = os.path.join(data_dir, f"src-{split}.txt")
-    tgt_path = os.path.join(data_dir, f"tgt-{split}.txt")
-
-    if not os.path.exists(src_path) or not os.path.exists(tgt_path):
-        print(f"Error: Data files not found for split '{split}' in {data_dir}", file=sys.stderr)
-        print(f"Please ensure src-{split}.txt and tgt-{split}.txt exist.", file=sys.stderr)
-        sys.exit(1)
-
-    with open(src_path, "r") as f:
-        nmr_lines = [line.strip() for line in f]
-    with open(tgt_path, "r") as f:
-        # From train_autoregressive.py: remove spaces from SMILES
-        smiles_lines = [line.strip().replace(" ", "") for line in f]
-
-    data = []
-    for nmr, smiles in zip(nmr_lines, smiles_lines):
-        prompt = prompt_template.format(nmr_data=nmr)
-        # Format for SFTTrainer: the 'text' field should contain prompt and completion
-        text = prompt + " " + smiles
-        data.append({"text": text})
-
-    return Dataset.from_dict({"text": [item["text"] for item in data]})
 
 def canonicalize_smiles(smiles):
     """Convert a SMILES string to its canonical form using RDKit. Removes extra spaces before conversion. Returns the canonical SMILES if possible, otherwise returns the cleaned string."""
@@ -204,6 +180,11 @@ def evaluate_model(model, tokenizer, dataset, batch_size: int = 4, max_new_token
     This function is intended to be called outside the training loop so that
     evaluation results reflect inference-time behaviour. Metrics are computed
     with the same helpers already defined in the script.
+    
+    NOTE: This function expects a dataset with a 'text' field, which is not
+    available if you use pre-tokenized data. This will need adjustment if
+    evaluation during training is needed with this exact function. For now,
+    the primary goal is to fix the training timeout.
     """
 
     model.eval()
@@ -211,9 +192,24 @@ def evaluate_model(model, tokenizer, dataset, batch_size: int = 4, max_new_token
 
     preds, targets = [], []
 
-    for start_idx in range(0, len(dataset), batch_size):
-        batch_texts = dataset[start_idx : start_idx + batch_size]["text"]
+    # This part will fail if the dataset does not have a "text" column.
+    # The pre-tokenized dataset will not have it.
+    # We will adjust this to work with the tokenized data by decoding it first.
+    # This is inefficient but makes the function work without major refactoring.
 
+    texts_for_eval = []
+    if "text" in dataset.column_names:
+         texts_for_eval = dataset["text"]
+    else:
+        # Reconstruct the text from tokens for evaluation
+        print("Reconstructing text from tokens for evaluation. This might be slow.")
+        decoded_samples = tokenizer.batch_decode(dataset["input_ids"], skip_special_tokens=True)
+        texts_for_eval = decoded_samples
+
+
+    for start_idx in range(0, len(texts_for_eval), batch_size):
+        batch_texts = texts_for_eval[start_idx : start_idx + batch_size]
+        
         prompts, batch_targets = [], []
         for txt in batch_texts:
             if prompt_end not in txt:
@@ -261,10 +257,10 @@ def main():
         print("Error: --hf_repo_id is required when --push_to_hub is set.", file=sys.stderr)
         sys.exit(1)
 
-    # 1. Load and template dataset
-    print(f"Loading and templating dataset from {args.data_dir}")
-    train_dataset = create_templated_dataset(args.data_dir, "train")
-    val_dataset = create_templated_dataset(args.data_dir, "val")
+    # 1. Load pre-tokenized dataset
+    print(f"Loading pre-tokenized dataset from {args.tokenized_data_dir}")
+    train_dataset = load_from_disk(os.path.join(args.tokenized_data_dir, "train"))
+    val_dataset = load_from_disk(os.path.join(args.tokenized_data_dir, "val"))
     
     print("Dataset loaded and formatted:")
     print(train_dataset)
@@ -328,6 +324,11 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         peft_config=peft_config,
+        # SFTTrainer will automatically use the tokenized columns.
+        # We don't specify `dataset_text_field`.
+        # `max_seq_length` is also not needed here as data is pre-truncated,
+        # but it's passed to the trainer which might use it for other purposes.
+        max_seq_length=args.max_seq_length,
     )
 
     # Handle PEFT+FSDP case, inspired by train_grpo_nmr.py
