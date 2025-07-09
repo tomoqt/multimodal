@@ -43,7 +43,7 @@
 #   --verbose                Pass verbose flag to training stages
 # ===============================================================
 
-#./run_nmr_pipeline.sh --sft-peft --accel-args "--config_file fsdp_config.yaml"
+#./run_nmr_pipeline.sh --sft-peft --accel-args "--config_file fsdp_config.yaml" --model Qwen/Qwen3-0.6B
 
 
 set -euo pipefail

@@ -328,7 +328,7 @@ def main():
         # We don't specify `dataset_text_field`.
         # `max_seq_length` is also not needed here as data is pre-truncated,
         # but it's passed to the trainer which might use it for other purposes.
-        max_seq_length=args.max_seq_length,
+        #max_seq_length=args.max_seq_length,
     )
 
     # Handle PEFT+FSDP case, inspired by train_grpo_nmr.py
