@@ -379,13 +379,12 @@ def main():
     else:
         print("Full fine-tuning is enabled.")
         # If the model has adapters, they must be merged before full fine-tuning.
-        if hasattr(model, "peft_config"):
+        if is_peft_model:
             print("Merging PEFT adapters for full fine-tuning...")
-            if hasattr(model, 'merge_and_unload'):
-                model = model.merge_and_unload()
-                print("Adapters merged.")
-            else:
-                print("Warning: Model has peft_config but no merge_and_unload method. Proceeding with full fine-tuning.")
+            model = model.merge_and_unload()
+            print("Adapters merged.")
+        elif hasattr(model, "peft_config"):
+            print("Warning: Model has peft_config but no merge_and_unload method. Proceeding with full fine-tuning.")
 
     # Final verification: Ensure all model parameters are ready for gradient computation
     print("\n=== Final Model Verification ===")
