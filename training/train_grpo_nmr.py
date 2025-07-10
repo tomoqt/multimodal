@@ -25,38 +25,10 @@ def print_trainable_parameters(model):
         all_param += param.numel()
         if param.requires_grad:
             trainable_params += param.numel()
-        else:
-            print(f"Parameter {name} does not require grad")
     print(
         f"trainable params: {trainable_params} || all params: {all_param} || "
         f"trainable%: {100 * trainable_params / all_param if all_param > 0 else 0}"
     )
-
-def ensure_model_trainable(model):
-    """Ensure model parameters require gradients."""
-    print("Checking and ensuring model parameters require gradients...")
-    frozen_params = []
-    
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            frozen_params.append(name)
-    
-    if frozen_params:
-        print(f"Found {len(frozen_params)} frozen parameters:")
-        for name in frozen_params[:10]:  # Show first 10
-            print(f"  - {name}")
-        if len(frozen_params) > 10:
-            print(f"  ... and {len(frozen_params) - 10} more")
-        
-        # Enable gradients for all parameters
-        for name, param in model.named_parameters():
-            param.requires_grad = True
-        
-        print("Enabled gradients for all parameters.")
-    else:
-        print("All parameters already require gradients.")
-    
-    return model
 
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
@@ -334,11 +306,27 @@ def main():
     # Load the model first. If it's a PEFT checkpoint, from_pretrained will load the base
     # and apply the adapters. We also specify torch_dtype for FSDP compatibility.
     print(f"Loading model from {args.model_name}...")
+    
+    # Check if this is a PEFT checkpoint directory
+    is_peft_checkpoint = False
+    if os.path.isdir(args.model_name):
+        adapter_config_path = os.path.join(args.model_name, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            is_peft_checkpoint = True
+            print(f"Detected PEFT checkpoint: {adapter_config_path} exists")
+    
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype="auto",
         low_cpu_mem_usage=True,
     )
+    
+    # Debug: Check initial model state
+    print(f"Model type after loading: {type(model)}")
+    print(f"Has peft_config: {hasattr(model, 'peft_config')}")
+    if hasattr(model, 'peft_config'):
+        print(f"Active adapters: {list(model.peft_config.keys())}")
+        print(f"PEFT type: {type(model.peft_config)}")
 
     peft_config = None
     if not args.full_finetune:
@@ -357,9 +345,25 @@ def main():
             model = get_peft_model(model, peft_config)
             print_trainable_parameters(model)
         else:
-            print("Model is already a PEFT model. Continuing training with existing adapters.")
-            # Extract the config from the loaded PEFT model to correctly handle FSDP wrapping
-            peft_config = model.peft_config[model.active_adapter()]
+            print("Model is already a PEFT model (likely from SFT stage).")
+            print("Merging existing adapters and applying new LoRA configuration for GRPO.")
+            
+            # Critical fix: Merge existing adapters first to avoid stacking
+            model = model.merge_and_unload()
+            print("Existing adapters merged into base model.")
+            
+            # Now add fresh adapters for GRPO training
+            peft_config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules="all-linear",
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            from peft import get_peft_model
+            model = get_peft_model(model, peft_config)
+            print("New LoRA adapters applied for GRPO training.")
             print_trainable_parameters(model)
     else:
         print("Full fine-tuning is enabled.")
@@ -369,8 +373,40 @@ def main():
             model = model.merge_and_unload()
             print("Adapters merged.")
 
-    # Ensure model parameters require gradients
-    model = ensure_model_trainable(model)
+    # Final verification: Ensure all model parameters are ready for gradient computation
+    print("\n=== Final Model Verification ===")
+    print(f"Model type: {type(model)}")
+    print(f"Has peft_config: {hasattr(model, 'peft_config')}")
+    print(f"Model training mode: {model.training}")
+    print(f"Model device: {next(model.parameters()).device}")
+    
+    # Count parameters by gradient requirement
+    total_params = 0
+    trainable_params = 0
+    frozen_params = 0
+    
+    for name, param in model.named_parameters():
+        total_params += 1
+        if param.requires_grad:
+            trainable_params += 1
+        else:
+            frozen_params += 1
+    
+    print(f"Parameter summary: {total_params} total, {trainable_params} trainable, {frozen_params} frozen")
+    
+    if frozen_params > 0:
+        print("⚠️  Warning: Some parameters are frozen. This might cause gradient computation issues.")
+        # Enable gradients for all parameters as a safety measure
+        for param in model.parameters():
+            param.requires_grad = True
+        print("✓ Enabled gradients for all parameters.")
+    else:
+        print("✓ All parameters are trainable.")
+
+    # Ensure model is in training mode
+    model.train()
+    print("✓ Model set to training mode.")
+    print("=== Verification Complete ===\n")
 
     # 3. Configure GRPO
     # ------------------------------------------------------------------
