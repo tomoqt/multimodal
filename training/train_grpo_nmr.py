@@ -290,24 +290,41 @@ def main():
     # Set padding side to 'left' for decoder-only models to ensure correct generation
     tokenizer.padding_side = 'left'
 
+    # Load the model first. If it's a PEFT checkpoint, from_pretrained will load the base
+    # and apply the adapters. We also specify torch_dtype for FSDP compatibility.
+    print(f"Loading model from {args.model_name}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        torch_dtype="auto",
+        low_cpu_mem_usage=True,
+    )
+
     peft_config = None
     if not args.full_finetune:
-        print("PEFT enabled (default). Using LoRA.")
-        peft_config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules="all-linear",
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = AutoModelForCausalLM.from_pretrained(args.model_name)
-        from peft import get_peft_model
-        model = get_peft_model(model,peft_config)
-        model.print_trainable_parameters()
+        # If the loaded model doesn't have adapters, and we want PEFT, add them.
+        if not hasattr(model, "peft_config"):
+            print("PEFT enabled (default). Applying new LoRA configuration.")
+            peft_config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules="all-linear",
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            from peft import get_peft_model
+            model = get_peft_model(model, peft_config)
+            model.print_trainable_parameters()
+        else:
+            print("Model is already a PEFT model. Continuing training with existing adapters.")
+            model.print_trainable_parameters()
     else:
-        print("PEFT disabled. Using full fine-tuning.")
-        model = AutoModelForCausalLM.from_pretrained(args.model_name)
+        print("Full fine-tuning is enabled.")
+        # If the model has adapters, they must be merged before full fine-tuning.
+        if hasattr(model, "peft_config"):
+            print("Merging PEFT adapters for full fine-tuning...")
+            model = model.merge_and_unload()
+            print("Adapters merged.")
 
     # 3. Configure GRPO
     # ------------------------------------------------------------------
@@ -357,7 +374,7 @@ def main():
         reward_funcs=reward_fns,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        processing_class = tokenizer #that's how it should be aaprently
+        tokenizer=tokenizer
     )
 
     # Handle PEFT+FSDP case
@@ -378,8 +395,10 @@ def main():
 
     # 7. Evaluate via generation
     eval_model = trainer.model
+    # When doing full finetune, we don't need to merge since we already did it or never had adapters.
     if not args.full_finetune:
         try:
+            # For evaluation, we merge the adapters into the base model
             eval_model = trainer.model.merge_and_unload()
             print("Successfully merged PEFT adapters for evaluation.")
         except Exception as e:
