@@ -387,7 +387,7 @@ def main():
         reward_funcs=reward_fns,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        tokenizer=tokenizer
+        processing_class = tokenizer #that's how it should be aaprently
     )
 
     # Handle PEFT+FSDP case
