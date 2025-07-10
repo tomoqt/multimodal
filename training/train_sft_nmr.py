@@ -38,6 +38,9 @@ def parse_args():
     # Verbose/debug flag
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging and print example samples.")
     
+    # Dataset slicing arguments
+    parser.add_argument("--max_train_samples", type=int, default=None, help="Number of training samples to use (from the beginning). If None, use all.")
+
     # PEFT arguments
     parser.add_argument("--use_peft", action="store_true", help="Enable PEFT for fine-tuning.")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA r parameter.")
@@ -262,6 +265,10 @@ def main():
     train_dataset = load_from_disk(os.path.join(args.tokenized_data_dir, "train"))
     val_dataset = load_from_disk(os.path.join(args.tokenized_data_dir, "val"))
     
+    if args.max_train_samples is not None and args.max_train_samples > 0:
+        print(f"Using the first {args.max_train_samples} samples for training.")
+        train_dataset = train_dataset.select(range(min(args.max_train_samples, len(train_dataset))))
+
     print("Dataset loaded and formatted:")
     print(train_dataset)
     print(val_dataset)

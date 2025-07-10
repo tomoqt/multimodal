@@ -189,6 +189,10 @@ def parse_args():
     # Verbose/debug flag
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging and print example samples.")
 
+    # Dataset slicing arguments
+    parser.add_argument("--max_train_samples", type=int, default=None, help="Number of training samples to use. If None, use all available after skipping.")
+    parser.add_argument("--skip_train_samples", type=int, default=0, help="Number of samples to skip from the beginning of the training set.")
+
     # vLLM arguments
     parser.add_argument("--use_vllm", action="store_true", help="Enable vLLM for faster generation.")
     parser.add_argument("--vllm_server_host", type=str, default="localhost", help="Hostname for the vLLM server.")
@@ -249,6 +253,24 @@ def main():
     print("Loading dataset ...")
     train_ds = load_nmr_dataset(args.data_dir, "train")
     val_ds = load_nmr_dataset(args.data_dir, "val")
+
+    # Slice the dataset as requested
+    if args.skip_train_samples > 0 or args.max_train_samples is not None:
+        original_size = len(train_ds)
+        
+        start_index = args.skip_train_samples
+        if start_index >= original_size:
+            print(f"Warning: --skip_train_samples ({start_index}) is >= dataset size ({original_size}). Training set will be empty.")
+            start_index = original_size
+        
+        end_index = original_size
+        if args.max_train_samples is not None and args.max_train_samples > 0:
+            end_index = start_index + args.max_train_samples
+        
+        selected_indices = range(start_index, min(end_index, original_size))
+        
+        print(f"Selecting training samples from index {selected_indices.start} to {selected_indices.stop -1} (original size: {original_size}).")
+        train_ds = train_ds.select(selected_indices)
 
     # ------------------------------------------------------------------
     # Verbose mode: print a handful of formatted samples for inspection
