@@ -358,30 +358,55 @@ def main():
     
     # 8. Separate evaluation using `model.generate` and explicit W&B logging
     print("Running evaluation with model.generate ...")
-    eval_model = trainer.model
-    if args.use_peft:
-        try:
-            # Move model to CPU before merging, as merge_and_unload() doesn't work well with FSDP
-            eval_model = trainer.model.to("cpu")
-            eval_model = eval_model.merge_and_unload()
-            print("Successfully merged PEFT adapters for evaluation.")
-        except Exception as e:
-            print(f"Could not merge PEFT adapters: {e}. Evaluating with adapters loaded.")
-            # If merging fails, use the original (FSDP) model from the trainer
-            eval_model = trainer.model
 
-    # Ensure the final model for evaluation is on the correct device
-    eval_model.to(trainer.accelerator.device)
+    # To ensure a clean state for evaluation, especially with FSDP,
+    # we load the model we just saved to disk. This gives us a regular,
+    # non-sharded model that is easy to work with. We only do this on the
+    # main process to avoid redundant work and logging issues.
     
-    eval_metrics = evaluate_model(eval_model, tokenizer, val_dataset, batch_size=args.batch_size)
-    print("Evaluation metrics:")
-    pprint(eval_metrics)
+    is_main_process = trainer.is_world_process_zero()
 
-    # Log metrics to wandb (will attach to the same run initiated by HF integration)
-    try:
-        wandb.log(eval_metrics)
-    except Exception as e:
-        print(f"wandb logging failed: {e}")
+    # Free up memory before loading new model
+    del model
+    del trainer
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    if is_main_process:
+        # Re-import peft for loading, if needed
+        if args.use_peft:
+            from peft import PeftModel
+            print(f"Loading base model ({args.model_name}) for PEFT evaluation...")
+            # Use a memory-efficient dtype for loading
+            torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            base_model = AutoModelForCausalLM.from_pretrained(
+                args.model_name,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True
+            )
+            print(f"Loading PEFT adapters from {args.output_dir}...")
+            eval_model = PeftModel.from_pretrained(base_model, args.output_dir)
+            print("Merging PEFT adapters...")
+            eval_model = eval_model.merge_and_unload()
+            print("PEFT adapters merged.")
+        else:
+            print(f"Loading fully fine-tuned model from {args.output_dir}...")
+            eval_model = AutoModelForCausalLM.from_pretrained(args.output_dir)
+
+        # Move model to the correct device for this process
+        device = f"cuda:{os.environ.get('LOCAL_RANK', 0)}"
+        eval_model.to(device)
+
+        eval_metrics = evaluate_model(eval_model, tokenizer, val_dataset, batch_size=args.batch_size)
+        print("Evaluation metrics:")
+        pprint(eval_metrics)
+
+        # Log metrics to wandb
+        try:
+            wandb.log(eval_metrics)
+        except Exception as e:
+            print(f"wandb logging failed: {e}")
 
 if __name__ == "__main__":
-    main() 
+    main()
