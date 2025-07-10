@@ -324,14 +324,21 @@ def main():
     # Debug: Check initial model state
     print(f"Model type after loading: {type(model)}")
     print(f"Has peft_config: {hasattr(model, 'peft_config')}")
+    print(f"Has merge_and_unload: {hasattr(model, 'merge_and_unload')}")
+    
+    # Determine if this is a genuine PEFT model
+    is_peft_model = hasattr(model, 'peft_config') and hasattr(model, 'merge_and_unload')
+    
     if hasattr(model, 'peft_config'):
-        print(f"Active adapters: {list(model.peft_config.keys())}")
+        print(f"Active adapters: {list(model.peft_config.keys()) if model.peft_config else 'None'}")
         print(f"PEFT type: {type(model.peft_config)}")
+    
+    print(f"Is genuine PEFT model: {is_peft_model}")
 
     peft_config = None
     if not args.full_finetune:
         # If the loaded model doesn't have adapters, and we want PEFT, add them.
-        if not hasattr(model, "peft_config"):
+        if not is_peft_model:
             print("PEFT enabled (default). Applying new LoRA configuration.")
             peft_config = LoraConfig(
                 r=args.lora_r,
@@ -349,8 +356,12 @@ def main():
             print("Merging existing adapters and applying new LoRA configuration for GRPO.")
             
             # Critical fix: Merge existing adapters first to avoid stacking
-            model = model.merge_and_unload()
-            print("Existing adapters merged into base model.")
+            if hasattr(model, 'merge_and_unload'):
+                model = model.merge_and_unload()
+                print("Existing adapters merged into base model.")
+            else:
+                print("Warning: Model has peft_config but no merge_and_unload method. This may be a regular model.")
+                print("Proceeding to apply new LoRA configuration anyway.")
             
             # Now add fresh adapters for GRPO training
             peft_config = LoraConfig(
@@ -370,8 +381,11 @@ def main():
         # If the model has adapters, they must be merged before full fine-tuning.
         if hasattr(model, "peft_config"):
             print("Merging PEFT adapters for full fine-tuning...")
-            model = model.merge_and_unload()
-            print("Adapters merged.")
+            if hasattr(model, 'merge_and_unload'):
+                model = model.merge_and_unload()
+                print("Adapters merged.")
+            else:
+                print("Warning: Model has peft_config but no merge_and_unload method. Proceeding with full fine-tuning.")
 
     # Final verification: Ensure all model parameters are ready for gradient computation
     print("\n=== Final Model Verification ===")
@@ -495,8 +509,11 @@ def main():
     if not args.full_finetune:
         try:
             # For evaluation, we merge the adapters into the base model
-            eval_model = trainer.model.merge_and_unload()
-            print("Successfully merged PEFT adapters for evaluation.")
+            if hasattr(trainer.model, 'merge_and_unload'):
+                eval_model = trainer.model.merge_and_unload()
+                print("Successfully merged PEFT adapters for evaluation.")
+            else:
+                print("Model does not have merge_and_unload method. Evaluating with current model state.")
         except Exception as e:
             print(f"Could not merge PEFT adapters: {e}. Evaluating with adapters loaded.")
 
