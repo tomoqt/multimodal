@@ -287,6 +287,9 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Set padding side to 'left' for decoder-only models to ensure correct generation
+    tokenizer.padding_side = 'left'
+
     peft_config = None
     if not args.full_finetune:
         print("PEFT enabled (default). Using LoRA.")

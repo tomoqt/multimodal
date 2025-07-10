@@ -35,6 +35,7 @@
 #   --sft-peft               Use PEFT/LoRA for SFT stage (default: full finetune)
 #   --grpo-full-finetune     Use full fine-tuning for GRPO (default: PEFT/LoRA)
 #   --sft-max-samples <int>  Use first N samples for SFT stage
+#   --sft-max-eval-samples <int> Use first N samples for SFT final evaluation (default 1000)
 #   --grpo-max-samples <int> Use next M samples for GRPO stage
 #   --lora-r <int>           LoRA 'r' parameter
 #   --lora-alpha <int>       LoRA 'alpha' parameter
@@ -65,6 +66,7 @@ HF_TOKEN=""
 SFT_PEFT=0
 GRPO_FULL_FINETUNE=0
 SFT_MAX_SAMPLES=""
+SFT_MAX_EVAL_SAMPLES="1000"
 GRPO_MAX_SAMPLES=""
 LORA_R=32
 LORA_ALPHA=64
@@ -90,6 +92,7 @@ while [[ $# -gt 0 ]]; do
     --sft-peft)             SFT_PEFT=1; shift ;;
     --grpo-full-finetune)   GRPO_FULL_FINETUNE=1; shift ;;
     --sft-max-samples)      SFT_MAX_SAMPLES="$2"; shift 2 ;;
+    --sft-max-eval-samples) SFT_MAX_EVAL_SAMPLES="$2"; shift 2 ;;
     --grpo-max-samples)     GRPO_MAX_SAMPLES="$2"; shift 2 ;;
     --lora-r)               LORA_R="$2"; shift 2 ;;
     --lora-alpha)           LORA_ALPHA="$2"; shift 2 ;;
@@ -126,6 +129,9 @@ if [[ -n "$SFT_MAX_SAMPLES" ]]; then
   EXTRA_SFT="$EXTRA_SFT --max_train_samples $SFT_MAX_SAMPLES"
   # GRPO should skip the samples used by SFT
   EXTRA_GRPO="$EXTRA_GRPO --skip_train_samples $SFT_MAX_SAMPLES"
+fi
+if [[ -n "$SFT_MAX_EVAL_SAMPLES" ]]; then
+  EXTRA_SFT="$EXTRA_SFT --max_eval_samples $SFT_MAX_EVAL_SAMPLES"
 fi
 if [[ -n "$GRPO_MAX_SAMPLES" ]]; then
   EXTRA_GRPO="$EXTRA_GRPO --max_train_samples $GRPO_MAX_SAMPLES"

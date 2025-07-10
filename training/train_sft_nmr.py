@@ -40,6 +40,7 @@ def parse_args():
     
     # Dataset slicing arguments
     parser.add_argument("--max_train_samples", type=int, default=None, help="Number of training samples to use (from the beginning). If None, use all.")
+    parser.add_argument("--max_eval_samples", type=int, default=1000, help="Maximum number of samples for final evaluation. If None or 0, use all.")
 
     # PEFT arguments
     parser.add_argument("--use_peft", action="store_true", help="Enable PEFT for fine-tuning.")
@@ -291,6 +292,9 @@ def main():
         print("Tokenizer does not have a pad token, setting it to eos_token.")
         tokenizer.pad_token = tokenizer.eos_token
         
+    # Set padding side to 'left' for decoder-only models to ensure correct generation
+    tokenizer.padding_side = 'left'
+        
     model = AutoModelForCausalLM.from_pretrained(args.model_name)
 
     # 3. Configure PEFT if requested
@@ -398,7 +402,13 @@ def main():
         device = f"cuda:{os.environ.get('LOCAL_RANK', 0)}"
         eval_model.to(device)
 
-        eval_metrics = evaluate_model(eval_model, tokenizer, val_dataset, batch_size=args.batch_size)
+        # Select a subset of the validation set if requested
+        eval_dataset_subset = val_dataset
+        if args.max_eval_samples is not None and args.max_eval_samples > 0:
+            print(f"Slicing validation set to a maximum of {args.max_eval_samples} samples for final evaluation.")
+            eval_dataset_subset = val_dataset.select(range(min(args.max_eval_samples, len(val_dataset))))
+
+        eval_metrics = evaluate_model(eval_model, tokenizer, eval_dataset_subset, batch_size=args.batch_size)
         print("Evaluation metrics:")
         pprint(eval_metrics)
 
