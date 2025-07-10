@@ -361,11 +361,18 @@ def main():
     eval_model = trainer.model
     if args.use_peft:
         try:
-            eval_model = trainer.model.merge_and_unload()
+            # Move model to CPU before merging, as merge_and_unload() doesn't work well with FSDP
+            eval_model = trainer.model.to("cpu")
+            eval_model = eval_model.merge_and_unload()
             print("Successfully merged PEFT adapters for evaluation.")
         except Exception as e:
             print(f"Could not merge PEFT adapters: {e}. Evaluating with adapters loaded.")
+            # If merging fails, use the original (FSDP) model from the trainer
+            eval_model = trainer.model
 
+    # Ensure the final model for evaluation is on the correct device
+    eval_model.to(trainer.accelerator.device)
+    
     eval_metrics = evaluate_model(eval_model, tokenizer, val_dataset, batch_size=args.batch_size)
     print("Evaluation metrics:")
     pprint(eval_metrics)
