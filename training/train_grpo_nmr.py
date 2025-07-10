@@ -21,14 +21,42 @@ def print_trainable_parameters(model):
     """Prints the number of trainable parameters in the model."""
     trainable_params = 0
     all_param = 0
-    for _, param in model.named_parameters():
+    for name, param in model.named_parameters():
         all_param += param.numel()
         if param.requires_grad:
             trainable_params += param.numel()
+        else:
+            print(f"Parameter {name} does not require grad")
     print(
         f"trainable params: {trainable_params} || all params: {all_param} || "
         f"trainable%: {100 * trainable_params / all_param if all_param > 0 else 0}"
     )
+
+def ensure_model_trainable(model):
+    """Ensure model parameters require gradients."""
+    print("Checking and ensuring model parameters require gradients...")
+    frozen_params = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            frozen_params.append(name)
+    
+    if frozen_params:
+        print(f"Found {len(frozen_params)} frozen parameters:")
+        for name in frozen_params[:10]:  # Show first 10
+            print(f"  - {name}")
+        if len(frozen_params) > 10:
+            print(f"  ... and {len(frozen_params) - 10} more")
+        
+        # Enable gradients for all parameters
+        for name, param in model.named_parameters():
+            param.requires_grad = True
+        
+        print("Enabled gradients for all parameters.")
+    else:
+        print("All parameters already require gradients.")
+    
+    return model
 
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
@@ -341,6 +369,9 @@ def main():
             model = model.merge_and_unload()
             print("Adapters merged.")
 
+    # Ensure model parameters require gradients
+    model = ensure_model_trainable(model)
+
     # 3. Configure GRPO
     # ------------------------------------------------------------------
     # Respect model's absolute maximum sequence length to avoid CUDA/shape
@@ -382,6 +413,20 @@ def main():
 
     # 4. Instantiate trainer. We pass both reward functions.
     reward_fns = [reward_format, reward_tanimoto]
+
+    # Ensure model is in training mode
+    model.train()
+    print(f"Model training mode: {model.training}")
+    
+    # Check model device
+    device = next(model.parameters()).device
+    print(f"Model device: {device}")
+    
+    # Ensure model is on CUDA if available
+    if torch.cuda.is_available() and device.type == 'cpu':
+        print("Moving model to CUDA...")
+        model = model.cuda()
+        print(f"Model moved to: {next(model.parameters()).device}")
 
     trainer = GRPOTrainer(
         model=model,
