@@ -17,6 +17,19 @@ RDLogger.DisableLog("rdApp.*")
 # Add project root to path so we can import utils if needed
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+def print_trainable_parameters(model):
+    """Prints the number of trainable parameters in the model."""
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || "
+        f"trainable%: {100 * trainable_params / all_param if all_param > 0 else 0}"
+    )
+
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
     "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
@@ -314,10 +327,10 @@ def main():
             )
             from peft import get_peft_model
             model = get_peft_model(model, peft_config)
-            model.print_trainable_parameters()
+            print_trainable_parameters(model)
         else:
             print("Model is already a PEFT model. Continuing training with existing adapters.")
-            model.print_trainable_parameters()
+            print_trainable_parameters(model)
     else:
         print("Full fine-tuning is enabled.")
         # If the model has adapters, they must be merged before full fine-tuning.
