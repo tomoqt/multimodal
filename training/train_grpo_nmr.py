@@ -320,6 +320,13 @@ def main():
         torch_dtype="auto",
         low_cpu_mem_usage=True,
     )
+
+    # Record the dtype used by the base model parameters **before** we potentially add
+    # new LoRA/PEFT layers. We'll later ensure every newly added parameter is cast to
+    # this dtype so that matrix multiplications don't fail due to dtype mismatches
+    # (e.g. float32 LoRA weights + bfloat16 base weights).
+    base_param_dtype = next(model.parameters()).dtype
+    print(f"Base model parameter dtype: {base_param_dtype}")
     
     # Debug: Check initial model state
     print(f"Model type after loading: {type(model)}")
@@ -385,6 +392,18 @@ def main():
             print("Adapters merged.")
         elif hasattr(model, "peft_config"):
             print("Warning: Model has peft_config but no merge_and_unload method. Proceeding with full fine-tuning.")
+
+    # ------------------------------------------------------------------
+    # Ensure all parameters (including newly added LoRA layers) use the same
+    # dtype as the original base model. This prevents runtime errors such as
+    # "expected mat1 and mat2 to have the same dtype" when mixed dtypes are
+    # encountered during forward passes under FSDP/mixed-precision training.
+    # ------------------------------------------------------------------
+    try:
+        model = model.to(dtype=base_param_dtype)
+        print(f"All model parameters cast to dtype {base_param_dtype} for consistency.")
+    except Exception as e:
+        print(f"[WARNING] Could not cast model parameters to dtype {base_param_dtype}: {e}")
 
     # Final verification: Ensure all model parameters are ready for gradient computation
     print("\n=== Final Model Verification ===")
