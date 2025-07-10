@@ -331,7 +331,7 @@ def main():
         else:
             print("Model is already a PEFT model. Continuing training with existing adapters.")
             # Extract the config from the loaded PEFT model to correctly handle FSDP wrapping
-            peft_config = model.peft_config[model.active_adapter]
+            peft_config = model.peft_config[model.active_adapter()]
             print_trainable_parameters(model)
     else:
         print("Full fine-tuning is enabled.")
