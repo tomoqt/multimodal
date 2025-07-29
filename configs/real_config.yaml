@@ -30,7 +30,7 @@ training:
   batch_size: 32
   test_batch_size: 1
   num_epochs: 50
-  learning_rate: 1e-3  # This will be used for AdamW components
+  learning_rate: 1.0e-3  # This will be used for AdamW components
   min_learning_rate: 1.0e-8
   weight_decay: 0.1
   validation_frequency: 1000
