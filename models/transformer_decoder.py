@@ -285,15 +285,6 @@ class SMILESDecoder(nn.Module):
         # Calculate total prompt length (memory + NMR)
         total_prompt_length = memory.size(1) + (nmr_tokens.size(1) if nmr_tokens is not None else 0)
         
-        # Check if target sequence + prompt length exceeds maximum
-        # Note: Individual components (target, memory, nmr) are already checked separately above
-        # This is just to ensure the total sequence length doesn't exceed transformer architecture limits
-        max_transformer_length = 1024  
-        if T + total_prompt_length > max_transformer_length:
-            raise ValueError(
-                f"Combined sequence length ({T} + {total_prompt_length} = {T + total_prompt_length}) "
-                f"exceeds maximum transformer architecture limit ({max_transformer_length})"
-            )
 
         # Embed target sequence using SMILES embeddings
         x = self.smiles_embed(tgt)
