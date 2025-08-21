@@ -20,6 +20,7 @@ model:
   log_normal_mean: 12.0
   log_normal_std: 0.5 
   use_rmsnorm: True
+  vanilla_mode: True
 # Checkpoint Configuration
 #checkpoint:
  #load_path: "checkpoints/latest_checkpoint.pt"  # Path to the checkpoint file
@@ -39,7 +40,6 @@ training:
   save_model_frequency: 10000 # How often to save model to wandb (in steps)
   greedy_decode_frequency: 1000
   steps_no_grad: 8
-  vanilla_mode: True
 # Optimizer Configuration
 optimizer:
   type: muon_mix  # Use Muon for matrices and AdamW for vectors/scalars
