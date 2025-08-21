@@ -73,8 +73,7 @@ data:
   preprocessed: False
   ir_as_prompt: False
   ir_tokenizer_path: "/data/tokenized_baseline/ir_processed/ir_vocab.json"
-  tokenized_dir: "data/tokenized_baseline/data"
-
+  tokenized_dir: "data/reshaped_tokenized_data/data"
 # Logging
 wandb:
   project: "smiles-generation"
