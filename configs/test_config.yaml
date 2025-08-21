@@ -15,7 +15,7 @@ model:
   max_loops: 10000
   automatic_loop_exit: False
   automatic_loop_exit_threshold: 1.0e-2
-  use_loop_concat: True
+  use_loop_concat: False
   log_normal_poisson: True
   log_normal_mean: 12.0
   log_normal_std: 0.5 
