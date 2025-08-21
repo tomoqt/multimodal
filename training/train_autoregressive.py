@@ -136,6 +136,9 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
                         nmr_tokens=nmr_tokens,
                         num_loops=num_loops
                     )
+                    # Unwrap if decoder returns (logits, aux)
+                    if isinstance(logits, tuple):
+                        logits = logits[0]
             else:
                 logits = model.decoder(
                     tgt=current_token,
@@ -143,6 +146,9 @@ def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=Non
                     nmr_tokens=nmr_tokens,
                     num_loops=num_loops
                 )
+                # Unwrap if decoder returns (logits, aux)
+                if isinstance(logits, tuple):
+                    logits = logits[0]
             
             # Get the next token - either sample or take argmax
             if sample and temperature > 0:
@@ -1441,6 +1447,8 @@ def main():
                             target_mask=mask[:-1, :-1],
                             num_loops=num_loops
                         )
+                        if isinstance(logits, tuple):
+                            logits = logits[0]
                         loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 else:
                     logits = model(
@@ -1450,6 +1458,8 @@ def main():
                         target_mask=mask[:-1, :-1],
                         num_loops=num_loops
                     )
+                    if isinstance(logits, tuple):
+                        logits = logits[0]
                     loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
                 pred_tokens = logits.argmax(dim=-1).cpu().tolist()
@@ -1551,6 +1561,8 @@ def main():
                         target_mask=mask[:-1, :-1],
                         num_loops=num_loops
                     )
+                    if isinstance(logits, tuple):
+                        logits = logits[0]
                     loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
                 # For FP16, we need to use the scaler for numerical stability
@@ -1592,6 +1604,8 @@ def main():
                     target_mask=mask[:-1, :-1],
                     num_loops=num_loops
                 )
+                if isinstance(logits, tuple):
+                    logits = logits[0]
                 loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
                 
                 loss.backward()
