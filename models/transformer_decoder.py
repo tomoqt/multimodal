@@ -192,7 +192,8 @@ class SMILESDecoder(nn.Module):
         automatic_loop_exit_threshold: float = 0.01, # threshold for automatic loop exit
         use_loop_concat:bool = True,
         use_rmsnorm: bool = True, # Add use_rmsnorm
-        loops_backprop_depth: int | None = 8
+        loops_backprop_depth: int | None = 8,
+        vanilla_mode: bool = False
     ):
         super().__init__()
         
@@ -212,6 +213,7 @@ class SMILESDecoder(nn.Module):
         self.loops_representation = loops_representation
         self.use_rmsnorm = use_rmsnorm
         self.loops_backprop_depth = loops_backprop_depth
+        self.vanilla_mode = vanilla_mode
 
         # Separate embeddings with different vocabulary sizes
         self.smiles_embed = nn.Embedding(smiles_vocab_size, embed_dim)
@@ -260,6 +262,104 @@ class SMILESDecoder(nn.Module):
             print(f"Memory: {memory.shape}")
             if nmr_tokens is not None:
                 print(f"NMR tokens: {nmr_tokens.shape}")
+
+        # If vanilla_mode is enabled, run a simple causal decoder without any prompt injection,
+        # looping, noising, or custom scaling. Keep norms and ReLU^2 activations.
+        if self.vanilla_mode:
+            # Enforce max sequence length on target only
+            if T > self.max_seq_length:
+                if self.verbose:
+                    print(f"Warning: Truncating target sequence from {T} to {self.max_seq_length} (vanilla mode)")
+                tgt = tgt[:, :self.max_seq_length]
+                T = self.max_seq_length
+
+            # Check and enforce sequence length limits only for non-IR prompt mode (memory)
+            if not self.ir_as_prompt and memory.size(1) > self.max_memory_length:
+                if self.verbose:
+                    print(f"Warning: Truncating memory from {memory.size(1)} to {self.max_memory_length} (vanilla mode)")
+                memory = memory[:, :self.max_memory_length]
+
+            if nmr_tokens is not None and nmr_tokens.size(1) > self.max_nmr_length:
+                if self.verbose:
+                    print(f"Warning: Truncating NMR tokens from {nmr_tokens.size(1)} to {self.max_nmr_length} (vanilla mode)")
+                nmr_tokens = nmr_tokens[:, :self.max_nmr_length]
+
+            # Calculate total prompt length (memory + NMR) and enforce transformer limit
+            total_prompt_length = memory.size(1) + (nmr_tokens.size(1) if nmr_tokens is not None else 0)
+            max_transformer_length = 1024
+            if T + total_prompt_length > max_transformer_length:
+                raise ValueError(
+                    f"Combined sequence length ({T} + {total_prompt_length} = {T + total_prompt_length}) "
+                    f"exceeds maximum transformer architecture limit ({max_transformer_length})"
+                )
+
+            # Embed target sequence
+            x = self.smiles_embed(tgt)
+
+            # Project memory if needed and build prompt with optional NMR
+            if not self.ir_as_prompt:
+                memory = self.memory_proj(memory)
+
+            if nmr_tokens is not None:
+                if self.verbose:
+                    print(f"Memory shape after projection: {memory.shape} (vanilla mode)")
+                    print(f"NMR tokens device: {nmr_tokens.device}, Memory device: {memory.device}")
+                    print(f"NMR tokens dtype: {nmr_tokens.dtype}, Memory dtype: {memory.dtype}")
+
+                nmr_tokens = nmr_tokens.to(memory.device)
+                nmr_embeddings = self.nmr_embed(nmr_tokens)
+
+                if self.verbose:
+                    print(f"NMR embeddings shape: {nmr_embeddings.shape} (vanilla mode)")
+
+                assert memory.size(0) == nmr_embeddings.size(0), "Batch sizes don't match"
+                assert memory.size(2) == nmr_embeddings.size(2), "Embedding dimensions don't match"
+
+                prompt = th.cat([memory, nmr_embeddings], dim=1)
+            else:
+                prompt = memory
+
+            if self.verbose:
+                print(f"Prompt shape after concatenation: {prompt.shape} (vanilla mode)")
+                print(f"Target embeddings shape: {x.shape} (vanilla mode)")
+
+            # Concatenate prompt and target embeddings
+            M = prompt.shape[1]
+            x = th.cat([prompt, x], dim=1)
+
+            # Build multimodal attention mask: prompt fully visible, target causal, prompt can't see future target
+            mask = th.ones(B, M+T, M+T, device=x.device).tril().bool()
+            mask[:, :M, :M] = True
+            mask[:, :M, M:] = False
+            mask = mask[:, None].repeat(1, self.num_heads, 1, 1)
+
+            # Ensure stablemax is disabled in vanilla mode
+            prev_stablemax_flags = []
+            for layer in self.layers:
+                if hasattr(layer, 'use_stablemax'):
+                    prev_stablemax_flags.append(layer.use_stablemax)
+                    layer.use_stablemax = False
+                else:
+                    prev_stablemax_flags.append(None)
+
+            # Pass through all layers once (no looping, no noising)
+            for layer in self.layers:
+                x = layer(x, mask)
+
+            # Project only the target portion to vocabulary
+            x_target = x[:, M:]
+            x_target = self.final_norm(x_target)
+            out = self.out(x_target)
+
+            # Restore original stablemax flags
+            for layer, prev_flag in zip(self.layers, prev_stablemax_flags):
+                if prev_flag is not None:
+                    layer.use_stablemax = prev_flag
+
+            if self.loops_representation:
+                return out, []
+            else:
+                return out
 
         # Use default num_loops if not specified
         if num_loops is None:

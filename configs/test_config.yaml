@@ -11,12 +11,12 @@ model:
   resample_size: 1000
   use_stablemax: False
   ir_encoder_type: convnext #regular, convnext
-  loop_range: [1, 20]
-  max_loops: 20
+  loop_range: [1, 10000]
+  max_loops: 10000
   automatic_loop_exit: False
   automatic_loop_exit_threshold: 1.0e-2
   use_loop_concat: True
-  log_normal_poisson: False
+  log_normal_poisson: True
   log_normal_mean: 12.0
   log_normal_std: 0.5 
   use_rmsnorm: True
@@ -27,11 +27,11 @@ model:
 # Training Parameters
 training:
   precision: "fp16"  # Controls training precision (fp32, fp16, bf16)
-  batch_size: 32
+  batch_size: 1024
   test_batch_size: 1
-  num_epochs: 10
+  num_epochs: 5
   learning_rate: 1.0e-3  # This will be used for AdamW components
-  min_learning_rate: 1.0e-5
+  min_learning_rate: 1.0e-8
   weight_decay: 0.1
   validation_frequency: 1000
   logging_frequency: 10
