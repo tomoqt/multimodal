@@ -240,7 +240,8 @@ def load_model_and_data_global():
             'max_loops': CONFIG['model'].get('max_loops', GRADIO_MAX_REFINE_LOOPS), # Use config's max_loops
             'loops_representation': True, # Crucial for step-by-step
             'use_loop_concat': CONFIG['model'].get('use_loop_concat', True),
-            'use_rmsnorm': CONFIG['model'].get('use_rmsnorm', True)
+            'use_rmsnorm': CONFIG['model'].get('use_rmsnorm', True),
+            'vanilla_mode': CONFIG['model'].get('vanilla_mode', False)
         }
         if IR_AS_PROMPT:
             model_kwargs['ir_vocab_size'] = extra_params.get('ir_vocab_size', len(IR_TOKENIZER) if IR_TOKENIZER else 0)
