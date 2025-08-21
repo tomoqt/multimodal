@@ -690,7 +690,8 @@ def load_config(config_path=None):
             'automatic_loop_exit': False, # Add new flag
             'automatic_loop_exit_threshold': 0.01, # Add threshold
             'use_loop_concat': True, # Add new flag for loop concatenation
-            'use_rmsnorm': False # Add use_rmsnorm flag
+            'use_rmsnorm': False, # Add use_rmsnorm flag
+            'vanilla_mode': False
         },
         'training': {
             'batch_size': 32,
@@ -1013,7 +1014,8 @@ def main():
         automatic_loop_exit=config['model'].get('automatic_loop_exit', False), # Pass flag
         automatic_loop_exit_threshold=config['model'].get('automatic_loop_exit_threshold', 0.01), # Pass threshold
         use_loop_concat=config['model'].get('use_loop_concat', True), # Pass loop concat flag
-        use_rmsnorm=config['model'].get('use_rmsnorm', False) # Pass use_rmsnorm flag
+        use_rmsnorm=config['model'].get('use_rmsnorm', False), # Pass use_rmsnorm flag
+        vanilla_mode=config['model'].get('vanilla_mode', False)
     )
     
     # Set precision for training based on configuration

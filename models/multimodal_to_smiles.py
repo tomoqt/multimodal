@@ -35,7 +35,8 @@ class MultiModalToSMILESModel(nn.Module):
         automatic_loop_exit: bool = False,
         automatic_loop_exit_threshold: float = 0.01,
         use_loop_concat: bool = True,
-        use_rmsnorm: bool = False
+        use_rmsnorm: bool = False,
+        vanilla_mode: bool = False
     ):
         """
         Args:
@@ -103,7 +104,8 @@ class MultiModalToSMILESModel(nn.Module):
             automatic_loop_exit=automatic_loop_exit,
             automatic_loop_exit_threshold=automatic_loop_exit_threshold,
             use_loop_concat=use_loop_concat,
-            use_rmsnorm=use_rmsnorm
+            use_rmsnorm=use_rmsnorm,
+            vanilla_mode=vanilla_mode
         )
 
     def forward(
