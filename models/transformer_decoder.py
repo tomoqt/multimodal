@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from torch.nn import LayerNorm, RMSNorm # Import RMSNorm
+from contextlib import nullcontext
 
 class RotaryEmbedding(th.nn.Module):
     def __init__(self, dim, base=10000):
@@ -190,7 +191,8 @@ class SMILESDecoder(nn.Module):
         automatic_loop_exit: bool = False, # flag to automatically exit loops based on convergence of representations
         automatic_loop_exit_threshold: float = 0.01, # threshold for automatic loop exit
         use_loop_concat:bool = True,
-        use_rmsnorm: bool = True # Add use_rmsnorm
+        use_rmsnorm: bool = True, # Add use_rmsnorm
+        loops_backprop_depth: int | None = 8
     ):
         super().__init__()
         
@@ -209,6 +211,7 @@ class SMILESDecoder(nn.Module):
         self.num_layers = num_layers
         self.loops_representation = loops_representation
         self.use_rmsnorm = use_rmsnorm
+        self.loops_backprop_depth = loops_backprop_depth
 
         # Separate embeddings with different vocabulary sizes
         self.smiles_embed = nn.Embedding(smiles_vocab_size, embed_dim)
@@ -369,49 +372,56 @@ class SMILESDecoder(nn.Module):
                 
                 # Loop through the middle layer num_loops times
                 for loop_idx in range(num_loops):
-                    
-                    # Add Gaussian noise ONLY to the first loop iteration 
-                    if loop_idx == 0:
-                        # Calculate noise scale with variance = 2/(5*embed_dim)
-                        noise_scale = math.sqrt(2/(5*self.embed_dim))
-                        # Generate Gaussian noise with proper scaling
-                        noise = th.randn_like(x) * noise_scale
-                        # Add noise to the input
-                        if self.use_loop_concat:
-                            x = self.loop_concat_adapter(th.cat([x_original, noise], dim=-1))
-                        else:
-                            x = x + noise
-                        if self.verbose:
-                            print(f"Added Gaussian noise with scale {noise_scale:.6f} to first loop iteration")
-                    else:
-                        if self.use_loop_concat:
-                            x = self.loop_concat_adapter(th.cat([x_original, x], dim=-1))
-                        else:
-                            x = x_original + x# Add the original input back to the residual stream before each iteration, as in https://arxiv.org/pdf/2502.05171
-                    
-                    # Process through the layer
-                    
-                    # automatically exit loop if we converge.
-                    if self.automatic_loop_exit:
-                        x_new = layer(x,mask)
-                        current_diff_norm_tensor = th.norm(x_new - x, dim=-1)
-                        current_diff_norm = current_diff_norm_tensor.mean(dim=-1) # Get a scalar value per batch item
+                    # Determine whether this iteration contributes gradients
+                    grad_this_iter = True
+                    if (
+                        self.loops_backprop_depth is not None
+                        and self.loops_backprop_depth > 0
+                        and num_loops > self.loops_backprop_depth
+                    ):
+                        grad_this_iter = loop_idx >= (num_loops - self.loops_backprop_depth)
 
-                        #print(f"Current diff norm: {current_diff_norm}")
+                    ctx = nullcontext() if grad_this_iter else th.no_grad()
 
-                        if prev_diff_norm is not None and loop_idx > 1: # Need at least two diff_norms to compare
-                            diff_of_diffs = th.abs(current_diff_norm - prev_diff_norm)
-                            #print(f"Diff of diffs: {diff_of_diffs}")
-                            if (diff_of_diffs < self.automatic_loop_exit_threshold):
-                                #print(f"Converged at loop {loop_idx} with diff_of_diffs {diff_of_diffs.item():.6f} (threshold {self.automatic_loop_exit_threshold:.6f})")
-                                x = x_new # Make sure to use the latest x
-                                break
+                    with ctx:
+                        # Add Gaussian noise ONLY to the first loop iteration 
+                        if loop_idx == 0:
+                            # Calculate noise scale with variance = 2/(5*embed_dim)
+                            noise_scale = math.sqrt(2/(5*self.embed_dim))
+                            # Generate Gaussian noise with proper scaling
+                            noise = th.randn_like(x) * noise_scale
+                            # Add noise to the input
+                            if self.use_loop_concat:
+                                x = self.loop_concat_adapter(th.cat([x_original, noise], dim=-1))
+                            else:
+                                x = x + noise
+                            if self.verbose:
+                                print(f"Added Gaussian noise with scale {noise_scale:.6f} to first loop iteration")
+                        else:
+                            if self.use_loop_concat:
+                                x = self.loop_concat_adapter(th.cat([x_original, x], dim=-1))
+                            else:
+                                # Add the original input back to the residual stream before each iteration
+                                x = x_original + x
                         
-                        prev_diff_norm = current_diff_norm
-                        x = x_new
+                        # Process through the layer
+                        if self.automatic_loop_exit:
+                            x_new = layer(x, mask)
+                            current_diff_norm_tensor = th.norm(x_new - x, dim=-1)
+                            current_diff_norm = current_diff_norm_tensor.mean(dim=-1) # Get a scalar value per batch item
 
-                    else:
-                        x = layer(x, mask)
+                            if prev_diff_norm is not None and loop_idx > 1: # Need at least two diff_norms to compare
+                                diff_of_diffs = th.abs(current_diff_norm - prev_diff_norm)
+                                if (diff_of_diffs < self.automatic_loop_exit_threshold):
+                                    x = x_new # Make sure to use the latest x
+                                    # Early exit from loop
+                                    # Note: earlier iterations may have been run under no_grad
+                                    break
+                            
+                            prev_diff_norm = current_diff_norm
+                            x = x_new
+                        else:
+                            x = layer(x, mask)
 
                     if self.loops_representation:
                         self.loop_representations.append(x.clone())

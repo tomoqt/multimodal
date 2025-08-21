@@ -96,3 +96,5 @@ inference_results/
 checkpoints_rl/
 inference_results_entropix_loop_steps/
 inference_results_test_looping/
+checkpoints_sft_nmr/
+representation_analysis/
