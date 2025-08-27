@@ -62,7 +62,7 @@ vocab_path = os.path.join(current_dir, 'vocab.txt')
 tokenizer = SmilesTokenizer(vocab_file=vocab_path)
 
 
-def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=None, temperature=1.0, sample=False, precision='fp32', num_loops=None):
+def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=512, device=None, temperature=1.0, sample=False, precision='fp32', num_loops=None):
     """
     Decoding for SMILES generation with optional sampling.
     Args:
@@ -245,7 +245,7 @@ def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examp
             if automatic_loop_exit:
                 current_num_loops = max_loops # Use max_loops when auto exit is on
             else:
-                current_num_loops = 1 # Default to 1 loop for standard greedy eval
+                current_num_loops = max_loops # Default to 1 loop for standard greedy eval
 
             predictions = greedy_decode(
                 model=model,
@@ -697,6 +697,7 @@ def load_config(config_path=None):
             'batch_size': 32,
             'test_batch_size': 1,
             'num_epochs': 1,
+            'num_iterations': 0,
             'learning_rate': 1.0e-4,
             'min_learning_rate': 1.0e-6,
             'validation_frequency': 500,
@@ -1233,9 +1234,15 @@ def main():
         print(f"        - Betas: {config['optimizer']['adamw'].get('betas', (0.9, 0.999))}")
         print(f"        - Weight decay: {config['training']['weight_decay']}")
 
-    # Calculate total training steps (batches per epoch * num epochs)
-    total_training_steps = len(train_loader) * config['training']['num_epochs']
-    print(f"[Main] Total training steps: {total_training_steps:,}")
+    # Calculate total training steps
+    # If explicit iterations are provided, they override epoch-based calculation
+    explicit_iterations = int(config['training'].get('num_iterations', 0) or 0)
+    if explicit_iterations > 0:
+        total_training_steps = explicit_iterations
+        print(f"[Main] Using explicit iterations: {total_training_steps:,} (overrides epochs)")
+    else:
+        total_training_steps = len(train_loader) * config['training']['num_epochs']
+        print(f"[Main] Total training steps (epochs x batches): {total_training_steps:,}")
     
     # Initialize scheduler
     scheduler = LinearWarmupCosineDecay(
@@ -1515,6 +1522,8 @@ def main():
     # Training Loop
     # -------------------------------------------------------------------------
     print("\n[Main] Starting training loop...")
+    max_iterations = explicit_iterations if explicit_iterations > 0 else None
+    done = False
     
     for epoch in range(NUM_EPOCHS):
         print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
@@ -1634,6 +1643,13 @@ def main():
             epoch_loss += loss.item()
             num_batches += 1
             global_step += 1
+
+            # Stop exactly after reaching the requested number of iterations
+            if max_iterations is not None and global_step >= max_iterations:
+                done = True
+                # Ensure pbar closes cleanly
+                pbar.close()
+                break
 
             if global_step % logging_frequency == 0:
                 current_lr = scheduler.get_lr()[0]  # Get current learning rate
@@ -1782,6 +1798,10 @@ def main():
 
         avg_epoch_loss = epoch_loss / max(num_batches, 1)
         print(f"Epoch {epoch+1} completed | Average Loss: {avg_epoch_loss:.4f}")
+
+        if done:
+            print(f"[Main] Stopping early after reaching {global_step} iterations as requested.")
+            break
 
     # Final test set evaluation - Only on rank 0
     final_test_metrics = {}
