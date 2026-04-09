@@ -1,0 +1,59 @@
+model:
+  max_seq_length: 128
+  max_nmr_length: 256
+  max_memory_length: 128
+  embed_dim: 576
+  num_heads: 8
+  num_layers: 16
+  dropout: 0.1
+  ir_encoder_type: regular
+  ir_as_prompt: false
+  use_stablemax: false
+  use_rmsnorm: false
+
+training:
+  batch_size: 240
+  test_batch_size: 240
+  num_epochs: 50
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  drop_last: true
+  log_every_steps: 20
+  seed: 1337
+  device: cuda
+  precision: bf16
+  grad_accum_steps: 1
+  grad_clip_norm: 0.0
+  allow_tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  ddp_backend: nccl
+  ddp_timeout_minutes: 30
+  ddp_find_unused_parameters: false
+  ddp_static_graph: true
+  ddp_gradient_as_bucket_view: true
+  compile: false
+  compile_mode: max-autotune
+  compile_dynamic: false
+  compile_fullgraph: false
+  validate_every_epochs: 25
+  run_final_test: true
+
+data:
+  tokenized_dir: data/tokenized_baseline/data
+  pretokenize: true
+  preload_ir: false
+  use_disk_cache: true
+  write_disk_cache: true
+  cache_dir: data/tokenized_baseline/cache
+  ir_cache_mode: none
+  ir_cache_dtype: float32
+
+checkpoint:
+  output_dir: checkpoints_h100_100m_sparse
+  save_every_epoch: true
+  save_every_n_epochs: 25

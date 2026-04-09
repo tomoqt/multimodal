@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 
 from .convnext import ConvNeXt1D
-from .preprocessing import PerSampleInterpolator, SpectralPreprocessor
 
 class ResidualConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
@@ -97,7 +96,6 @@ class MultimodalSpectralEncoder(nn.Module):
                 from .convnext import ConvNeXt1D  # ensure local import
                 self.ir_encoder = ConvNeXt1D(in_chans=1, **base_config)
             elif encoder_type == "regular":
-                from .spectral_encoder import Regular1DCNNEncoder
                 self.ir_encoder = Regular1DCNNEncoder(embed_dim=embed_dim, num_blocks=3, initial_channels=384)
             else:
                 raise ValueError(f"Unknown encoder_type: {encoder_type}")

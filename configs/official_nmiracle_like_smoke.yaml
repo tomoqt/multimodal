@@ -1,0 +1,43 @@
+model:
+  max_seq_length: 64
+  max_nmr_length: 128
+  max_memory_length: 64
+  embed_dim: 128
+  num_heads: 4
+  num_layers: 2
+  dropout: 0.0
+  ir_encoder_type: regular
+  ir_as_prompt: false
+  use_stablemax: false
+  use_rmsnorm: false
+  architecture: cross_attention
+
+training:
+  batch_size: 4
+  test_batch_size: 4
+  num_epochs: 1
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  num_workers: 0
+  log_every_steps: 20
+  seed: 3245
+  device: mps
+  precision: fp32
+  validate_every_epochs: 1
+  run_final_test: true
+  decode_validate_examples: 16
+  decode_validate_max_len: 64
+
+data:
+  tokenized_dir: data/tokenized_official_nmiracle_like_smoke/data
+  pretokenize: true
+  preload_ir: false
+  use_disk_cache: true
+  write_disk_cache: true
+  cache_dir: data/tokenized_official_nmiracle_like_smoke/cache
+  ir_cache_mode: none
+  ir_cache_dtype: float32
+
+checkpoint:
+  output_dir: checkpoints_official_nmiracle_like_smoke
+  save_every_epoch: false

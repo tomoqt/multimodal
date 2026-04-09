@@ -1,1828 +1,1054 @@
-# =======================
-# File: train_autoregressive.py
-# =======================
+#!/usr/bin/env python3
 """
-Script to train a MultiModalToSMILESModel from memory-mapped binary data.
-Key Steps:
-1) Loads spectral + SMILES data from .bin and .npy index
-2) Tokenizes SMILES
-3) Basic training loop with teacher forcing
-4) Minimal inference (greedy decode) function
+Lean autoregressive pretraining entrypoint with optional DDP.
 """
-import sys
+
+import argparse
+import hashlib
+import json
 import os
+import random
+import shutil
+import sys
+import time
+from contextlib import nullcontext
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import yaml
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
-import wandb
-from datetime import datetime
-from sklearn.model_selection import train_test_split
-import json
-from rdkit import Chem
-from rdkit import RDLogger
-from rdkit.Chem import rdFMCS
-from pathlib import Path
-import numpy as np
-import math
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import seaborn as sns
-import yaml
-import argparse
-import time
-from pprint import pprint
-from copy import deepcopy
-from utils.logging.logging_utils import evaluate_predictions, aggregate_metrics, log_results
-import heavyball
-from utils.optimization.ortho_grad import OrthoGrad  # Import our new optimizer wrapper
-# Import our custom tokenizer
-from models.smiles_tokenizer import SmilesTokenizer
 from models.multimodal_to_smiles import MultiModalToSMILESModel
-import subprocess
-from utils.optimization.muon import Muon  # Import Muon optimizer from the local file
-import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
-
-# Disable RDKit logging
-RDLogger.DisableLog("rdApp.*")
-
-try:
-    import torch._dynamo
-    torch._dynamo.config.backend = "aot_eager"
-    print("[TorchDynamo] Set backend to aot_eager to avoid inductor backend issues.")
-except Exception as e:
-    print(f"[TorchDynamo] Warning: could not set backend: {e}")
-
-current_dir = os.path.dirname(os.path.realpath(__file__))
-vocab_path = os.path.join(current_dir, 'vocab.txt')
-tokenizer = SmilesTokenizer(vocab_file=vocab_path)
+from models.multimodal_prefix_to_smiles import MultiModalPrefixToSMILESModel
+from models.smiles_tokenizer import SmilesTokenizer
+from inference.inference import DecodingStrategy, ModelInference
+from training.core_dataset import SpectralSmilesDataset, collate_spectral_smiles
+from training.core_train import compute_next_token_loss
 
 
-def greedy_decode(model, nmr_tokens, ir_data, tokenizer, max_len=128, device=None, temperature=1.0, sample=False, precision='fp32', num_loops=None):
-    """
-    Decoding for SMILES generation with optional sampling.
-    Args:
-        model: The MultiModalToSMILESModel instance
-        nmr_tokens: NMR token tensor or None
-        ir_data: IR data tensor or None
-        tokenizer: SmilesTokenizer instance
-        max_len: Maximum sequence length for generation
-        device: torch device to use
-        temperature: Temperature for sampling (higher = more random, lower = more deterministic)
-        sample: If True, sample from the distribution; if False, use greedy decoding (argmax)
-        precision: Precision type ('fp32', 'fp16', 'bf16')
-        num_loops: Number of loops for the model to generate
-    """
-    if device is None:
-        device = next(model.parameters()).device
-    
-    # Get tokenizer's special token IDs
-    BOS_TOKEN_ID = tokenizer.cls_token_id  # [CLS] token is used as BOS
-    EOS_TOKEN_ID = tokenizer.sep_token_id  # [SEP] token is used as EOS
-    PAD_TOKEN_ID = tokenizer.pad_token_id
-        
-    model.eval()
-    with torch.no_grad():
-        # Get batch size from input data
-        batch_size = 1  # Default
-        if nmr_tokens is not None:
-            batch_size = nmr_tokens.size(0)
-        elif ir_data is not None:
-            batch_size = ir_data.size(0)
-            
-        # Start tokens for each sequence in the batch
-        current_token = torch.tensor([[BOS_TOKEN_ID]] * batch_size, device=device)
-        
-        # Encode spectral data with appropriate precision
-        use_amp = (precision in ['fp16', 'bf16']) and torch.cuda.is_available()
-        
-        if use_amp:
-            amp_dtype = torch.bfloat16 if precision == 'bf16' else torch.float16
-            with torch.cuda.amp.autocast(dtype=amp_dtype):
-                memory = model.encoder(None, ir_data, None)  # NMR tokens not needed here
+@dataclass
+class DistContext:
+    enabled: bool = False
+    rank: int = 0
+    world_size: int = 1
+    local_rank: int = 0
+    backend: Optional[str] = None
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
+
+
+def _deep_update(base: Dict, patch: Dict) -> Dict:
+    for k, v in patch.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_update(base[k], v)
         else:
-            memory = model.encoder(None, ir_data, None)  # NMR tokens not needed here
-        
-        if memory is None:
-            if nmr_tokens is not None:
-                batch_size = nmr_tokens.size(0)
-            elif ir_data is not None:
-                batch_size = ir_data.size(0)
-            else:
-                batch_size = 1
-            memory = torch.zeros(batch_size, model.decoder.max_memory_length, model.decoder.memory_dim, device=device)
-        
-        # Initialize storage for generated tokens
-        generated_sequences = [[] for _ in range(batch_size)]
-        for seq in generated_sequences:
-            seq.append(BOS_TOKEN_ID)
-        
-        # Use model's max sequence length as the limit
-        max_len = min(max_len, model.decoder.max_seq_length)
-        
-        finished_sequences = [False] * batch_size
-        
-        for _ in range(max_len):
-            # Get next token predictions with appropriate precision
-            if use_amp:
-                with torch.cuda.amp.autocast(dtype=amp_dtype):
-                    logits = model.decoder(
-                        tgt=current_token,
-                        memory=memory,
-                        nmr_tokens=nmr_tokens,
-                        num_loops=num_loops
-                    )
-            else:
-                logits = model.decoder(
-                    tgt=current_token,
-                    memory=memory,
-                    nmr_tokens=nmr_tokens,
-                    num_loops=num_loops
-                )
-            
-            # Get the next token - either sample or take argmax
-            if sample and temperature > 0:
-                # Apply temperature and convert to probabilities
-                probs = F.softmax(logits[:, -1] / temperature, dim=-1)
-                # Sample from the distribution
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                # Greedy decoding (argmax)
-                next_token = logits[:, -1:].argmax(dim=-1)
-            
-            # Update each sequence
-            for i in range(batch_size):
-                if not finished_sequences[i]:
-                    token = next_token[i].item()
-                    generated_sequences[i].append(token)
-                    if token == EOS_TOKEN_ID:
-                        finished_sequences[i] = True
-            
-            # Stop if all sequences are finished
-            if all(finished_sequences):
-                break
-            
-            current_token = torch.cat([current_token, next_token], dim=1)
-        
-        # Decode sequences
-        decoded_sequences = []
-        for seq in generated_sequences:
-            # Find EOS token if present
-            try:
-                eos_idx = seq.index(EOS_TOKEN_ID)
-                seq = seq[:eos_idx]  # Exclude EOS token
-            except ValueError:
-                pass  # No EOS found, use full sequence
-            
-            # Remove BOS token and decode
-            decoded = tokenizer.decode(seq[1:])  # Skip BOS token
-            decoded_sequences.append(decoded)
-            
-        return decoded_sequences
+            base[k] = v
+    return base
 
 
-# Updated helper function for canonicalizing SMILES using RDKit: remove spaces before canonicalization
-
-def canonicalize_smiles(smiles):
-    """Convert a SMILES string to its canonical form using RDKit. Removes extra spaces before conversion. Returns the canonical SMILES if possible, otherwise returns the cleaned string."""
-    # Remove spaces and strip leading/trailing whitespace
-    cleaned = smiles.replace(' ', '').strip()
-    from rdkit import Chem
-    try:
-        mol = Chem.MolFromSmiles(cleaned)
-        if mol is None:
-            return cleaned
-        return Chem.MolToSmiles(mol, canonical=True)
-    except Exception:
-        return cleaned
+def _default_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
+        return "mps"
+    return "cpu"
 
 
-def evaluate_with_greedy_decode(model, test_loader, tokenizer, device, num_examples=100, block_ir=False, block_nmr=False, num_loops=None):
-    """Evaluate model using greedy decoding with optional IR/NMR blocking"""
-    model.eval()
-    all_predictions = []
-    all_targets = []
-    
-    # Get current precision setting from config if it exists
-    precision = 'fp32'  # Default
-    try:
-        # Access the global config if available
-        precision = config['training'].get('precision', 'fp32')
-        automatic_loop_exit = config['model'].get('automatic_loop_exit', False)
-        automatic_loop_exit_threshold = config['model'].get('automatic_loop_exit_threshold', 0.01)
-        max_loops = config['model'].get('max_loops', 1)
-    except (NameError, KeyError):
-        # Fallback if config is not available (e.g., when called outside main script)
-        automatic_loop_exit = False
-        automatic_loop_exit_threshold = 0.01
-        max_loops = 1
+def load_config(path: str = None) -> Dict:
+    config = {
+        "model": {
+            "max_seq_length": 128,
+            "max_nmr_length": 256,
+            "max_memory_length": 128,
+            "embed_dim": 256,
+            "num_heads": 8,
+            "num_layers": 6,
+            "dropout": 0.1,
+            "ir_encoder_type": "regular",
+            "ir_as_prompt": False,
+            "use_stablemax": False,
+            "use_rmsnorm": False,
+            "architecture": "cross_attention",
+        },
+        "training": {
+            "batch_size": 8,
+            "test_batch_size": 8,
+            "num_epochs": 1,
+            "learning_rate": 3e-4,
+            "weight_decay": 0.01,
+            "num_workers": 4,
+            "pin_memory": True,
+            "persistent_workers": True,
+            "prefetch_factor": 4,
+            "drop_last": True,
+            "log_every_steps": 20,
+            "seed": 1337,
+            "device": _default_device(),
+            "precision": "bf16" if torch.cuda.is_available() else "fp32",
+            "grad_accum_steps": 1,
+            "grad_clip_norm": 0.0,
+            "allow_tf32": True,
+            "cudnn_benchmark": True,
+            "matmul_precision": "high",
+            "ddp_backend": "nccl",
+            "ddp_timeout_minutes": 30,
+            "ddp_find_unused_parameters": False,
+            "ddp_static_graph": True,
+            "ddp_gradient_as_bucket_view": True,
+            "compile": False,
+            "compile_mode": "max-autotune",
+            "compile_dynamic": False,
+            "compile_fullgraph": False,
+            "validate_every_epochs": 1,
+            "run_final_test": True,
+            "decode_validate_examples": 0,
+            "decode_validate_max_len": 0,
+        },
+        "data": {
+            "tokenized_dir": "data/tokenized_baseline/data",
+            "pretokenize": True,
+            "preload_ir": False,
+            "use_disk_cache": True,
+            "write_disk_cache": True,
+            "cache_dir": None,
+            "ir_cache_mode": "none",
+            "ir_cache_dtype": "float32",
+        },
+        "checkpoint": {
+            "output_dir": "checkpoints",
+            "save_every_epoch": True,
+            "save_every_n_epochs": 1,
+        },
+    }
+    if path:
+        with open(path, "r", encoding="utf-8") as f:
+            user_cfg = yaml.safe_load(f) or {}
+        _deep_update(config, user_cfg)
+    return config
 
-    with torch.no_grad():
-        for target_tokens, ir_data, nmr_tokens, _ in tqdm(test_loader, desc="Greedy decoding"):
-            # Block modalities if flags are set
-            if block_ir:
-                ir_data = None
-            if block_nmr:
-                nmr_tokens = None
 
-            # Move data to device
-            if ir_data is not None:
-                ir_data = ir_data.to(device)
-            if nmr_tokens is not None:
-                nmr_tokens = nmr_tokens.to(device)
+def load_nmr_tokenizer(tokenized_dir: Path) -> Dict[str, int]:
+    vocab_json = tokenized_dir.parent / "vocab.json"
+    if not vocab_json.exists():
+        raise FileNotFoundError(f"Missing NMR vocabulary at {vocab_json}")
+    with vocab_json.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
-            # Determine num_loops for greedy decoding
-            if automatic_loop_exit:
-                current_num_loops = max_loops # Use max_loops when auto exit is on
-            else:
-                current_num_loops = 1 # Default to 1 loop for standard greedy eval
 
-            predictions = greedy_decode(
-                model=model,
-                nmr_tokens=nmr_tokens,
-                ir_data=ir_data,
-                tokenizer=tokenizer,
-                device=device,
-                sample=False,  # Ensure we're using greedy decoding (not sampling) for evaluation
-                precision=precision,  # Pass precision setting
-                num_loops=current_num_loops # Pass the determined number of loops
+def _set_perf_flags(training_cfg: Dict) -> None:
+    allow_tf32 = bool(training_cfg.get("allow_tf32", True))
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+        torch.backends.cudnn.benchmark = bool(training_cfg.get("cudnn_benchmark", True))
+    matmul_precision = str(training_cfg.get("matmul_precision", "high"))
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision(matmul_precision)
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _infer_dist_context(training_cfg: Dict, requested_device: str) -> DistContext:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return DistContext(enabled=False)
+
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if requested_device not in {"cuda", "cpu"}:
+        raise RuntimeError(
+            f"DDP requested via WORLD_SIZE={world_size}, but device '{requested_device}' is unsupported for DDP."
+        )
+
+    if requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP with CUDA requested but CUDA is unavailable.")
+        if local_rank >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} exceeds visible CUDA device count={torch.cuda.device_count()}."
             )
+        torch.cuda.set_device(local_rank)
 
-            targets = []
-            for tgt in target_tokens:
-                try:
-                    eos_idx = tgt.tolist().index(tokenizer.sep_token_id)
-                    tgt = tgt[:eos_idx]
-                except ValueError:
-                    pass
-                decoded = tokenizer.decode(tgt[1:]).strip()
-                targets.append(decoded)
+    backend = str(training_cfg.get("ddp_backend", "nccl" if requested_device == "cuda" else "gloo"))
+    timeout_minutes = float(training_cfg.get("ddp_timeout_minutes", 30))
+    dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout_minutes))
+    return DistContext(enabled=True, rank=rank, world_size=world_size, local_rank=local_rank, backend=backend)
 
-            all_predictions.extend(predictions)
-            all_targets.extend(targets)
 
-            if num_examples and len(all_predictions) >= num_examples:
-                break
+def _cleanup_dist(ctx: DistContext) -> None:
+    if ctx.enabled and dist.is_initialized():
+        dist.destroy_process_group()
 
-    # Canonicalize predictions and targets before evaluation
-    all_predictions = [canonicalize_smiles(pred) for pred in all_predictions]
-    all_targets = [canonicalize_smiles(tgt) for tgt in all_targets]
 
-    detailed_results = evaluate_predictions(all_predictions, all_targets)
-    metrics = aggregate_metrics(detailed_results)
-    metrics['predictions'] = all_predictions[:10]
-    metrics['targets'] = all_targets[:10]
-    metrics['num_samples'] = len(all_predictions)
+def _autocast_context(device: torch.device, precision: str):
+    if device.type != "cuda":
+        return nullcontext()
+    p = precision.lower()
+    if p == "bf16":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    if p == "fp16":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
+
+
+def _reduce_pair(total: float, count: float, device: torch.device, dist_ctx: DistContext) -> Tuple[float, float]:
+    stats = torch.tensor([total, count], device=device, dtype=torch.float32)
+    if dist_ctx.enabled:
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+    return float(stats[0].item()), float(stats[1].item())
+
+
+def _quick_file_fingerprint(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    st = path.stat()
+    out: Dict[str, Any] = {
+        "path": str(path.resolve()),
+        "size_bytes": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns),
+    }
+    try:
+        h = hashlib.sha256()
+        sample_bytes = 1024 * 1024
+        with path.open("rb") as f:
+            h.update(f.read(sample_bytes))
+            if st.st_size > sample_bytes:
+                f.seek(max(st.st_size - sample_bytes, 0))
+                h.update(f.read(sample_bytes))
+        out["quick_sha256"] = h.hexdigest()
+    except Exception:
+        pass
+    return out
+
+
+def _copy_if_exists(src: Path, dst: Path) -> Optional[str]:
+    if not src.exists():
+        return None
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return str(dst)
+
+
+def _write_run_artifacts(
+    output_dir: Path,
+    cfg: Dict,
+    tokenized_dir: Path,
+    smiles_vocab_path: Path,
+    run_started_at_utc: str,
+    world_size: int,
+    parameter_count: int,
+    latest_metrics: Optional[Dict[str, Any]] = None,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    config_snapshot = output_dir / "config.yaml"
+    with config_snapshot.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+
+    smiles_vocab_snapshot = output_dir / "smiles_vocab.txt"
+    _copy_if_exists(smiles_vocab_path, smiles_vocab_snapshot)
+
+    nmr_vocab_src = tokenized_dir.parent / "vocab.json"
+    nmr_vocab_snapshot = output_dir / "nmr_vocab.json"
+    _copy_if_exists(nmr_vocab_src, nmr_vocab_snapshot)
+
+    dataset_fingerprint = {
+        "tokenized_dir": str(tokenized_dir),
+        "splits": {
+            "train": {
+                "src": _quick_file_fingerprint(tokenized_dir / "src-train.txt"),
+                "tgt": _quick_file_fingerprint(tokenized_dir / "tgt-train.txt"),
+                "ir": _quick_file_fingerprint(tokenized_dir / "ir-train.npy"),
+            },
+            "val": {
+                "src": _quick_file_fingerprint(tokenized_dir / "src-val.txt"),
+                "tgt": _quick_file_fingerprint(tokenized_dir / "tgt-val.txt"),
+                "ir": _quick_file_fingerprint(tokenized_dir / "ir-val.npy"),
+            },
+            "test": {
+                "src": _quick_file_fingerprint(tokenized_dir / "src-test.txt"),
+                "tgt": _quick_file_fingerprint(tokenized_dir / "tgt-test.txt"),
+                "ir": _quick_file_fingerprint(tokenized_dir / "ir-test.npy"),
+            },
+        },
+        "nmr_vocab": _quick_file_fingerprint(nmr_vocab_src),
+        "smiles_vocab": _quick_file_fingerprint(smiles_vocab_path),
+    }
+    dataset_fingerprint_path = output_dir / "dataset_fingerprint.json"
+    with dataset_fingerprint_path.open("w", encoding="utf-8") as f:
+        json.dump(dataset_fingerprint, f, indent=2)
+
+    manifest = {
+        "run_started_at_utc": run_started_at_utc,
+        "run_updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "world_size": world_size,
+        "parameter_count": parameter_count,
+        "tokenized_dir": str(tokenized_dir),
+        "artifacts": {
+            "config": str(config_snapshot.name),
+            "dataset_fingerprint": str(dataset_fingerprint_path.name),
+            "smiles_vocab": str(smiles_vocab_snapshot.name) if smiles_vocab_snapshot.exists() else None,
+            "nmr_vocab": str(nmr_vocab_snapshot.name) if nmr_vocab_snapshot.exists() else None,
+        },
+        "latest_metrics": latest_metrics or {},
+    }
+    manifest_path = output_dir / "run_manifest.json"
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def _decode_target_smiles(tokenizer: SmilesTokenizer, target_tokens: torch.Tensor) -> str:
+    ids = target_tokens.tolist()
+    cleaned: List[int] = []
+    for token_id in ids:
+        if token_id == tokenizer.sep_token_id:
+            break
+        if token_id in (tokenizer.cls_token_id, tokenizer.pad_token_id):
+            continue
+        cleaned.append(token_id)
+    return tokenizer.decode(cleaned).replace(" ", "").strip()
+
+
+def _compute_decode_metrics(predictions: List[str], targets: List[str]) -> Dict[str, Any]:
+    n = len(predictions)
+    if n == 0:
+        return {
+            "decode_examples": 0,
+            "decode_rdkit": False,
+            "decode_valid_smiles": float("nan"),
+            "decode_exact_match_all": float("nan"),
+            "decode_exact_match_valid_pairs": float("nan"),
+            "decode_avg_tanimoto": float("nan"),
+            "decode_avg_ecfp6_iou": float("nan"),
+            "decode_avg_mcs_over_target": float("nan"),
+            "decode_valid_pairs": 0,
+        }
+
+    try:
+        from rdkit import Chem, DataStructs, RDLogger
+        from rdkit.Chem import AllChem, rdFMCS
+
+        RDLogger.DisableLog("rdApp.*")
+        rdkit_available = True
+    except Exception:
+        rdkit_available = False
+
+    if not rdkit_available:
+        exact_all = float(np.mean([int(p == t) for p, t in zip(predictions, targets)]))
+        return {
+            "decode_examples": n,
+            "decode_rdkit": False,
+            "decode_valid_smiles": float("nan"),
+            "decode_exact_match_all": exact_all,
+            "decode_exact_match_valid_pairs": float("nan"),
+            "decode_avg_tanimoto": float("nan"),
+            "decode_avg_ecfp6_iou": float("nan"),
+            "decode_avg_mcs_over_target": float("nan"),
+            "decode_valid_pairs": 0,
+        }
+
+    valid_pred = 0
+    exact_all = 0
+    exact_valid = 0
+    valid_pairs = 0
+    tanimoto_sum = 0.0
+    ecfp6_iou_sum = 0.0
+    mcs_over_target_sum = 0.0
+
+    for pred, target in zip(predictions, targets):
+        pred_clean = pred.replace(" ", "")
+        target_clean = target.replace(" ", "")
+        mol_pred = Chem.MolFromSmiles(pred_clean)
+        mol_target = Chem.MolFromSmiles(target_clean)
+
+        is_valid_pred = mol_pred is not None
+        if is_valid_pred:
+            valid_pred += 1
+
+        if mol_pred is None or mol_target is None:
+            continue
+
+        can_pred = Chem.MolToSmiles(mol_pred, canonical=True)
+        can_target = Chem.MolToSmiles(mol_target, canonical=True)
+        is_exact = int(can_pred == can_target)
+        exact_all += is_exact
+        exact_valid += is_exact
+        valid_pairs += 1
+
+        fp_pred = AllChem.GetMorganFingerprintAsBitVect(mol_pred, 2)
+        fp_target = AllChem.GetMorganFingerprintAsBitVect(mol_target, 2)
+        tanimoto_sum += float(DataStructs.TanimotoSimilarity(fp_pred, fp_target))
+
+        fp3_pred = AllChem.GetMorganFingerprintAsBitVect(mol_pred, radius=3, nBits=1024)
+        fp3_target = AllChem.GetMorganFingerprintAsBitVect(mol_target, radius=3, nBits=1024)
+        intersection = sum((fp3_pred & fp3_target))
+        union = sum((fp3_pred | fp3_target))
+        ecfp6_iou_sum += float(intersection / union) if union > 0 else 0.0
+
+        mcs = rdFMCS.FindMCS([mol_pred, mol_target])
+        mcs_mol = Chem.MolFromSmarts(mcs.smartsString) if mcs.smartsString else None
+        if mcs_mol is not None:
+            target_atoms = mol_target.GetNumAtoms()
+            mcs_over_target_sum += float(mcs_mol.GetNumAtoms() / target_atoms) if target_atoms > 0 else 0.0
+
+    return {
+        "decode_examples": n,
+        "decode_rdkit": True,
+        "decode_valid_smiles": float(valid_pred / max(n, 1)),
+        "decode_exact_match_all": float(exact_all / max(n, 1)),
+        "decode_exact_match_valid_pairs": float(exact_valid / max(valid_pairs, 1)),
+        "decode_avg_tanimoto": float(tanimoto_sum / max(valid_pairs, 1)),
+        "decode_avg_ecfp6_iou": float(ecfp6_iou_sum / max(valid_pairs, 1)),
+        "decode_avg_mcs_over_target": float(mcs_over_target_sum / max(valid_pairs, 1)),
+        "decode_valid_pairs": int(valid_pairs),
+    }
+
+
+@torch.no_grad()
+def evaluate_decode_metrics(
+    model: torch.nn.Module,
+    dataset: SpectralSmilesDataset,
+    tokenizer: SmilesTokenizer,
+    device: torch.device,
+    max_examples: int,
+    max_len: int,
+    ir_as_prompt: bool,
+) -> Dict[str, Any]:
+    was_training = model.training
+    model.eval()
+
+    inference = ModelInference(model, tokenizer, device=device, ir_as_prompt=ir_as_prompt)
+    n = min(max_examples, len(dataset))
+    predictions: List[str] = []
+    targets: List[str] = []
+    non_blocking = device.type == "cuda"
+
+    for idx in range(n):
+        target_tokens, ir_data, nmr_tokens = dataset[idx]
+        if ir_data is not None:
+            ir_data = ir_data.to(device, non_blocking=non_blocking)
+        if nmr_tokens is not None:
+            nmr_tokens = nmr_tokens.to(device, non_blocking=non_blocking)
+
+        pred = inference.decode(
+            nmr_tokens=nmr_tokens,
+            ir_data=ir_data,
+            strategy=DecodingStrategy.GREEDY,
+            max_len=max_len,
+        )[0]
+        tgt = _decode_target_smiles(tokenizer, target_tokens)
+        predictions.append(pred)
+        targets.append(tgt)
+
+    metrics = _compute_decode_metrics(predictions, targets)
+    if was_training:
+        model.train()
     return metrics
 
 
-# -------------------------------------------------------------------------
-# Linear Warmup + Cosine/Constant LR Scheduler
-# -------------------------------------------------------------------------
+def create_loaders(
+    tokenized_dir: Path,
+    smiles_tokenizer: SmilesTokenizer,
+    nmr_tokenizer: Dict[str, int],
+    config: Dict,
+    dist_ctx: Optional[DistContext] = None,
+    device: Optional[torch.device] = None,
+    return_train_index: bool = False,
+    return_eval_index: bool = False,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    model_cfg = config["model"]
+    train_cfg = config["training"]
+    data_cfg = config["data"]
+    dist_ctx = dist_ctx or DistContext(enabled=False)
+    device = device or torch.device("cpu")
 
+    train_ds = SpectralSmilesDataset(
+        data_dir=str(tokenized_dir),
+        smiles_tokenizer=smiles_tokenizer,
+        spectral_tokenizer=nmr_tokenizer,
+        split="train",
+        max_smiles_len=model_cfg["max_seq_length"],
+        max_nmr_len=model_cfg["max_nmr_length"],
+        pretokenize=data_cfg.get("pretokenize", True),
+        preload_ir=data_cfg.get("preload_ir", False),
+        use_disk_cache=data_cfg.get("use_disk_cache", True),
+        write_disk_cache=data_cfg.get("write_disk_cache", True),
+        cache_dir=data_cfg.get("cache_dir"),
+        ir_cache_mode=data_cfg.get("ir_cache_mode", "none"),
+        ir_cache_dtype=data_cfg.get("ir_cache_dtype", "float32"),
+        return_index=return_train_index,
+    )
+    val_ds = SpectralSmilesDataset(
+        data_dir=str(tokenized_dir),
+        smiles_tokenizer=smiles_tokenizer,
+        spectral_tokenizer=nmr_tokenizer,
+        split="val",
+        max_smiles_len=model_cfg["max_seq_length"],
+        max_nmr_len=model_cfg["max_nmr_length"],
+        pretokenize=data_cfg.get("pretokenize", True),
+        preload_ir=data_cfg.get("preload_ir", False),
+        use_disk_cache=data_cfg.get("use_disk_cache", True),
+        write_disk_cache=data_cfg.get("write_disk_cache", True),
+        cache_dir=data_cfg.get("cache_dir"),
+        ir_cache_mode=data_cfg.get("ir_cache_mode", "none"),
+        ir_cache_dtype=data_cfg.get("ir_cache_dtype", "float32"),
+        return_index=return_eval_index,
+    )
+    test_ds = SpectralSmilesDataset(
+        data_dir=str(tokenized_dir),
+        smiles_tokenizer=smiles_tokenizer,
+        spectral_tokenizer=nmr_tokenizer,
+        split="test",
+        max_smiles_len=model_cfg["max_seq_length"],
+        max_nmr_len=model_cfg["max_nmr_length"],
+        pretokenize=data_cfg.get("pretokenize", True),
+        preload_ir=data_cfg.get("preload_ir", False),
+        use_disk_cache=data_cfg.get("use_disk_cache", True),
+        write_disk_cache=data_cfg.get("write_disk_cache", True),
+        cache_dir=data_cfg.get("cache_dir"),
+        ir_cache_mode=data_cfg.get("ir_cache_mode", "none"),
+        ir_cache_dtype=data_cfg.get("ir_cache_dtype", "float32"),
+        return_index=return_eval_index,
+    )
 
-class LinearWarmupCosineDecay(torch.optim.lr_scheduler._LRScheduler):
-    """
-    Learning rate scheduler with linear warmup followed by either constant LR or cosine decay.
-    Linearly increases learning rate from 0 to max_lr over `warmup_steps`,
-    then either maintains constant LR or uses cosine decay from max_lr to min_lr.
-    """
-    def __init__(self, optimizer, warmup_steps, total_steps, decay_type='cosine', min_lr=0.0, last_epoch=-1, initial_step=0):
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.decay_type = decay_type
-        self.min_lr = min_lr
-        self.initial_step = initial_step  # Store the initial step offset
-        super().__init__(optimizer, last_epoch)
-
-    def get_lr(self):
-        # Calculate the absolute current step based on initial_step and scheduler's internal step counter
-        # self.last_epoch starts at -1, so the first step corresponds to last_epoch=0.
-        # Adding 1 aligns it with the notion of step 1, step 2, etc.
-        current_absolute_step = self.last_epoch + self.initial_step + 1
-
-        if current_absolute_step <= self.warmup_steps:
-            # Linear warmup based on absolute step
-            # Ensure we don't divide by zero if warmup_steps is 0
-            warmup_divisor = float(max(1, self.warmup_steps))
-            alpha = current_absolute_step / warmup_divisor
-            return [base_lr * alpha for base_lr in self.base_lrs]
-        else:
-            if self.decay_type == 'constant':
-                # Constant learning rate after warmup
-                return self.base_lrs
-            else:  # cosine decay
-                # Progress through the *decay phase* (from warmup_steps to total_steps)
-                # Use absolute step count relative to the start of the decay phase
-                steps_into_decay = current_absolute_step - self.warmup_steps
-                total_decay_steps = self.total_steps - self.warmup_steps
-
-                # Ensure total_decay_steps is at least 1 to avoid division by zero
-                progress = steps_into_decay / float(max(1, total_decay_steps))
-                progress = max(0.0, min(1.0, progress)) # Clamp progress to [0, 1]
-
-                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-                return [
-                    self.min_lr + (base_lr - self.min_lr) * cosine_decay
-                    for base_lr in self.base_lrs
-                ]
-
-
-# -------------------------------------------------------------------------
-# Dataset / DataLoader for Memory-Mapped Binary Files
-# -------------------------------------------------------------------------
-class SpectralSmilesDataset(Dataset):
-    """
-    A PyTorch Dataset that reads from tokenized text files and numpy arrays:
-      - src-{split}.txt  (source sequences with NMR data)
-      - tgt-{split}.txt  (target SMILES sequences) 
-      - ir-{split}.npy   (IR spectra data)
-    """
-    def __init__(
-        self, 
-        data_dir, 
-        smiles_tokenizer, 
-        spectral_tokenizer, 
-        split='train', 
-        max_smiles_len=512,  # Separate length limit for SMILES
-        max_nmr_len=128,      # Separate length limit for NMR
-        ir_as_prompt=False,   # NEW: flag to indicate IR should be processed as prompt tokens
-        ir_tokenizer=None     # NEW: IR vocabulary mapping for tokenization
-    ):
-        super().__init__()
-        self.data_dir = Path(data_dir)
-        self.smiles_tokenizer = smiles_tokenizer
-        self.spectral_tokenizer = spectral_tokenizer
-        self.max_smiles_len = max_smiles_len
-        self.max_nmr_len = max_nmr_len
-        self.split = split
-        self.ir_as_prompt = ir_as_prompt
-        self.ir_tokenizer = ir_tokenizer
-
-        # Load source (NMR) and target sequences
-        with open(self.data_dir / f"src-{split}.txt") as f:
-            self.sources = [line.strip() for line in f]
-        with open(self.data_dir / f"tgt-{split}.txt") as f:
-            # Remove spaces when loading SMILES sequences
-            self.targets = [line.strip().replace(" ", "") for line in f]
-
-        # Load IR data - either from pre-tokenized text file or memory-mapped binary
-        if self.ir_as_prompt:
-            # Load pre-tokenized IR data from text file
-            ir_text_path = self.data_dir.parent / "ir_processed" / f"ir-{split}.txt"
-            if not ir_text_path.exists():
-                raise FileNotFoundError(
-                    f"IR text file not found at {ir_text_path}. "
-                    "Please run build_ir_vocab.py first to generate tokenized IR data."
-                )
-            with open(ir_text_path) as f:
-                self.ir_sources = [line.strip() for line in f]
-            print(f"[Dataset] Loaded tokenized IR data from {ir_text_path}")
-            self.ir_data = None  # Not needed when using pre-tokenized data
-        else:
-            # Load raw IR data using memory-mapped binary
-            self.ir_sources = None
-            ir_path = self.data_dir / f"ir-{split}.npy"
-            self.ir_data = None
-            if ir_path.exists():
-                try:
-                    self.ir_data = np.memmap(
-                        ir_path,
-                        dtype='float32',
-                        mode='r',
-                        shape=None
-                    )
-                    array_shape = self.ir_data.shape
-                    if len(array_shape) == 1:
-                        num_samples = len(self.sources)
-                        feature_dim = array_shape[0] // num_samples
-                        self.ir_data = self.ir_data.reshape(num_samples, feature_dim)
-                    print(f"[Dataset] Loaded IR data with shape: {self.ir_data.shape}")
-                except Exception as e:
-                    print(f"[Warning] Failed to load IR data: {e}")
-                    self.ir_data = None
-
-        print(f"[Dataset] SpectralSmilesDataset initialized for {split}:")
-        print(f"          Found {len(self.sources)} samples")
-
-        # Add debug printing for NMR tokens
-        print(f"\n[Debug] Inspecting first 3 NMR sequences from {split} split:")
-        for i in range(min(3, len(self.sources))):
-            nmr_seq = self.sources[i]
-            nmr_tokens = nmr_seq.split()
-            print(f"\nSequence {i+1}:")
-            print("Raw tokens:", nmr_tokens[:10], "..." if len(nmr_tokens) > 10 else "")
-            print("Token IDs:", [spectral_tokenizer.get(token, spectral_tokenizer["<UNK>"]) for token in nmr_tokens[:10]], 
-                  "..." if len(nmr_tokens) > 10 else "")
-            print("Sequence length:", len(nmr_tokens))
-
-        # Add debug printing for SMILES sequences
-        print(f"\n[Debug] Inspecting first 3 SMILES sequences from {split} split:")
-        for i in range(min(3, len(self.targets))):
-            smiles_seq = self.targets[i]
-            print(f"\nSMILES {i+1}:")
-            print("Raw SMILES (before tokenization):", smiles_seq)
-            tokens = smiles_tokenizer.encode(
-                smiles_seq,
-                add_special_tokens=True,
-                max_length=max_smiles_len,
-                truncation=True
-            )
-            decoded = smiles_tokenizer.decode(tokens)
-            decoded_no_spaces = decoded.replace(" ", "")
-            print("Tokenized IDs:", tokens)
-            print("Decoded (space-separated tokens):", decoded)
-            print("Decoded (no spaces):", decoded_no_spaces)
-            print("Token count:", len(tokens))
-
-    def __len__(self):
-        return len(self.sources)
-
-    def __getitem__(self, idx):
-        """
-        Returns:
-          (target_tokens, (ir_data, None), nmr_tokens, None)
-        """
-        # Get target sequence (SMILES) - use SMILES tokenizer
-        target_seq = self.targets[idx]
-        target_tokens = self.smiles_tokenizer.encode(
-            target_seq,
-            add_special_tokens=True,
-            max_length=self.max_smiles_len,
-            truncation=True
+    if dist_ctx.is_main and data_cfg.get("use_disk_cache", True):
+        print(
+            "[data] token-cache "
+            f"train={'hit' if train_ds.token_cache_hit else 'miss'} "
+            f"val={'hit' if val_ds.token_cache_hit else 'miss'} "
+            f"test={'hit' if test_ds.token_cache_hit else 'miss'}"
         )
-        target_tokens = torch.tensor(target_tokens, dtype=torch.long)
-
-        # Get source sequence (NMR data) - use spectral tokenizer
-        source_seq = self.sources[idx]
-        # Split into tokens and convert to IDs using the spectral vocabulary
-        nmr_tokens = source_seq.split()
-        nmr_token_ids = [self.spectral_tokenizer.get(token, self.spectral_tokenizer["<UNK>"]) 
-                        for token in nmr_tokens]
-        if len(nmr_token_ids) > self.max_nmr_len:
-            nmr_token_ids = nmr_token_ids[:self.max_nmr_len]
-        nmr_tokens = torch.tensor(nmr_token_ids, dtype=torch.long)
-
-        # Get IR data - either from pre-tokenized text or raw data
-        ir_data = None
-        if self.ir_as_prompt and self.ir_sources is not None:
-            # Use pre-tokenized IR data
-            ir_seq = self.ir_sources[idx]
-            ir_tokens = ir_seq.split()
-            ir_token_ids = [self.ir_tokenizer.get(token, self.ir_tokenizer["<UNK>"]) 
-                          for token in ir_tokens]
-            ir_data = torch.tensor(ir_token_ids, dtype=torch.long)
-        elif self.ir_data is not None:
-            # Use raw IR data
-            ir_data = torch.tensor(self.ir_data[idx].copy(), dtype=torch.float32)
-
-        return (
-            target_tokens,
-            (ir_data, None),
-            nmr_tokens,
-            None
+    if dist_ctx.is_main and data_cfg.get("ir_cache_mode", "none") == "pt":
+        print(
+            "[data] ir-cache "
+            f"train={'hit' if train_ds.ir_cache_hit else 'miss'} "
+            f"val={'hit' if val_ds.ir_cache_hit else 'miss'} "
+            f"test={'hit' if test_ds.ir_cache_hit else 'miss'} "
+            f"dtype={data_cfg.get('ir_cache_dtype', 'float32')}"
         )
 
-    # Add cleanup method to properly close memmap file
-    def __del__(self):
-        if hasattr(self, 'ir_data') and self.ir_data is not None:
-            del self.ir_data
-
-
-# -------------------------------------------------------------------------
-# Collate Function
-# -------------------------------------------------------------------------
-def collate_fn(batch, spectral_tokenizer):
-    """
-    Custom collate function that handles:
-    - Padding target tokens (SMILES)
-    - Padding NMR tokens
-    - Stacking IR data
-    """
-    target_tokens, ir_tuples, nmr_tokens, _ = zip(*batch)
-
-    # Pad target tokens (SMILES)
-    max_target_len = max(len(seq) for seq in target_tokens)
-    padded_target_tokens = []
-    for seq in target_tokens:
-        pad_amount = max_target_len - len(seq)
-        if pad_amount > 0:
-            pad_tensor = torch.full((pad_amount,), tokenizer.pad_token_id, dtype=torch.long)
-            seq = torch.cat([seq, pad_tensor], dim=0)
-        padded_target_tokens.append(seq)
-    target_batch = torch.stack(padded_target_tokens, dim=0)
-
-    # Pad NMR tokens
-    max_nmr_len = max(len(seq) for seq in nmr_tokens)
-    padded_nmr_tokens = []
-    for seq in nmr_tokens:
-        pad_amount = max_nmr_len - len(seq)
-        if pad_amount > 0:
-            pad_tensor = torch.full((pad_amount,), spectral_tokenizer["<PAD>"], dtype=torch.long)
-            seq = torch.cat([seq, pad_tensor], dim=0)
-        padded_nmr_tokens.append(seq)
-    nmr_batch = torch.stack(padded_nmr_tokens, dim=0)
-
-    # Stack IR data if available
-    ir_batch = None
-    if ir_tuples[0] is not None:
-        # Extract just the IR tensors from the tuples (first element)
-        ir_tensors = [t[0] for t in ir_tuples if t[0] is not None]
-        if ir_tensors:
-            ir_batch = torch.stack(ir_tensors, dim=0)
-
-    return target_batch, ir_batch, nmr_batch, None
-
-
-def load_vocabularies(config):
-    """Load both SMILES and NMR vocabularies and return their sizes"""
-    # Load NMR vocabulary
-    nmr_vocab_path = Path(config['data']['tokenized_dir']).parent / "vocab.json"
-    if not nmr_vocab_path.exists():
-        raise FileNotFoundError(f"NMR vocabulary not found at {nmr_vocab_path}")
-
-    with open(nmr_vocab_path) as f:
-        nmr_tokenizer = json.load(f)
-    
-    # Check the actual range of token IDs
-    token_ids = list(nmr_tokenizer.values())
-    min_id = min(token_ids)
-    max_id = max(token_ids)
-    nmr_vocab_size = max_id + 1  # Adjust vocab size to accommodate highest token ID
-    
-    print(f"[Vocab] Loaded NMR vocabulary with {len(nmr_tokenizer)} tokens")
-    print(f"[Vocab] NMR token ID range: [{min_id}, {max_id}]")
-    print(f"[Vocab] Setting NMR vocab size to: {nmr_vocab_size}")
-
-    # SMILES vocabulary size comes from the tokenizer
-    smiles_vocab_size = len(tokenizer)
-    print(f"[Vocab] SMILES vocabulary has {smiles_vocab_size} tokens")
-
-    return smiles_vocab_size, nmr_vocab_size, nmr_tokenizer
-
-
-def create_data_loaders(smiles_tokenizer, nmr_tokenizer, config):
-    print("\n[DataLoader] Creating data loaders...")
-
-    # Load IR tokenizer if IR as prompt is enabled
-    ir_tokenizer = None
-    ir_vocab_size = None
-    if config['data'].get('ir_as_prompt', False):
-        ir_vocab_path = config['data'].get('ir_tokenizer_path')
-        if not ir_vocab_path:
-            raise ValueError("IR as prompt is enabled but 'ir_tokenizer_path' is not provided in config.")
-        with open(ir_vocab_path, 'r') as f:
-            ir_tokenizer = json.load(f)
-            ir_vocab_size = len(ir_tokenizer)  # Get vocabulary size for model initialization
-
-    # Create a collate function with the spectral tokenizer
-    collate_with_tokenizer = lambda batch: collate_fn(batch, nmr_tokenizer)
-
-    # Create datasets for each split with separate length limits, passing the new IR prompt parameters
-    train_dataset = SpectralSmilesDataset(
-        data_dir=config['data']['tokenized_dir'],
-        smiles_tokenizer=smiles_tokenizer,
-        spectral_tokenizer=nmr_tokenizer,
-        split='train',
-        max_smiles_len=config['model']['max_seq_length'],
-        max_nmr_len=config['model']['max_nmr_length'],
-        ir_as_prompt=config['data'].get('ir_as_prompt', False),
-        ir_tokenizer=ir_tokenizer
+    collate = lambda b: collate_spectral_smiles(  # noqa: E731
+        b,
+        smiles_pad_token_id=smiles_tokenizer.pad_token_id,
+        nmr_pad_token_id=nmr_tokenizer["<PAD>"],
     )
 
-    val_dataset = SpectralSmilesDataset(
-        data_dir=config['data']['tokenized_dir'],
-        smiles_tokenizer=smiles_tokenizer,
-        spectral_tokenizer=nmr_tokenizer,
-        split='val',
-        max_smiles_len=config['model']['max_seq_length'],
-        max_nmr_len=config['model']['max_nmr_length'],
-        ir_as_prompt=config['data'].get('ir_as_prompt', False),
-        ir_tokenizer=ir_tokenizer
-    )
-
-    test_dataset = SpectralSmilesDataset(
-        data_dir=config['data']['tokenized_dir'],
-        smiles_tokenizer=smiles_tokenizer,
-        spectral_tokenizer=nmr_tokenizer,
-        split='test',
-        max_smiles_len=config['model']['max_seq_length'],
-        max_nmr_len=config['model']['max_nmr_length'],
-        ir_as_prompt=config['data'].get('ir_as_prompt', False),
-        ir_tokenizer=ir_tokenizer
-    )
-
-    print(f"[DataLoader] Dataset sizes:")
-    print(f"          Train: {len(train_dataset)}")
-    print(f"          Val: {len(val_dataset)}")
-    print(f"          Test: {len(test_dataset)}")
-
-    # Create distributed samplers if running in distributed mode
     train_sampler = None
     val_sampler = None
     test_sampler = None
-    if torch.distributed.is_initialized():
-        train_sampler = DistributedSampler(train_dataset)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False)
-        test_sampler = DistributedSampler(test_dataset, shuffle=False)
+    if dist_ctx.enabled:
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=dist_ctx.world_size,
+            rank=dist_ctx.rank,
+            shuffle=True,
+            drop_last=bool(train_cfg.get("drop_last", True)),
+        )
+        val_sampler = DistributedSampler(
+            val_ds,
+            num_replicas=dist_ctx.world_size,
+            rank=dist_ctx.rank,
+            shuffle=False,
+            drop_last=False,
+        )
+        test_sampler = DistributedSampler(
+            test_ds,
+            num_replicas=dist_ctx.world_size,
+            rank=dist_ctx.rank,
+            shuffle=False,
+            drop_last=False,
+        )
 
-    # Create data loaders with the wrapped collate function
+    num_workers = int(train_cfg.get("num_workers", 0))
+    pin_memory = bool(train_cfg.get("pin_memory", device.type == "cuda"))
+    persistent_workers = bool(train_cfg.get("persistent_workers", num_workers > 0)) and num_workers > 0
+    prefetch_factor = int(train_cfg.get("prefetch_factor", 2))
+
+    common_loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+        "collate_fn": collate,
+    }
+    if num_workers > 0:
+        common_loader_kwargs["prefetch_factor"] = prefetch_factor
+
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=(train_sampler is None),  # Only shuffle if not using distributed sampler
-        num_workers=config['data'].get('num_workers', 0),
-        collate_fn=collate_with_tokenizer,
-        sampler=train_sampler
+        train_ds,
+        batch_size=train_cfg["batch_size"],
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        drop_last=bool(train_cfg.get("drop_last", True)),
+        **common_loader_kwargs,
     )
-
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['training']['batch_size'],
+        val_ds,
+        batch_size=train_cfg.get("test_batch_size", train_cfg["batch_size"]),
         shuffle=False,
-        num_workers=config['data'].get('num_workers', 0),
-        collate_fn=collate_with_tokenizer,
-        sampler=val_sampler
+        sampler=val_sampler,
+        drop_last=False,
+        **common_loader_kwargs,
     )
-
     test_loader = DataLoader(
-        test_dataset,
-        batch_size=config['training'].get('test_batch_size', 1),
+        test_ds,
+        batch_size=train_cfg.get("test_batch_size", train_cfg["batch_size"]),
         shuffle=False,
-        num_workers=config['data'].get('num_workers', 0),
-        collate_fn=collate_with_tokenizer,
-        sampler=test_sampler
+        sampler=test_sampler,
+        drop_last=False,
+        **common_loader_kwargs,
     )
-
     return train_loader, val_loader, test_loader
 
 
-# -------------------------------------------------------------------------
-# Config, Arg Parsing, etc.
-# -------------------------------------------------------------------------
-def load_config(config_path=None):
-    """Load config from yaml file, falling back to defaults if not specified"""
-    default_config = {
-        'model': {
-            'max_seq_length': 512,      # Max SMILES sequence length
-            'max_nmr_length': 128,      # Max NMR sequence length
-            'max_memory_length': 128,   # Max memory/IR sequence length
-            'embed_dim': 768,
-            'num_heads': 8,
-            'num_layers': 6,
-            'dropout': 0.1,
-            'resample_size': 1000,
-            'use_concat': True,
-            'use_stablemax': False,
-            'ir_encoder_type': 'regular',
-            'max_loops': 1,
-            'loop_range': [0, 5],  # Range for uniform sampling of loop count during training
-            'automatic_loop_exit': False, # Add new flag
-            'automatic_loop_exit_threshold': 0.01, # Add threshold
-            'use_loop_concat': True, # Add new flag for loop concatenation
-            'use_rmsnorm': False # Add use_rmsnorm flag
-        },
-        'training': {
-            'batch_size': 32,
-            'test_batch_size': 1,
-            'num_epochs': 1,
-            'learning_rate': 1.0e-4,
-            'min_learning_rate': 1.0e-6,
-            'validation_frequency': 500,
-            'logging_frequency': 100,
-            'save_frequency': 1000,
-            'generate_during_training': False,
-            'save_local': False,
-            'greedy_decode_frequency': 1000,
-            'weight_decay': 0.01,
-            'use_torch_compile': False # Add flag for torch compile
-        },
-        'scheduler': {
-            'type': 'constant',  # or 'cosine'
-            'warmup_steps': 100
-        },
-        'data': {
-            'tokenized_dir': "tokenized_baseline/data",  # Path to tokenized data
-            'num_workers': 0
-        },
-        'wandb': {
-            'project': "smiles-generation",
-            'base_run_name': "smiles_gen",
-            'log_examples': True
-        },
-        'optimizer': {
-            'type': 'adamw',  # Options: 'adamw', 'ortho_adamw', 'muon_mix'
-            'adamw': {
-                'betas': (0.9, 0.999),
-                'eps': 1e-8,
-                'weight_decay': 0.1,
-                'caution': False
-            },
-            'foreachadopt': {
-                'caution': True
-            },
-            'ortho': {
-                'eps': 1e-30,
-                'rescale': True
-            },
-            'foreachmuon': {
-                'betas': (0.9, 0.99),
-                'eps': 1e-8,
-                'weight_decay': 0.01,
-                'warmup_steps': 0,
-                'beta2_scale': 0.8,
-                'nesterov': True,
-                'mars': False,
-                'mars_gamma': 0.0025,
-                'caution': False
-            },
-            'muon': {
-                'lr': 0.02,
-                'weight_decay': 0.01,
-                'momentum': 0.95,
-                'nesterov': True,
-                'ns_steps': 5
-            }
-        }
-    }
+@torch.no_grad()
+def evaluate_loss(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    pad_token_id: int,
+    nmr_pad_token_id: int,
+    device: torch.device,
+    precision: str,
+    dist_ctx: DistContext,
+) -> float:
+    model.eval()
+    total = 0.0
+    count = 0.0
+    non_blocking = device.type == "cuda"
 
-    if config_path:
-        with open(config_path, 'r') as f:
-            custom_config = yaml.safe_load(f)
-            def update_dict(d, u):
-                for k, v in u.items():
-                    if isinstance(v, dict):
-                        d[k] = update_dict(d.get(k, {}), v)
-                    else:
-                        d[k] = v
-                return d
-            update_dict(default_config, custom_config)
+    for target_tokens, ir_data, nmr_tokens in loader:
+        target_tokens = target_tokens.to(device, non_blocking=non_blocking)
+        nmr_tokens = nmr_tokens.to(device, non_blocking=non_blocking)
+        if ir_data is not None:
+            ir_data = ir_data.to(device, non_blocking=non_blocking)
 
-    return default_config
+        with _autocast_context(device, precision):
+            decoder_input = target_tokens[:, :-1]
+            logits = model(
+                nmr_tokens=nmr_tokens,
+                ir_data=ir_data,
+                target_seq=decoder_input,
+                target_padding_mask=(decoder_input == pad_token_id),
+                nmr_padding_mask=(nmr_tokens == nmr_pad_token_id),
+            )
+            loss = compute_next_token_loss(logits, target_tokens, pad_token_id)
+        total += float(loss.item())
+        count += 1.0
+
+    global_total, global_count = _reduce_pair(total, count, device, dist_ctx)
+    return global_total / max(global_count, 1.0)
 
 
-# Helper function to update config dict from command-line args
-def update_config_from_args(config, overrides):
-    """
-    Updates the config dictionary with overrides from the command line.
-    Overrides are expected in the format 'key1.key2.key3=value'.
-    Attempts to convert value to the type of the existing config value.
-    """
-    print("[Config] Applying command-line overrides...")
-    for arg in overrides:
-        if '=' not in arg:
-            print(f"  [Warning] Skipping invalid override format (missing '='): {arg}")
-            continue
-
-        key_str, value_str = arg.split('=', 1)
-        keys = key_str.split('.')
-        
-        # Traverse the config dict
-        d = config
-        valid_key = True
-        for i, key in enumerate(keys[:-1]):
-            if isinstance(d, dict) and key in d:
-                d = d[key]
-            else:
-                print(f"  [Warning] Invalid key path in override: {key_str}")
-                valid_key = False
-                break
-        
-        if not valid_key:
-            continue
-
-        # Update the value
-        final_key = keys[-1]
-        if isinstance(d, dict) and final_key in d:
-            target_type = type(d[final_key])
-            original_value = d[final_key]
-            try:
-                # Attempt type conversion
-                if target_type == bool:
-                    converted_value = value_str.lower() in ['true', '1', 'yes']
-                elif target_type == list:
-                    # Handle list conversion (assuming comma-separated or simple JSON-like list)
-                    try:
-                        import json
-                        converted_value = json.loads(value_str)
-                        if not isinstance(converted_value, list):
-                             raise ValueError("Parsed value is not a list")
-                    except (json.JSONDecodeError, ValueError):
-                        # Fallback for simple comma-separated strings if JSON fails
-                        converted_value = [item.strip() for item in value_str.split(',')]
-                    # Attempt to convert list elements if original list had consistent types
-                    if original_value and all(isinstance(x, type(original_value[0])) for x in original_value):
-                         elem_type = type(original_value[0])
-                         converted_value = [elem_type(item) for item in converted_value]
-
-                else:
-                    converted_value = target_type(value_str)
-                
-                d[final_key] = converted_value
-                print(f"  Overriding: {key_str} = {converted_value} (was {original_value})")
-            except ValueError as e:
-                print(f"  [Warning] Could not convert override value '{value_str}' for key '{key_str}' to type {target_type}. Error: {e}")
-            except Exception as e:
-                 print(f"  [Warning] Error applying override for key '{key_str}'. Error: {e}")
-        elif isinstance(d, dict):
-             # Key doesn't exist, try to infer type (basic inference)
-            try:
-                if value_str.lower() in ['true', 'false']:
-                    d[final_key] = value_str.lower() == 'true'
-                    print(f"  Adding new boolean key: {key_str} = {d[final_key]}")
-                elif value_str.startswith('[') and value_str.endswith(']'):
-                     # Basic list inference
-                    try:
-                        import json
-                        d[final_key] = json.loads(value_str)
-                        print(f"  Adding new list key: {key_str} = {d[final_key]}")
-                    except json.JSONDecodeError:
-                         # Fallback: treat as comma-separated string list
-                         items = value_str[1:-1].split(',')
-                         d[final_key] = [item.strip() for item in items]
-                         print(f"  Adding new string list key (fallback): {key_str} = {d[final_key]}")
-
-                elif '.' in value_str or 'e' in value_str.lower():
-                    d[final_key] = float(value_str)
-                    print(f"  Adding new float key: {key_str} = {d[final_key]}")
-                elif value_str.isdigit() or (value_str.startswith('-') and value_str[1:].isdigit()):
-                    d[final_key] = int(value_str)
-                    print(f"  Adding new integer key: {key_str} = {d[final_key]}")
-                else:
-                    d[final_key] = value_str # Assume string
-                    print(f"  Adding new string key: {key_str} = {d[final_key]}")
-            except ValueError:
-                 d[final_key] = value_str # Fallback to string
-                 print(f"  [Warning] Could not infer type for new key '{key_str}', setting as string: {value_str}")
-        else:
-             print(f"  [Warning] Cannot set key '{final_key}' on non-dictionary element for path: {key_str}")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Train SMILES generation model', add_help=False) # Disable default help to handle overrides cleanly
-    
-    # Known arguments
-    parser.add_argument('--config', type=str, help='Path to config file')
-    parser.add_argument('--block-ir', action='store_true', help='Block IR signals in the model inputs')
-    parser.add_argument('--block-nmr', action='store_true', help='Block NMR signals in the model inputs')
-    parser.add_argument('--use-torch-compile', action='store_true', help='Enable torch.compile for the model') # Add argument
-    
-    # Add help argument manually
-    parser.add_argument('-h', '--help', action='help', default=argparse.SUPPRESS,
-                        help='Show this help message and exit. Use key.subkey=value for config overrides.')
-
-    # Parse known args first, remainder will be overrides
-    args, unknown_args = parser.parse_known_args()
-    
-    # Attach unknown_args (overrides) to the args object for later processing
-    args.overrides = unknown_args
-    
-    return args
-
-
-def cleanup_wandb_cache():
-    """Clean up wandb cache to prevent disk space issues"""
-    try:
-        # Clean files older than 24 hours and don't include online runs
-        subprocess.run(['wandb', 'sync', '--clean-old-hours', '24', '--no-include-online'], 
-                      capture_output=True, text=True)
-        # Clean artifact cache over 5GB
-        subprocess.run(['wandb', 'artifact', 'cache', 'cleanup', '1GB'],
-                      capture_output=True, text=True)
-        print("[wandb] Cache cleaned successfully")
-    except Exception as e:
-        print(f"[wandb] Cache cleanup failed: {e}")
-
-
-# -------------------------------------------------------------------------
-# Main Training Script
-# -------------------------------------------------------------------------
-def main():
-    print("\n[Main] Starting training script...")
-    args = parse_args()
-    block_ir = args.block_ir
-    block_nmr = args.block_nmr
-
-    # Initialize distributed training if running with torchrun
-    rank = 0
-    world_size = 1
-    if "LOCAL_RANK" in os.environ:
-        print("[Main] Detected distributed environment (torchrun)")
-        
-        local_rank = int(os.environ["LOCAL_RANK"])
-        rank = int(os.environ.get("RANK", local_rank))
-        world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
-        
-        # Set device before initializing process group
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-        
-        # Initialize process group with nccl backend (better for GPU communication)
-        torch.distributed.init_process_group(
-            backend="nccl",  # Use NCCL for best GPU performance
-            init_method="env://"
-        )
-        
-        print(f"[Main] Process rank: {rank}, world size: {world_size}")
-        
-        # Print GPU topology information on rank 0
-        if rank == 0:
-            print("\n[Main] GPU Topology:")
-            try:
-                topo = subprocess.check_output(['nvidia-smi', 'topo', '-m']).decode()
-                print(topo)
-            except Exception as e:
-                print(f"Could not get GPU topology: {e}")
+def _build_model(cfg: Dict, smiles_tokenizer: SmilesTokenizer, nmr_tokenizer: Dict[str, int], device: torch.device):
+    architecture = str(cfg["model"].get("architecture", "cross_attention")).lower()
+    if architecture == "cross_attention":
+        model_cls = MultiModalToSMILESModel
+    elif architecture == "prefix":
+        model_cls = MultiModalPrefixToSMILESModel
     else:
-        print("[Main] Running in non-distributed mode")
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-    # Helper function for wandb logging that only logs on rank 0
-    def log_wandb(metrics, step=None):
-        if rank == 0 and wandb.run is not None:
-            wandb.log(metrics, step=step)
+        raise ValueError(f"Unsupported AR architecture: {architecture}")
 
-    print("[Main] Loading configuration...")
-    config = load_config(args.config)
-    # Apply command-line overrides AFTER loading the base config
-    if args.overrides:
-        update_config_from_args(config, args.overrides)
-    print("[Main] Configuration loaded and overrides applied.")
-    # Optionally print the final config for verification (can be verbose)
-    # if rank == 0: 
-    #     print("[Main] Final Configuration:")
-    #     pprint(config)
-
-    # Clean wandb cache before starting
-    print("\n[Main] Cleaning wandb cache...")
-    cleanup_wandb_cache()
-
-    # Variable to store loaded checkpoint for restoring optimizer state later
-    loaded_checkpoint = None
-    global_step = 0
-
-    # Load vocabularies first
-    print("\n[Main] Loading vocabularies...")
-    smiles_vocab_size, nmr_vocab_size, nmr_tokenizer = load_vocabularies(config)
-
-    print("\n[Main] Setting up device...")
-    if torch.cuda.is_available():
-        print(f"[Main] Found {torch.cuda.device_count()} CUDA devices.")
-        for i in range(torch.cuda.device_count()):
-            print(f"  - {torch.cuda.get_device_name(i)}")
-    else:
-        print("[Main] No CUDA devices found, using CPU.")
-    print(f"[Main] Using device: {device}")
-
-    print("\n[Main] Initializing model...")
-    ir_vocab_size = None
-    if config['data'].get('ir_as_prompt', False):
-        ir_vocab_path = config['data'].get('ir_tokenizer_path')
-        if not ir_vocab_path:
-            raise ValueError("IR as prompt is enabled but 'ir_tokenizer_path' is not provided in config.")
-        with open(ir_vocab_path, 'r') as f:
-            ir_vocab = json.load(f)
-            ir_vocab_size = len(ir_vocab)
-    model = MultiModalToSMILESModel(
-        smiles_vocab_size=smiles_vocab_size,
-        nmr_vocab_size=nmr_vocab_size,
-        max_seq_length=config['model']['max_seq_length'],
-        max_nmr_length=config['model']['max_nmr_length'],
-        max_memory_length=config['model']['max_memory_length'],
-        embed_dim=config['model']['embed_dim'],
-        num_heads=config['model']['num_heads'],
-        num_layers=config['model']['num_layers'],
-        dropout=config['model']['dropout'],
+    model = model_cls(
+        smiles_vocab_size=len(smiles_tokenizer),
+        nmr_vocab_size=max(nmr_tokenizer.values()) + 1,
+        max_seq_length=cfg["model"]["max_seq_length"],
+        max_nmr_length=cfg["model"]["max_nmr_length"],
+        max_memory_length=cfg["model"]["max_memory_length"],
+        embed_dim=cfg["model"]["embed_dim"],
+        num_heads=cfg["model"]["num_heads"],
+        num_layers=cfg["model"]["num_layers"],
+        dropout=cfg["model"]["dropout"],
         verbose=False,
-        use_stablemax=config['model'].get('use_stablemax', False),
-        ir_encoder_type=config['model'].get('ir_encoder_type', 'regular'),
-        ir_as_prompt=config['data'].get('ir_as_prompt', False),
-        ir_vocab_size=ir_vocab_size,
-        max_loops=max(config['model'].get('max_loops', 1), max(config['model'].get('loop_range', [0, 1]))),
-        loops_representation=config['model'].get('loops_representation', False),
-        automatic_loop_exit=config['model'].get('automatic_loop_exit', False), # Pass flag
-        automatic_loop_exit_threshold=config['model'].get('automatic_loop_exit_threshold', 0.01), # Pass threshold
-        use_loop_concat=config['model'].get('use_loop_concat', True), # Pass loop concat flag
-        use_rmsnorm=config['model'].get('use_rmsnorm', False) # Pass use_rmsnorm flag
-    )
-    
-    # Set precision for training based on configuration
-    precision = config['training'].get('precision', 'fp32')
-    print(f"[Main] Using {precision} precision for training")
-    
-    # Load checkpoint if specified in config
-    if 'checkpoint' in config and 'load_path' in config['checkpoint'] and config['checkpoint']['load_path']:
-        checkpoint_path = config['checkpoint']['load_path']
-        print(f"\n[Main] Loading checkpoint from {checkpoint_path}...")
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"[Main] Successfully loaded model from checkpoint at epoch {checkpoint['epoch']}, step {checkpoint['global_step']}")
-            
-            # Record the best validation loss from the checkpoint
-            best_val_loss = checkpoint.get('val_loss', float('inf'))
-            print(f"[Main] Checkpoint validation loss: {best_val_loss:.4f}")
-            
-            # Save global_step from checkpoint if available
-            if 'global_step' in checkpoint:
-                global_step = checkpoint['global_step']
-                print(f"[Main] Resuming from global step: {global_step}")
-            
-            # Store checkpoint for optimizer state restoration later
-            loaded_checkpoint = checkpoint
-        except Exception as e:
-            print(f"[Main] Error loading checkpoint: {e}")
-    
-    if precision == 'fp16' and torch.cuda.is_available():
-        print("[Main] Enabling automatic mixed precision (AMP) for FP16 training")
-        # Do NOT convert model to half precision - this causes issues with GradScaler
-        # The autocast context manager will handle precision conversion during forward pass
-    elif precision == 'bf16' and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        print("[Main] Enabling bfloat16 precision for training")
-        # For bf16, we can use either approach. We'll use autocast for consistency.
-    else:
-        # Default to fp32
-        if precision != 'fp32':
-            print(f"[Main] Warning: Requested precision {precision} not supported. Using fp32 instead.")
-        print("[Main] Using default full (FP32) precision")
-    
-    # Move model to device (always in default precision)
-    model = model.to(device)
-    
-    # Compile the model for potential performance boost if enabled in config
-    if config['training'].get('use_torch_compile', False):
-        print("[Main] Compiling the model...")
-        try:
-            model = torch.compile(model) # Add compilation step
-            print("[Main] Model compilation complete.")
-        except Exception as e:
-            print(f"[Main] Model compilation failed: {e}")
-    else:
-        print("[Main] Skipping torch.compile based on configuration.")
+        use_stablemax=cfg["model"].get("use_stablemax", False),
+        ir_encoder_type=cfg["model"].get("ir_encoder_type", "regular"),
+        ir_as_prompt=cfg["model"].get("ir_as_prompt", False),
+        use_rmsnorm=cfg["model"].get("use_rmsnorm", False),
+    ).to(device)
+    return model
 
-    # Do NOT wrap model with DDP - we'll handle gradient synchronization manually
-    # if torch.distributed.is_initialized():
-    #     model = DDP(model, device_ids=[rank], output_device=rank)
 
-    print("\n[Main] Creating data loaders...")
-    train_loader, val_loader, test_loader = create_data_loaders(
-        smiles_tokenizer=tokenizer,
-        nmr_tokenizer=nmr_tokenizer,  # Pass the loaded tokenizer
-        config=config
-    )
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Lean autoregressive pretraining (DDP-ready)")
+    parser.add_argument("--config", type=str, default=None, help="Path to yaml config")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Optional checkpoint to resume from")
+    args = parser.parse_args()
 
-    print("\n[Main] Initializing wandb...")
-    run_name = (
-        f"{config['wandb']['base_run_name']}_"
-        f"d{config['model']['embed_dim']}_"
-        f"h{config['model']['num_heads']}_"
-        f"l{config['model']['num_layers']}_"
-        f"bs{config['training']['batch_size']}_"
-        f"lr{config['training']['learning_rate']}_"
-        f"warm{config['scheduler']['warmup_steps']}_"
-        f"{datetime.now().strftime('%m%d_%H%M')}"
-    )
+    cfg = load_config(args.config)
+    training_cfg = cfg["training"]
+    requested_device_name = str(training_cfg.get("device", "cpu")).lower()
+    dist_ctx = DistContext(enabled=False)
 
-    # Only initialize wandb on the main process (rank 0) in distributed mode
-    if rank == 0:
-        wandb.init(
-            project=config['wandb']['project'],
-            name=run_name,
-            config=config
-        )
-        
-        print("[Main] Calculating model size...")
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        param_size_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 * 1024)
+    try:
+        dist_ctx = _infer_dist_context(training_cfg, requested_device_name)
 
-        wandb.run.summary.update({
-            "total_parameters": total_params,
-            "trainable_parameters": trainable_params,
-            "model_size_mb": param_size_mb
-        })
-        print(f"[Main] Total parameters: {total_params:,}")
-        print(f"[Main] Trainable parameters: {trainable_params:,}")
-        print(f"[Main] Model size: {param_size_mb:.2f} MB")
-
-    print("\n[Main] Setting up training components...")
-    criterion = nn.CrossEntropyLoss(
-        ignore_index=tokenizer.pad_token_id
-    )
-
-    # Initialize optimizer based on config
-    optimizer_type = config.get('optimizer', {}).get('type', 'adamw')
-    
-
-    if optimizer_type == 'muon_mix':
-        # Directly use the approach from the Muon repository
-        # Filter parameters by dimensionality
-        matrix_params = [p for p in model.parameters() if p.ndim >= 2]
-        vector_params = [p for p in model.parameters() if p.ndim < 2]
-        
-        # Print parameter counts for each optimizer
-        matrix_param_count = sum(p.numel() for p in matrix_params)
-        vector_param_count = sum(p.numel() for p in vector_params)
-        total_params = matrix_param_count + vector_param_count
-        
-        print(f"[Optimizer] Parameter distribution:")
-        print(f"  - Muon (≥2D): {matrix_param_count:,} parameters ({matrix_param_count/total_params:.1%})")
-        print(f"  - AdamW (<2D): {vector_param_count:,} parameters ({vector_param_count/total_params:.1%})")
-        
-        # Get distributed training info from torch.distributed if available
-        if torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-            world_size = torch.distributed.get_world_size()
+        if requested_device_name == "cuda":
+            cuda_index = dist_ctx.local_rank if dist_ctx.enabled else 0
+            device = torch.device(f"cuda:{cuda_index}")
+        elif requested_device_name == "cpu":
+            device = torch.device("cpu")
+        elif requested_device_name == "mps":
+            if dist_ctx.enabled:
+                raise RuntimeError("MPS DDP is not supported in this trainer. Use CUDA + NCCL for multi-GPU.")
+            device = torch.device("mps")
         else:
-            rank = 0
-            world_size = 1
-            
-        # Create separate optimizers in a list
-        muon_opt = Muon(
-            matrix_params,
-            lr=config['optimizer'].get('muon', {}).get('lr', 0.02),
-            weight_decay=config['training']['weight_decay'],
-            momentum=config['optimizer'].get('muon', {}).get('momentum', 0.95),
-            nesterov=config['optimizer'].get('muon', {}).get('nesterov', True),
-            ns_steps=config['optimizer'].get('muon', {}).get('ns_steps', 5),
-            rank=rank,
-            world_size=world_size
-        ) if matrix_params else None
-        
-        adamw_opt = optim.AdamW(
-            vector_params,
-            lr=config['training']['learning_rate'],
-            betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
-            eps=config['optimizer']['adamw'].get('eps', 1e-8),
-            weight_decay=config['training']['weight_decay']
-        ) if vector_params else None
-        
-        # Create list of optimizers (filtering out None)
-        optimizers = [opt for opt in [muon_opt, adamw_opt] if opt is not None]
-        
-        # For scheduler compatibility, we'll use the first optimizer
-        # The learning rate scheduler will only apply to this optimizer
-        optimizer = optimizers[0] if optimizers else None
-        
-        # Debug: print learning rates for optimizers
-        if muon_opt is not None:
-            for i, group in enumerate(muon_opt.param_groups):
-                print(f"[Muon Optimizer] Group {i} lr: {group['lr']}")
-        if adamw_opt is not None:
-            for i, group in enumerate(adamw_opt.param_groups):
-                print(f"[AdamW Optimizer] Group {i} lr: {group['lr']}")
-    elif optimizer_type == 'ortho_adamw':
-        # Use our orthogonal gradient wrapper with AdamW
-        # Separate base optimizer args from ortho args
-        base_args = {
-            'lr': config['training']['learning_rate'],
-            'betas': config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
-            'weight_decay': config['training']['weight_decay']  # Use weight decay from training config
-        }
-        # Only pass eps to base optimizer if not using ortho's eps
-        if not config['optimizer'].get('ortho', {}).get('eps'):
-            base_args['eps'] = config['optimizer']['adamw'].get('eps', 1e-8)
-            
-        # Create optimizer with proper parameter separation
-        optimizer = OrthoGrad(
-            model.parameters(),
-            base_optimizer_cls=optim.AdamW,
-            eps=config['optimizer']['ortho'].get('eps', 1e-30),
-            rescale=config['optimizer']['ortho'].get('rescale', True),
-            **base_args
+            raise ValueError(f"Unsupported device '{requested_device_name}'.")
+
+        _set_perf_flags(training_cfg)
+        base_seed = int(training_cfg.get("seed", 1337))
+        _seed_everything(base_seed + dist_ctx.rank)
+
+        tokenized_dir = Path(cfg["data"]["tokenized_dir"])
+        if not tokenized_dir.exists():
+            raise FileNotFoundError(f"Tokenized directory not found: {tokenized_dir}")
+
+        if dist_ctx.is_main:
+            print(
+                f"[setup] device={device} tokenized_dir={tokenized_dir} "
+                f"ddp={dist_ctx.enabled} world_size={dist_ctx.world_size}"
+            )
+
+        smiles_vocab_path = Path(__file__).with_name("vocab.txt")
+        smiles_tokenizer = SmilesTokenizer(vocab_file=str(smiles_vocab_path))
+        nmr_tokenizer = load_nmr_tokenizer(tokenized_dir)
+        nmr_pad_token_id = int(nmr_tokenizer.get("<PAD>", 0))
+        train_loader, val_loader, test_loader = create_loaders(
+            tokenized_dir,
+            smiles_tokenizer,
+            nmr_tokenizer,
+            cfg,
+            dist_ctx=dist_ctx,
+            device=device,
         )
-        optimizers = [optimizer]
-    else:  # Default to AdamW
-        # Remove heavyball.AdamW variant and caution check
-        optimizer = optim.AdamW(
+
+        model = _build_model(cfg, smiles_tokenizer, nmr_tokenizer, device)
+        parameter_count = int(sum(p.numel() for p in model.parameters()))
+        run_started_at_utc = datetime.now(timezone.utc).isoformat()
+
+        compile_enabled = bool(training_cfg.get("compile", False))
+        if compile_enabled:
+            if hasattr(torch, "compile"):
+                model = torch.compile(
+                    model,
+                    mode=str(training_cfg.get("compile_mode", "max-autotune")),
+                    dynamic=bool(training_cfg.get("compile_dynamic", False)),
+                    fullgraph=bool(training_cfg.get("compile_fullgraph", False)),
+                )
+                if dist_ctx.is_main:
+                    print("[setup] torch.compile enabled")
+            elif dist_ctx.is_main:
+                print("[setup] torch.compile requested but unavailable on this PyTorch build; continuing without compile.")
+
+        optimizer = torch.optim.AdamW(
             model.parameters(),
-            lr=config['training']['learning_rate'],
-            betas=config['optimizer']['adamw'].get('betas', (0.9, 0.999)),
-            eps=config['optimizer']['adamw'].get('eps', 1e-8),
-            weight_decay=config['training']['weight_decay']  # Use weight decay from training config
+            lr=training_cfg["learning_rate"],
+            weight_decay=training_cfg.get("weight_decay", 0.01),
         )
-        optimizers = [optimizer]
 
-    print(f"[Main] Using optimizer: {optimizer_type}")
-    if optimizer_type == 'ortho_adamw':
-        print(f"      - Base optimizer: AdamW")
-        print(f"      - Orthogonalization eps: {config['optimizer']['ortho'].get('eps', 1e-30)}")
-        print(f"      - Rescale gradients: {config['optimizer']['ortho'].get('rescale', True)}")
+        start_epoch = 0
+        checkpoint_payload = None
+        if args.checkpoint:
+            checkpoint_payload = torch.load(args.checkpoint, map_location=device)
+            model.load_state_dict(checkpoint_payload["model_state_dict"])
+            optimizer.load_state_dict(checkpoint_payload["optimizer_state_dict"])
+            start_epoch = int(checkpoint_payload.get("epoch", 0)) + 1
+            if dist_ctx.is_main:
+                print(f"Loaded checkpoint {args.checkpoint} at epoch {start_epoch}")
 
-    elif optimizer_type == 'muon_mix':
-        print(f"      - Muon config:")
-        print(f"        - Learning rate: {config['optimizer'].get('muon', {}).get('lr', 0.02)}")
-        print(f"        - Weight decay: {config['training']['weight_decay']}")
-        print(f"        - Momentum: {config['optimizer'].get('muon', {}).get('momentum', 0.95)}")
-        print(f"        - Nesterov: {config['optimizer'].get('muon', {}).get('nesterov', True)}")
-        print(f"        - NS steps: {config['optimizer'].get('muon', {}).get('ns_steps', 5)}")
-        print(f"      - AdamW config:")
-        print(f"        - Learning rate: {config['training']['learning_rate']}")
-        print(f"        - Betas: {config['optimizer']['adamw'].get('betas', (0.9, 0.999))}")
-        print(f"        - Weight decay: {config['training']['weight_decay']}")
+        if dist_ctx.enabled:
+            model = DDP(
+                model,
+                device_ids=[dist_ctx.local_rank] if device.type == "cuda" else None,
+                output_device=dist_ctx.local_rank if device.type == "cuda" else None,
+                find_unused_parameters=bool(training_cfg.get("ddp_find_unused_parameters", False)),
+                gradient_as_bucket_view=bool(training_cfg.get("ddp_gradient_as_bucket_view", True)),
+                static_graph=bool(training_cfg.get("ddp_static_graph", True)),
+            )
 
-    # Calculate total training steps (batches per epoch * num epochs)
-    total_training_steps = len(train_loader) * config['training']['num_epochs']
-    print(f"[Main] Total training steps: {total_training_steps:,}")
-    
-    # Initialize scheduler
-    scheduler = LinearWarmupCosineDecay(
-        optimizer,
-        warmup_steps=config['scheduler']['warmup_steps'],
-        total_steps=total_training_steps,
-        decay_type=config['scheduler'].get('type', 'constant'),
-        min_lr=config['training'].get('min_learning_rate', 1e-6),
-        initial_step=global_step  # Pass the loaded or initial global_step
-    )
-    print(f"[Main] Using {config['scheduler'].get('type', 'constant')} scheduler with:")
-    print(f"      - Warmup steps: {config['scheduler']['warmup_steps']}")
-    print(f"      - Total steps: {total_training_steps}")
-    if config['scheduler'].get('type') == 'cosine':
-        print(f"      - Min LR: {config['training'].get('min_learning_rate', 1e-6)}")
+        precision = str(training_cfg.get("precision", "fp32")).lower()
+        if precision not in {"fp32", "bf16", "fp16"}:
+            raise ValueError(f"Unsupported precision '{precision}'. Use one of: fp32, bf16, fp16.")
+        use_grad_scaler = device.type == "cuda" and precision == "fp16"
+        scaler = torch.cuda.amp.GradScaler(enabled=use_grad_scaler)
+        if scaler.is_enabled() and checkpoint_payload is not None:
+            scaler_state = checkpoint_payload.get("scaler_state_dict")
+            if scaler_state:
+                scaler.load_state_dict(scaler_state)
 
-    # Restore optimizer state if we loaded a checkpoint and reset_optimizer is False
-    if loaded_checkpoint is not None and 'checkpoint' in config and not config['checkpoint'].get('reset_optimizer', True):
-        print("\n[Main] Restoring optimizer state from checkpoint...")
-        try:
-            if 'optimizer_state_dicts' in loaded_checkpoint and loaded_checkpoint['optimizer_state_dicts']:
-                # For multiple optimizers
-                if len(loaded_checkpoint['optimizer_state_dicts']) == len(optimizers):
-                    for i, opt in enumerate(optimizers):
-                        opt.load_state_dict(loaded_checkpoint['optimizer_state_dicts'][i])
-                    print(f"[Main] Successfully restored state for {len(optimizers)} optimizers")
-                else:
-                    print(f"[Main] Warning: Mismatch in optimizer count. Checkpoint has {len(loaded_checkpoint['optimizer_state_dicts'])}, current has {len(optimizers)}.")
-                    print("[Main] Will only restore the primary optimizer state.")
-                    optimizers[0].load_state_dict(loaded_checkpoint['optimizer_state_dicts'][0])
-            else:
-                print("[Main] No optimizer state found in checkpoint or state is empty.")
-        except Exception as e:
-            print(f"[Main] Error restoring optimizer state: {e}")
-    else:
-        print("\n[Main] Starting with fresh optimizer state.")
+        grad_accum_steps = max(1, int(training_cfg.get("grad_accum_steps", 1)))
+        grad_clip_norm = float(training_cfg.get("grad_clip_norm", 0.0))
+        log_every = int(training_cfg.get("log_every_steps", 20))
+        non_blocking = device.type == "cuda"
 
-    print("\n[Main] Creating checkpoint directory (overwriting previous checkpoints)...")
-    save_dir = Path('checkpoints')
-    save_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[Main] Checkpoint directory: {save_dir}")
+        num_epochs = int(training_cfg["num_epochs"])
+        validate_every_epochs = max(1, int(training_cfg.get("validate_every_epochs", 1)))
+        run_final_test = bool(training_cfg.get("run_final_test", True))
+        decode_validate_examples = max(0, int(training_cfg.get("decode_validate_examples", 0)))
+        decode_validate_max_len_cfg = int(training_cfg.get("decode_validate_max_len", 0))
+        pad_token_id = smiles_tokenizer.pad_token_id
+        output_dir = Path(cfg["checkpoint"].get("output_dir", "checkpoints"))
+        save_every_epoch = bool(cfg["checkpoint"].get("save_every_epoch", True))
+        save_every_n_epochs = max(1, int(cfg["checkpoint"].get("save_every_n_epochs", 1)))
+        if dist_ctx.is_main:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            _write_run_artifacts(
+                output_dir=output_dir,
+                cfg=cfg,
+                tokenized_dir=tokenized_dir,
+                smiles_vocab_path=smiles_vocab_path,
+                run_started_at_utc=run_started_at_utc,
+                world_size=dist_ctx.world_size,
+                parameter_count=parameter_count,
+                latest_metrics={},
+            )
+        if dist_ctx.enabled:
+            dist.barrier()
 
-    # Track best model info
-    best_val_loss = float('inf')
-    best_model_path = None
-    latest_model_path = None
+        last_epoch_metrics: Dict[str, Any] = {}
+        for epoch in range(start_epoch, num_epochs):
+            if dist_ctx.enabled and isinstance(train_loader.sampler, DistributedSampler):
+                train_loader.sampler.set_epoch(epoch)
 
-    def save_checkpoint(model, optimizers, epoch, global_step, val_loss, is_best=False):
-        """Helper function to save checkpoints and manage storage"""
-        nonlocal best_model_path, latest_model_path
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
 
-        # Create checkpoint - adapted to handle multiple optimizers
-        checkpoint = {
-            'epoch': epoch,
-            'global_step': global_step,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dicts': [opt.state_dict() for opt in optimizers],
-            'val_loss': val_loss,
-            'timestamp': datetime.now().isoformat()
-        }
+            running_loss_sum = 0.0
+            nonpad_tokens = 0.0
+            epoch_start = time.perf_counter()
+            micro_steps = 0
+            optimizer_steps = 0
 
-        # Save as latest checkpoint locally
-        if latest_model_path and os.path.exists(latest_model_path):
-            os.remove(latest_model_path)  # Remove old latest checkpoint
-
-        latest_model_path = save_dir / "latest_checkpoint.pt"
-        torch.save(checkpoint, latest_model_path, _use_new_zipfile_serialization=False)
-
-        # Create metadata
-        meta = {
-            'epoch': epoch,
-            'global_step': global_step,
-            'val_loss': val_loss,
-            'timestamp': checkpoint['timestamp']
-        }
-
-        # Only log artifacts on rank 0
-        if rank == 0 and wandb.run is not None:
-            # Log artifacts based on save_model_frequency from config
-            should_log_artifact = (global_step % config['training']['save_model_frequency'] == 0)
-
-            if should_log_artifact:
-                # Create and log latest artifact
-                latest_artifact = wandb.Artifact(
-                    name=f"{wandb.run.name}-latest",
-                    type="model",
-                    metadata=meta
-                )
-                latest_artifact.add_file(str(latest_model_path))
-                wandb.log_artifact(latest_artifact, aliases=["latest"])
-
-            # If this is the best model, save it separately
-            if is_best:
-                if best_model_path and os.path.exists(best_model_path):
-                    os.remove(best_model_path)  # Remove old best checkpoint
-
-                best_model_path = save_dir / "best_model.pt"
-                torch.save(checkpoint, best_model_path, _use_new_zipfile_serialization=False)
-
-                # Always log best model artifact since it's important
-                best_artifact = wandb.Artifact(
-                    name=f"{wandb.run.name}-best",
-                    type="model",
-                    metadata=meta
-                )
-                best_artifact.add_file(str(best_model_path))
-                wandb.log_artifact(best_artifact, aliases=["best"])
-
-                # Log best model metrics to wandb
-                wandb.run.summary.update({
-                    "best_val_loss": val_loss,
-                    "best_model_step": global_step,
-                    "best_model_epoch": epoch,
-                    "best_model_timestamp": checkpoint['timestamp']
-                })
-        else:
-            # For non-rank-0 processes, just save the model files without wandb
-            if is_best:
-                best_model_path = save_dir / "best_model.pt"
-                torch.save(checkpoint, best_model_path, _use_new_zipfile_serialization=False)
-
-    NUM_EPOCHS = config['training']['num_epochs']
-    validation_frequency = config['training']['validation_frequency']
-    logging_frequency = config['training']['logging_frequency']
-    save_frequency = config['training']['save_frequency']
-    greedy_decode_frequency = config['training']['greedy_decode_frequency']
-    
-    # Initialize gradient scaler for mixed precision training
-    scaler = None
-    precision = config['training'].get('precision', 'fp32')
-    use_amp = (precision in ['fp16', 'bf16']) and torch.cuda.is_available()
-    
-    # Only FP16 needs gradient scaling (BF16 has same dynamic range as FP32)
-    if precision == 'fp16' and torch.cuda.is_available():
-        scaler = torch.cuda.amp.GradScaler()
-        print("[Main] Initialized GradScaler for FP16 mixed precision training")
-    
-    start_time = time.time()
-    
-    # Helper for validation
-    def validate(model, loader, criterion, tokenizer, device, block_ir=False, block_nmr=False):
-        model.eval()
-        total_loss = 0.0
-        total_batches = 0
-        predictions = []
-        targets = []
-        
-        with torch.no_grad():
-            for target_tokens, ir_data, nmr_tokens, _ in loader:
-                if block_ir:
-                    ir_data = None
-                if block_nmr:
-                    nmr_tokens = None
-
-                target_tokens = target_tokens.to(device)
+            for step, batch in enumerate(train_loader, start=1):
+                target_tokens, ir_data, nmr_tokens = batch
+                target_tokens = target_tokens.to(device, non_blocking=non_blocking)
+                nmr_tokens = nmr_tokens.to(device, non_blocking=non_blocking)
                 if ir_data is not None:
-                    ir_data = ir_data.to(device)
-                if nmr_tokens is not None:
-                    nmr_tokens = nmr_tokens.to(device)
+                    ir_data = ir_data.to(device, non_blocking=non_blocking)
 
-                T = target_tokens.size(1)
-                mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=target_tokens.device), 1)
-                
-                # Determine number of loops for training
-                loop_range = config['model'].get('loop_range', None)
-                automatic_loop_exit = config['model'].get('automatic_loop_exit', False)
-                max_loops = config['model'].get('max_loops', 1)
-                log_normal_poisson = config['model'].get('log_normal_poisson', False)
-                log_normal_mean = config['model'].get('log_normal_mean', 1.0)
-                log_normal_std = config['model'].get('log_normal_std', 0.5)
-                num_loops = None
-                if automatic_loop_exit:
-                    num_loops = max_loops # Use max_loops when auto exit is on
-                elif loop_range: # Only sample if auto exit is off and loop_range is defined
-                    min_loops, max_loops_range = loop_range
-                    num_loops = torch.randint(min_loops, max_loops_range + 1, (1,)).item()
-                elif log_normal_poisson:
-                    # Define the parameters for the Normal distribution of τ
-                    # Assuming log_normal_mean corresponds to r_bar and log_normal_std to sigma
-                    mean_tau = torch.log(torch.tensor(log_normal_mean)) - 0.5 * torch.tensor(log_normal_std)**2
-                    std_tau = torch.tensor(log_normal_std) # Use sigma directly, not log(sigma)
-                    
-                    # Create the Normal distribution object
-                    normal_dist = torch.distributions.Normal(mean_tau, std_tau)
-                    
-                    # Sample τ from the Normal distribution
-                    tau = normal_dist.sample((1,)).item() # Sample τ ~ N(mean_tau, std_tau)
-                    
-                    # Calculate the rate for the Poisson distribution: exp(τ)
-                    # Ensure rate is positive
-                    rate = torch.exp(torch.tensor(tau)).item()
-                    rate = max(rate, 1e-6) # Avoid non-positive rates for Poisson
+                nonpad_tokens += float((target_tokens[:, 1:] != pad_token_id).sum().item())
+                micro_steps += 1
 
-                    # Sample from Poisson(rate=exp(τ)) and add 1
-                    poisson_sample = torch.poisson(torch.tensor(rate)).item()
-                    num_loops = int(poisson_sample) + 1
+                with _autocast_context(device, precision):
+                    decoder_input = target_tokens[:, :-1]
+                    logits = model(
+                        nmr_tokens=nmr_tokens,
+                        ir_data=ir_data,
+                        target_seq=decoder_input,
+                        target_padding_mask=(decoder_input == pad_token_id),
+                        nmr_padding_mask=(nmr_tokens == nmr_pad_token_id),
+                    )
+                    loss = compute_next_token_loss(logits, target_tokens, pad_token_id)
+                    scaled_loss = loss / grad_accum_steps
 
+                if scaler.is_enabled():
+                    scaler.scale(scaled_loss).backward()
                 else:
-                     num_loops = 1 # Default to 1 loop if no range and no auto exit
-                
-                # Use mixed precision for validation too if enabled
-                precision = config['training'].get('precision', 'fp32')
-                use_amp = (precision in ['fp16', 'bf16']) and torch.cuda.is_available()
-                if use_amp:
-                    amp_dtype = torch.bfloat16 if precision == 'bf16' else torch.float16
-                    with torch.cuda.amp.autocast(dtype=amp_dtype):
-                        logits = model(
-                            nmr_tokens=nmr_tokens,
-                            ir_data=ir_data,
-                            target_seq=target_tokens[:, :-1],
-                            target_mask=mask[:-1, :-1],
-                            num_loops=num_loops
+                    scaled_loss.backward()
+
+                running_loss_sum += float(loss.item())
+                should_step = (step % grad_accum_steps) == 0
+                if should_step:
+                    if grad_clip_norm > 0:
+                        if scaler.is_enabled():
+                            scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    optimizer_steps += 1
+
+                if log_every > 0 and step % log_every == 0:
+                    global_loss_sum, global_micro = _reduce_pair(running_loss_sum, float(micro_steps), device, dist_ctx)
+                    global_tokens, _ = _reduce_pair(nonpad_tokens, 0.0, device, dist_ctx)
+                    elapsed = max(time.perf_counter() - epoch_start, 1e-6)
+                    if dist_ctx.is_main:
+                        print(
+                            f"[epoch {epoch+1}/{num_epochs}] step={step} "
+                            f"train_loss={global_loss_sum/max(global_micro, 1.0):.4f} "
+                            f"tok_s={global_tokens/elapsed:.1f} elapsed_s={elapsed:.1f} "
+                            f"opt_steps={optimizer_steps}"
                         )
-                        loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
-                else:
-                    logits = model(
-                        nmr_tokens=nmr_tokens,
-                        ir_data=ir_data,
-                        target_seq=target_tokens[:, :-1],
-                        target_mask=mask[:-1, :-1],
-                        num_loops=num_loops
-                    )
-                    loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
-                
-                pred_tokens = logits.argmax(dim=-1).cpu().tolist()
-                tgt_tokens = target_tokens[:, 1:].cpu().tolist()
-                
-                for pred_seq in pred_tokens:
-                    try:
-                        sep_idx = pred_seq.index(tokenizer.sep_token_id)
-                        pred_seq = pred_seq[:sep_idx]
-                    except ValueError:
-                        pass
-                    decoded = tokenizer.decode(pred_seq).strip()
-                    predictions.append(decoded)
 
-                for tgt_seq in tgt_tokens:
-                    try:
-                        sep_idx = tgt_seq.index(tokenizer.sep_token_id)
-                        tgt_seq = tgt_seq[:sep_idx]
-                    except ValueError:
-                        pass
-                    decoded = tokenizer.decode(tgt_seq).strip()
-                    targets.append(decoded)
-                
-                total_loss += loss.item()
-                total_batches += 1
-                torch.cuda.empty_cache()
-        
-        val_loss = total_loss / max(total_batches, 1)
-        
-        detailed_results = evaluate_predictions(predictions, targets)
-        metrics = aggregate_metrics(detailed_results)
-        combined_metrics = {
-            'val_loss': val_loss,
-            'valid_smiles_rate': metrics['valid_smiles'],
-            'exact_match_rate': metrics['exact_match'],
-            'exact_match_all_rate': metrics['exact_match_all'],
-            'tanimoto_similarity': metrics['avg_tanimoto'],
-            'mcs_ratio': metrics['avg_#mcs/#target'],
-            'ecfp6_iou': metrics['avg_ecfp6_iou'],
-            'predictions': predictions[:10],
-            'targets': targets[:10],
-            'num_samples': len(predictions)
-        }
-        return combined_metrics
-
-    # Initialize wandb table outside the validation loop
-    columns = ["step", "prediction", "target", "exact_match", "tanimoto", "mcs_ratio", "ecfp6_iou"]
-    examples_table = wandb.Table(columns=columns)
-    
-    # -------------------------------------------------------------------------
-    # Training Loop
-    # -------------------------------------------------------------------------
-    print("\n[Main] Starting training loop...")
-    
-    for epoch in range(NUM_EPOCHS):
-        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
-        model.train()
-        epoch_loss = 0.0
-        num_batches = 0
-
-        pbar = tqdm(train_loader, total=len(train_loader), desc="Training", dynamic_ncols=True)
-        for batch in pbar:
-            target_tokens, ir_data, nmr_tokens, _ = batch
-            
-            target_tokens = target_tokens.to(device)
-            if ir_data is not None:
-                ir_data = ir_data.to(device)
-            if nmr_tokens is not None:
-                nmr_tokens = nmr_tokens.to(device)
-
-            T = target_tokens.size(1)
-            mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=target_tokens.device), 1)
-            
-            # Determine number of loops for training
-            loop_range = config['model'].get('loop_range', None)
-            automatic_loop_exit = config['model'].get('automatic_loop_exit', False)
-            max_loops = config['model'].get('max_loops', 1)
-            num_loops = None
-            if automatic_loop_exit:
-                num_loops = max_loops # Use max_loops when auto exit is on
-            elif loop_range: # Only sample if auto exit is off and loop_range is defined
-                min_loops, max_loops_range = loop_range
-                num_loops = torch.randint(min_loops, max_loops_range + 1, (1,)).item()
-            else:
-                 num_loops = 1 # Default to 1 loop if no range and no auto exit
-            
-            # Zero gradients for all optimizers
-            for opt in optimizers:
-                opt.zero_grad()
-            
-            # Forward and backward pass with automatic mixed precision for fp16/bf16
-            if use_amp:
-                amp_dtype = torch.bfloat16 if precision == 'bf16' else torch.float16
-                with torch.cuda.amp.autocast(dtype=amp_dtype):
-                    logits = model(
-                        nmr_tokens=nmr_tokens,
-                        ir_data=ir_data,
-                        target_seq=target_tokens[:, :-1],
-                        target_mask=mask[:-1, :-1],
-                        num_loops=num_loops
-                    )
-                    loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
-                
-                # For FP16, we need to use the scaler for numerical stability
-                if scaler is not None:
-                    # Scale loss and do backward pass
-                    scaler.scale(loss).backward()
-                    
-                    # Manually synchronize gradients across processes like in the reference
-                    if torch.distributed.is_initialized():
-                        for param in model.parameters():
-                            if param.grad is not None:
-                                torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
-                    
-                    # Step optimizers with scaler
-                    for opt in optimizers:
-                        scaler.step(opt)
-                    
-                    # Update scaler
+            if (micro_steps % grad_accum_steps) != 0:
+                if grad_clip_norm > 0:
+                    if scaler.is_enabled():
+                        scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
                     scaler.update()
                 else:
-                    # For BF16, we don't need scaling since it has the same dynamic range as FP32
-                    loss.backward()
-                    
-                    # Manually synchronize gradients across processes like in the reference
-                    if torch.distributed.is_initialized():
-                        for param in model.parameters():
-                            if param.grad is not None:
-                                torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
-                    
-                    # Step all optimizers
-                    for opt in optimizers:
-                        opt.step()
-            else:
-                # Regular forward and backward pass for fp32
-                logits = model(
-                    nmr_tokens=nmr_tokens,
-                    ir_data=ir_data,
-                    target_seq=target_tokens[:, :-1],
-                    target_mask=mask[:-1, :-1],
-                    num_loops=num_loops
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
+
+            global_loss_sum, global_micro = _reduce_pair(running_loss_sum, float(micro_steps), device, dist_ctx)
+            global_tokens, _ = _reduce_pair(nonpad_tokens, 0.0, device, dist_ctx)
+            train_loss = global_loss_sum / max(global_micro, 1.0)
+
+            should_validate = ((epoch + 1) % validate_every_epochs) == 0 or (epoch + 1) == num_epochs
+            val_loss = (
+                evaluate_loss(
+                    model,
+                    val_loader,
+                    pad_token_id,
+                    nmr_pad_token_id,
+                    device,
+                    precision,
+                    dist_ctx,
                 )
-                loss = criterion(logits.reshape(-1, logits.size(-1)), target_tokens[:, 1:].reshape(-1))
-                
-                loss.backward()
-                
-                # Manually synchronize gradients across processes like in the reference
-                if torch.distributed.is_initialized():
-                    for param in model.parameters():
-                        if param.grad is not None:
-                            torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
-                
-                # Step all optimizers
-                for opt in optimizers:
-                    opt.step()
-            # Step the scheduler regardless of precision mode
-            scheduler.step()
-            
-            # Clear memory after backward pass
-            del logits, mask
-            if ir_data is not None:
-                del ir_data
-            if nmr_tokens is not None:
-                del nmr_tokens
-            
-            epoch_loss += loss.item()
-            num_batches += 1
-            global_step += 1
-
-            if global_step % logging_frequency == 0:
-                current_lr = scheduler.get_lr()[0]  # Get current learning rate
-                log_wandb({
-                    "train_loss": loss.item(),
-                    "learning_rate": current_lr,
-                    "epoch": epoch + 1,
-                    "global_step": global_step,
-                    "progress": global_step / total_training_steps  # Add progress tracking
-                }, step=global_step)
-
-            # Periodic validation
-            if global_step % validation_frequency == 0:
-                print(f"\nRunning validation at step {global_step}...")
-                # Only validate on rank 0
-                if rank == 0:
-                    val_metrics = validate(model, val_loader, criterion, tokenizer, device, block_ir, block_nmr)
-
-                    # Clean wandb cache periodically (every 5 validation steps)
-                    if (global_step // validation_frequency) % 5 == 0:
-                        cleanup_wandb_cache()
-
-                    # Create a new table for each validation step
-                    examples_table = wandb.Table(columns=columns)
-
-                    # Log results - sample 10 random examples for logging
-                    if val_metrics['predictions']:
-                        # Randomly sample 10 indices
-                        num_examples = len(val_metrics['predictions'])
-                        sample_indices = np.random.choice(
-                            num_examples,
-                            min(10, num_examples),
-                            replace=False
-                        )
-
-                        for idx in sample_indices:
-                            pred = val_metrics['predictions'][idx]
-                            tgt = val_metrics['targets'][idx]
-                            # Calculate metrics for this pair
-                            pair_results = evaluate_predictions([pred], [tgt])[0]
-                            examples_table.add_data(
-                                global_step,
-                                pred,
-                                tgt,
-                                pair_results['exact_match'],
-                                pair_results['tanimoto'],
-                                pair_results['#mcs/#target'],
-                                pair_results['ecfp6_iou']
-                            )
-
-                    # Log metrics
-                    log_wandb({
-                        "val_loss": val_metrics['val_loss'],
-                        "val_valid_smiles": val_metrics['valid_smiles_rate'],
-                        "val_exact_matches": val_metrics['exact_match_rate'],
-                        "val_exact_matches_all": val_metrics['exact_match_all_rate'],
-                        "val_tanimoto": val_metrics['tanimoto_similarity'],
-                        "val_mcs_ratio": val_metrics['mcs_ratio'],
-                        "val_ecfp6_iou": val_metrics['ecfp6_iou'],
-                        "val_examples": examples_table,  # Log new table each time
-                        "global_step": global_step
-                    }, step=global_step)
-
-                    print(f"[Val] Loss: {val_metrics['val_loss']:.4f}")
-
-                    # Save model periodically (outside validation check)
-                    # Condition saving on rank 0 and frequency
-                    if global_step % config['training']['save_model_frequency'] == 0:
-                        print(f"\nSaving model checkpoint at step {global_step}...")
-
-                        # Get current validation metrics if available
-                        current_val_loss = val_metrics.get('val_loss', float('inf')) # Use .get for safety
-
-                        # Save checkpoint and manage storage
-                        is_best = current_val_loss < best_val_loss
-                        if is_best:
-                            best_val_loss = current_val_loss
-                            print(f"New best validation loss: {best_val_loss:.4f}")
-
-                        # Saving is already rank-aware inside save_checkpoint
-                        save_checkpoint(
-                            model=model,
-                            optimizers=optimizers,  # Pass all optimizers
-                            epoch=epoch,
-                            global_step=global_step,
-                            val_loss=current_val_loss,
-                            is_best=is_best
-                        )
-
-                        print(f"[Main] Model checkpoint saved at step {global_step}")
+                if should_validate
+                else float("nan")
+            )
+            epoch_elapsed = max(time.perf_counter() - epoch_start, 1e-6)
+            if dist_ctx.is_main:
+                if should_validate:
+                    print(
+                        f"[epoch {epoch+1}/{num_epochs}] train_loss={train_loss:.4f} "
+                        f"val_loss={val_loss:.4f} tok_s={global_tokens/epoch_elapsed:.1f} "
+                        f"elapsed_s={epoch_elapsed:.1f} opt_steps={optimizer_steps}"
+                    )
                 else:
-                    # Ensure all processes wait if not validating/saving
-                    if torch.distributed.is_initialized():
-                        torch.distributed.barrier()
-
-
-            # Periodic greedy decode evaluation
-            if global_step % greedy_decode_frequency == 0:
-                print(f"\nRunning greedy decode evaluation at step {global_step}...")
-                # Only run greedy decode on rank 0
-                if rank == 0:
-                    greedy_metrics = evaluate_with_greedy_decode(
-                        model=model,
-                        test_loader=test_loader, # Use test_loader for greedy eval
-                        tokenizer=tokenizer,
-                        device=device,
-                        num_loops=None
+                    print(
+                        f"[epoch {epoch+1}/{num_epochs}] train_loss={train_loss:.4f} "
+                        f"val_skipped tok_s={global_tokens/epoch_elapsed:.1f} "
+                        f"elapsed_s={epoch_elapsed:.1f} opt_steps={optimizer_steps}"
                     )
 
-                    # Create a new table for greedy decode examples
-                    greedy_table = wandb.Table(columns=columns)
+            epoch_decode_metrics: Optional[Dict[str, Any]] = None
+            if should_validate and decode_validate_examples > 0:
+                if dist_ctx.is_main:
+                    model_for_decode = model.module if isinstance(model, DDP) else model
+                    decode_max_len = (
+                        decode_validate_max_len_cfg
+                        if decode_validate_max_len_cfg > 0
+                        else int(cfg["model"]["max_seq_length"])
+                    )
+                    epoch_decode_metrics = evaluate_decode_metrics(
+                        model=model_for_decode,
+                        dataset=val_loader.dataset,
+                        tokenizer=smiles_tokenizer,
+                        device=device,
+                        max_examples=decode_validate_examples,
+                        max_len=decode_max_len,
+                        ir_as_prompt=bool(cfg["model"].get("ir_as_prompt", False)),
+                    )
+                    decode_valid = float(epoch_decode_metrics.get("decode_valid_smiles", float("nan")))
+                    decode_exact = float(epoch_decode_metrics.get("decode_exact_match_all", float("nan")))
+                    decode_tani = float(epoch_decode_metrics.get("decode_avg_tanimoto", float("nan")))
+                    decode_ecfp6 = float(epoch_decode_metrics.get("decode_avg_ecfp6_iou", float("nan")))
+                    decode_mcs = float(epoch_decode_metrics.get("decode_avg_mcs_over_target", float("nan")))
+                    decode_examples = int(epoch_decode_metrics.get("decode_examples", 0))
+                    decode_valid_str = f"{decode_valid:.4f}" if np.isfinite(decode_valid) else "nan"
+                    decode_exact_str = f"{decode_exact:.4f}" if np.isfinite(decode_exact) else "nan"
+                    decode_tani_str = f"{decode_tani:.4f}" if np.isfinite(decode_tani) else "nan"
+                    decode_ecfp6_str = f"{decode_ecfp6:.4f}" if np.isfinite(decode_ecfp6) else "nan"
+                    decode_mcs_str = f"{decode_mcs:.4f}" if np.isfinite(decode_mcs) else "nan"
+                    metric_mode = "rdkit" if bool(epoch_decode_metrics.get("decode_rdkit", False)) else "string"
+                    print(
+                        f"[epoch {epoch+1}/{num_epochs}] decode_examples={decode_examples} "
+                        f"valid_smiles={decode_valid_str} exact_match_all={decode_exact_str} "
+                        f"avg_tanimoto={decode_tani_str} avg_ecfp6_iou={decode_ecfp6_str} "
+                        f"avg_mcs_over_target={decode_mcs_str} mode={metric_mode}"
+                    )
+                if dist_ctx.enabled:
+                    dist.barrier()
 
-                    # Log sample results
-                    for pred, tgt in zip(greedy_metrics['predictions'], greedy_metrics['targets']):
-                        # Calculate metrics for this pair
-                        pair_results = evaluate_predictions([pred], [tgt])[0]
-                        greedy_table.add_data(
-                            global_step,
-                            pred,
-                            tgt,
-                            pair_results['exact_match'],
-                            pair_results['tanimoto'],
-                            pair_results['#mcs/#target'],
-                            pair_results['ecfp6_iou']
-                        )
+            latest_epoch_metrics: Dict[str, Any] = {
+                "epoch": int(epoch + 1),
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
+                "tok_s": float(global_tokens / epoch_elapsed),
+                "epoch_elapsed_s": float(epoch_elapsed),
+                "optimizer_steps": int(optimizer_steps),
+            }
+            if epoch_decode_metrics is not None:
+                latest_epoch_metrics.update(epoch_decode_metrics)
+            last_epoch_metrics = latest_epoch_metrics
 
-                    # Log metrics
-                    log_wandb({
-                        "greedy_valid_smiles": greedy_metrics['valid_smiles'],
-                        "greedy_exact_matches": greedy_metrics['exact_match'],
-                        "greedy_exact_matches_all": greedy_metrics['exact_match_all'],
-                        "greedy_tanimoto": greedy_metrics['avg_tanimoto'],
-                        "greedy_mcs_ratio": greedy_metrics['avg_#mcs/#target'],
-                        "greedy_ecfp6_iou": greedy_metrics['avg_ecfp6_iou'],
-                        "greedy_examples": greedy_table,
-                        "global_step": global_step
-                    }, step=global_step)
+            should_save = save_every_epoch and (((epoch + 1) % save_every_n_epochs) == 0 or (epoch + 1) == num_epochs)
+            if should_save and dist_ctx.is_main:
+                model_to_save = model.module if isinstance(model, DDP) else model
+                ckpt_path = output_dir / f"epoch_{epoch+1}.pt"
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model_to_save.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scaler_state_dict": scaler.state_dict() if scaler.is_enabled() else None,
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                        "decode_metrics": epoch_decode_metrics,
+                        "config": cfg,
+                        "world_size": dist_ctx.world_size,
+                    },
+                    ckpt_path,
+                )
+                print(f"Saved checkpoint: {ckpt_path}")
+                latest_with_checkpoint = dict(latest_epoch_metrics)
+                latest_with_checkpoint["checkpoint"] = str(ckpt_path.name)
+                _write_run_artifacts(
+                    output_dir=output_dir,
+                    cfg=cfg,
+                    tokenized_dir=tokenized_dir,
+                    smiles_vocab_path=smiles_vocab_path,
+                    run_started_at_utc=run_started_at_utc,
+                    world_size=dist_ctx.world_size,
+                    parameter_count=parameter_count,
+                    latest_metrics=latest_with_checkpoint,
+                )
 
-                    print(f"[Greedy] Valid SMILES: {greedy_metrics['valid_smiles']:.2%}")
-                    print(f"[Greedy] Exact matches: {greedy_metrics['exact_match']:.2%}")
-                    print(f"[Greedy] Tanimoto similarity: {greedy_metrics['avg_tanimoto']:.4f}")
-                else:
-                     # Ensure all processes wait if not evaluating
-                     if torch.distributed.is_initialized():
-                         torch.distributed.barrier()
-
-        avg_epoch_loss = epoch_loss / max(num_batches, 1)
-        print(f"Epoch {epoch+1} completed | Average Loss: {avg_epoch_loss:.4f}")
-
-    # Final test set evaluation - Only on rank 0
-    final_test_metrics = {}
-    if rank == 0:
-        print("\n[Main] Evaluating on test set...")
-        final_test_metrics = validate(model, test_loader, criterion, tokenizer, device, block_ir, block_nmr)
-        log_wandb({"test_loss": final_test_metrics.get('val_loss', float('inf'))}, step=global_step)
-        print(f"[Test] Loss: {final_test_metrics.get('val_loss', float('inf')):.4f}")
-    else:
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
-
-    # Final greedy decode evaluation - Only on rank 0
-    final_greedy_metrics = {}
-    if rank == 0:
-        print("\n[Main] Running final greedy decode evaluation...")
-        final_greedy_metrics = evaluate_with_greedy_decode(
-            model=model,
-            test_loader=test_loader,
-            tokenizer=tokenizer,
-            device=device,
-            num_loops=None
-        )
-        log_wandb({
-            "final_greedy_valid_smiles": final_greedy_metrics.get('valid_smiles', 0.0),
-            "final_greedy_exact_matches": final_greedy_metrics.get('exact_match', 0.0),
-            "final_greedy_tanimoto": final_greedy_metrics.get('avg_tanimoto', 0.0),
-            "final_greedy_mcs_ratio": final_greedy_metrics.get('avg_#mcs/#target', 0.0),
-            "final_greedy_ecfp6_iou": final_greedy_metrics.get('avg_ecfp6_iou', 0.0)
-        }, step=global_step)
-        print(f"[Final Greedy] Valid SMILES: {final_greedy_metrics.get('valid_smiles', 0.0):.2%}")
-        print(f"[Final Greedy] Exact matches: {final_greedy_metrics.get('exact_match', 0.0):.2%}")
-        print(f"[Final Greedy] Tanimoto similarity: {final_greedy_metrics.get('avg_tanimoto', 0.0):.4f}")
-    else:
-         if torch.distributed.is_initialized():
-             torch.distributed.barrier()
-
-
-    # Save final model if requested - Only on rank 0
-    if rank == 0:
-        if config['training'].get('save_local', False):
-            current_val_loss = final_test_metrics.get('val_loss', float('inf'))
-            save_checkpoint(
-                model=model,
-                optimizers=optimizers,  # Pass all optimizers
-                epoch=NUM_EPOCHS,
-                global_step=global_step,
-                val_loss=current_val_loss,
-                is_best=current_val_loss < best_val_loss
+        if run_final_test:
+            test_loss = evaluate_loss(
+                model,
+                test_loader,
+                pad_token_id,
+                nmr_pad_token_id,
+                device,
+                precision,
+                dist_ctx,
             )
-            print(f"Final checkpoint saved in {save_dir}")
+            if dist_ctx.is_main:
+                print(f"[final] test_loss={test_loss:.4f}")
+                final_metrics = dict(last_epoch_metrics)
+                final_metrics["final_test_loss"] = float(test_loss)
+                _write_run_artifacts(
+                    output_dir=output_dir,
+                    cfg=cfg,
+                    tokenized_dir=tokenized_dir,
+                    smiles_vocab_path=smiles_vocab_path,
+                    run_started_at_utc=run_started_at_utc,
+                    world_size=dist_ctx.world_size,
+                    parameter_count=parameter_count,
+                    latest_metrics=final_metrics,
+                )
+        elif dist_ctx.is_main:
+            print("[final] test_skipped")
 
-    print("[Main] Training script completed.")
-    if rank == 0 and wandb.run is not None:
-        wandb.finish()
+    finally:
+        _cleanup_dist(dist_ctx)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

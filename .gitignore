@@ -96,3 +96,7 @@ inference_results/
 checkpoints_rl/
 inference_results_entropix_loop_steps/
 inference_results_test_looping/
+artifacts/
+checkpoints_*/
+data/tokenized_*/
+sweep_results*.json

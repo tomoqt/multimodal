@@ -17,6 +17,39 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # TODO: hynopump@ parallelize
 
+def process_and_save_chunk(
+    parquet_file: Path,
+    h_nmr: bool,
+    c_nmr: bool,
+    ir: bool,
+    pos_msms: bool,
+    neg_msms: bool,
+    formula: bool,
+    original_x: np.ndarray | None,
+    tokenize_ir: bool,
+    temp_dir: Path,
+) -> str:
+    """
+    Worker helper: process one parquet file and persist a CSV directly from the
+    worker process. Returning only the CSV path avoids expensive dataframe IPC.
+    """
+    df_chunk = process_parquet_file(
+        parquet_file=parquet_file,
+        h_nmr=h_nmr,
+        c_nmr=c_nmr,
+        ir=ir,
+        pos_msms=pos_msms,
+        neg_msms=neg_msms,
+        formula=formula,
+        original_x=original_x,
+        tokenize_ir=tokenize_ir,
+        show_progress=False,
+    )
+    chunk_file = temp_dir / f"{parquet_file.stem}_{uuid.uuid4().hex}.csv"
+    df_chunk.to_csv(chunk_file, index=False)
+    return str(chunk_file)
+
+
 ################################################################################
 # Main CLI
 ################################################################################
@@ -46,6 +79,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 @click.option("--seed", type=int, default=3245, help="Random seed for splitting")
 @click.option("--tokenize_ir", is_flag=True, default=False, help="Tokenize IR data instead of returning raw values")
 @click.option("--test_mode", is_flag=True, default=False, help="Process only first 3 files for testing")
+@click.option("--max_workers", type=int, default=None, help="Maximum number of worker processes")
 def main(
         analytical_data: Path,
         out_path: Path,
@@ -58,7 +92,8 @@ def main(
         pred_spectra: bool = False,
         seed: int = 3245,
         tokenize_ir: bool = False,
-        test_mode: bool = False
+        test_mode: bool = False,
+        max_workers: int | None = None,
 ):
     """
     Create tokenized training data from analytical spectra
@@ -92,15 +127,17 @@ def main(
         parquet_files = parquet_files[:3]
 
     # Use ProcessPoolExecutor for parallel processing
-    with ProcessPoolExecutor(max_workers=os.cpu_count() - 2) as executor:
+    worker_count = max_workers if max_workers is not None else max(1, (os.cpu_count() or 2) - 2)
+    print(f"Using {worker_count} worker processes")
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
         # Submit tasks to the executor and store futures in a dictionary
         future_to_file = {}
         for parquet_file in parquet_files:
             print(f"Submitting {parquet_file.name} for processing...")
             future = executor.submit(
-                process_parquet_file,
+                process_and_save_chunk,
                 parquet_file, h_nmr, c_nmr, ir, pos_msms, neg_msms,
-                formula, original_x, tokenize_ir
+                formula, original_x, tokenize_ir, temp_dir
             )
             future_to_file[future] = parquet_file
 
@@ -108,9 +145,7 @@ def main(
         for future in as_completed(future_to_file):
             parquet_file = future_to_file[future]
             try:
-                df_chunk = future.result()
-                chunk_file = temp_dir / f"{parquet_file.stem}_{uuid.uuid4().hex}.csv"
-                df_chunk.to_csv(chunk_file, index=False)
+                chunk_file = Path(future.result())
                 chunk_files.append(chunk_file)
                 print(f"Completed processing {parquet_file.name}")
             except Exception as e:

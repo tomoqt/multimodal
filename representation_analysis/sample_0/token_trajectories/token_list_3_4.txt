@@ -1,4 +1,0 @@
-Token list for PC3 vs PC4 visualization:
-Total tokens: 1
-
-1. [SEP] (pos 54)

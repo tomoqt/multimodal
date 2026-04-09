@@ -1,0 +1,44 @@
+model:
+  max_seq_length: 64
+  max_nmr_length: 128
+  max_memory_length: 64
+  embed_dim: 128
+  num_heads: 4
+  num_layers: 2
+  dropout: 0.0
+  ir_encoder_type: regular
+  ir_as_prompt: false
+  use_stablemax: false
+  use_rmsnorm: false
+
+training:
+  batch_size: 4
+  test_batch_size: 4
+  num_epochs: 1
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  num_workers: 0
+  log_every_steps: 20
+
+data:
+  tokenized_dir: data/tokenized_baseline/data
+  pretokenize: true
+  preload_ir: false
+  use_disk_cache: true
+  write_disk_cache: true
+  cache_dir: data/tokenized_baseline/cache
+  ir_cache_mode: none
+  ir_cache_dtype: float32
+
+diffusion:
+  architecture: cross_attention
+  mask_prob_floor: 1.0e-3
+  sampling_steps: 63
+  sampling_block_length: 63
+  sampling_temperature: 0.0
+  sampling_remasking: low_confidence
+  decode_validate_examples: 4
+
+checkpoint:
+  output_dir: checkpoints_test_diffusion
+  save_every_epoch: false

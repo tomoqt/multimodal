@@ -1,6 +1,5 @@
-import torch as th
+import torch
 import torch.nn as nn
-from typing import Any
 
 from .spectral_encoder import MultimodalSpectralEncoder
 from .transformer_decoder import SMILESDecoder
@@ -8,10 +7,9 @@ from .transformer_decoder import SMILESDecoder
 
 class MultiModalToSMILESModel(nn.Module):
     """
-    A high-level model that:
-      1) Encodes IR / H-NMR / C-NMR data via MultimodalSpectralEncoder (concatenation),
-         or uses IR as prompt tokens if enabled.
-      2) Decodes tokens with SMILESDecoder using a prompt-based approach.
+    Lean end-to-end model:
+    - Optional IR encoder (ConvNeXt or regular 1D CNN)
+    - Decoder-only transformer over SMILES with IR/NMR prompt memory
     """
 
     def __init__(
@@ -30,44 +28,14 @@ class MultiModalToSMILESModel(nn.Module):
         ir_encoder_type: str = "regular",
         ir_as_prompt: bool = False,
         ir_vocab_size: int = None,
-        max_loops: int = 1,
-        loops_representation: bool = False,
-        automatic_loop_exit: bool = False,
-        automatic_loop_exit_threshold: float = 0.01,
-        use_loop_concat: bool = True,
-        use_rmsnorm: bool = False
-    ):
-        """
-        Args:
-            smiles_vocab_size: Number of tokens in the SMILES vocabulary.
-            nmr_vocab_size:   Number of tokens in the NMR vocabulary.
-            max_seq_length:   Max tokens for decoding.
-            max_nmr_length:   Max tokens for NMR decoding.
-            max_memory_length: Max tokens for memory/IR embeddings.
-            embed_dim:  Hidden dimension for the encoder & (matching) decoder memory.
-            num_heads:  Number of attention heads in the decoder.
-            num_layers: Number of decoder layers.
-            dropout:    Dropout probability in the decoder.
-            verbose:    If True, print debugging shapes in forward pass.
-            use_stablemax: If True, use stablemax instead of softmax in the decoder.
-            ir_encoder_type: Type of IR encoder to use.
-            ir_as_prompt: If True, use IR as prompt tokens.
-            ir_vocab_size: Number of tokens in the IR vocabulary if IR is used as prompt.
-            max_loops: Maximum number of times to loop the middle layer in the decoder.
-            loops_representation: Whether to track and return representations across loops.
-            automatic_loop_exit: Whether to enable automatic exiting from middle layer loops based on representation convergence.
-            automatic_loop_exit_threshold: The threshold for convergence detection when automatic_loop_exit is enabled.
-            use_loop_concat: Whether to concatenate original input with looped input in the middle layer.
-            use_rmsnorm: If True, use RMSNorm instead of LayerNorm in the decoder.
-        """
+        use_rmsnorm: bool = False,
+    ) -> None:
         super().__init__()
         self.verbose = verbose
         self.ir_as_prompt = ir_as_prompt
         self.max_memory_length = max_memory_length
-        self.max_loops = max_loops
-        self.use_rmsnorm = use_rmsnorm
+        self.embed_dim = embed_dim
 
-        # Initialize spectral encoder; pass the flag so that it bypasses encoding if IR is prompt
         self.encoder = MultimodalSpectralEncoder(
             embed_dim=embed_dim,
             verbose=verbose,
@@ -75,7 +43,6 @@ class MultiModalToSMILESModel(nn.Module):
             ir_as_prompt=ir_as_prompt,
         )
 
-        # If IR is used as prompt, create an embedding layer for IR tokens
         if self.ir_as_prompt:
             if ir_vocab_size is None:
                 raise ValueError("ir_vocab_size must be provided when ir_as_prompt is True.")
@@ -83,7 +50,6 @@ class MultiModalToSMILESModel(nn.Module):
         else:
             self.ir_embed = None
 
-        # The decoder expects memory_dim == encoder's output dim; note that if IR is prompt, memory will come from IR embedding
         self.decoder = SMILESDecoder(
             smiles_vocab_size=smiles_vocab_size,
             nmr_vocab_size=nmr_vocab_size,
@@ -98,85 +64,64 @@ class MultiModalToSMILESModel(nn.Module):
             verbose=verbose,
             use_stablemax=use_stablemax,
             ir_as_prompt=ir_as_prompt,
-            max_loops=max_loops,
-            loops_representation=loops_representation,
-            automatic_loop_exit=automatic_loop_exit,
-            automatic_loop_exit_threshold=automatic_loop_exit_threshold,
-            use_loop_concat=use_loop_concat,
-            use_rmsnorm=use_rmsnorm
+            use_rmsnorm=use_rmsnorm,
         )
+
+    def _build_memory(
+        self,
+        nmr_tokens: torch.Tensor = None,
+        ir_data: torch.Tensor = None,
+        target_seq: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if self.ir_as_prompt:
+            if ir_data is not None:
+                if ir_data.dim() != 2:
+                    raise ValueError(f"Expected tokenized IR prompt with shape (B, L), got {tuple(ir_data.shape)}")
+                return self.ir_embed(ir_data)
+
+            if target_seq is not None:
+                batch_size, device = target_seq.size(0), target_seq.device
+            elif nmr_tokens is not None:
+                batch_size, device = nmr_tokens.size(0), nmr_tokens.device
+            else:
+                batch_size, device = 1, torch.device("cpu")
+            return torch.zeros(batch_size, 1, self.embed_dim, device=device)
+
+        memory = None
+        if ir_data is not None:
+            memory = self.encoder(None, ir_data, None)
+
+        if memory is not None:
+            return memory
+
+        if target_seq is not None:
+            batch_size, device = target_seq.size(0), target_seq.device
+        elif nmr_tokens is not None:
+            batch_size, device = nmr_tokens.size(0), nmr_tokens.device
+        else:
+            batch_size, device = 1, torch.device("cpu")
+        return torch.zeros(batch_size, self.max_memory_length, self.embed_dim, device=device)
 
     def forward(
         self,
-        nmr_tokens: th.Tensor | None,
-        ir_data: th.Tensor | None,
-        target_seq: th.Tensor | None = None,
-        target_mask: th.Tensor | None = None,
-        num_loops: int = None
-    ):
-        """
-        Args:
-            nmr_tokens: Token IDs for NMR data, shape (B, L).
-            ir_data:    IR data, shape (B, L).
-            target_seq: Token IDs for SMILES, shape (B, T).
-            target_mask: Optional causal mask for the target sequence.
-            num_loops: Number of times to loop the middle layer in the decoder.
+        nmr_tokens: torch.Tensor = None,
+        ir_data: torch.Tensor = None,
+        target_seq: torch.Tensor = None,
+        target_mask: torch.Tensor = None,
+        target_padding_mask: torch.Tensor = None,
+        nmr_padding_mask: torch.Tensor = None,
+        memory_padding_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        del target_mask
+        if target_seq is None:
+            raise ValueError("target_seq is required for forward pass.")
 
-        Returns:
-            logits: (B, T, vocab_size), the decoder output for each token.
-        """
-        if self.verbose:
-            print("\n=== Starting Forward Pass ===")
-            def shape_str(x):
-                if x is None:
-                    return "None"
-                elif isinstance(x, th.Tensor):
-                    return str(x.shape)
-                return "Unknown"
-            print(f"NMR Tokens: {shape_str(nmr_tokens)}")
-            print(f"IR Data:    {shape_str(ir_data)}")
-            print(f"Target sequence shape: {shape_str(target_seq)}")
-            print(f"Number of middle layer loops: {num_loops if num_loops is not None else 1}")
-
-        # Handle memory creation based on mode
-        memory = None
-        if self.ir_as_prompt:
-            # If IR is used as prompt, embed IR tokens using the IR embedding layer
-            if ir_data is not None:
-                # Ensure IR data is exactly 400 tokens (the expected IR prompt length)
-                if ir_data.size(1) != 401:
-                    raise ValueError(f"IR prompt must be exactly 400 tokens, got {ir_data.size(1)}")
-                memory = self.ir_embed(ir_data)  # ir_data: (B, L) token ids, becomes (B, L, embed_dim)
-            else:
-                batch_size = target_seq.size(0) if target_seq is not None else (nmr_tokens.size(0) if nmr_tokens is not None else 1)
-                device = target_seq.device if target_seq is not None else th.device('cpu')
-                memory = th.zeros(batch_size, 401, self.decoder.memory_dim, device=device)
-        elif not self.ir_as_prompt:
-            # Only use encoder if not in prompt mode
-            if ir_data is not None:
-                memory = self.encoder(None, ir_data, None)
-            
-            # Create zero memory if needed
-            if memory is None:
-                if target_seq is not None:
-                    batch_size = target_seq.size(0)
-                    device = target_seq.device
-                elif nmr_tokens is not None:
-                    batch_size = nmr_tokens.size(0)
-                    device = nmr_tokens.device
-                else:
-                    batch_size = 1
-                    device = th.device('cpu')
-                memory = th.zeros(batch_size, self.max_memory_length, self.decoder.memory_dim, device=device)
-
-        if self.verbose:
-            print("\n=== Starting Decoding ===")
-            print(f"Encoder Output (memory) shape: {memory.shape}")
-
-        # 2) Decode to SMILES: target_seq => shape (B, T)
-        logits = self.decoder(target_seq, memory, nmr_tokens, num_loops=num_loops)
-
-        if self.verbose:
-            print("\n=== Forward Pass Complete ===")
-
-        return logits 
+        memory = self._build_memory(nmr_tokens=nmr_tokens, ir_data=ir_data, target_seq=target_seq)
+        return self.decoder(
+            tgt=target_seq,
+            memory=memory,
+            nmr_tokens=nmr_tokens,
+            tgt_padding_mask=target_padding_mask,
+            nmr_padding_mask=nmr_padding_mask,
+            memory_padding_mask=memory_padding_mask,
+        )

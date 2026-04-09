@@ -3,12 +3,9 @@ import click
 import pandas as pd
 from tqdm.auto import tqdm
 from typing import Tuple, List, Dict, Union
-from sklearn.model_selection import train_test_split
 import regex as re
-from scipy.interpolate import interp1d
 import numpy as np
 import pyarrow.parquet as pq
-from rxn.chemutils.tokenization import tokenize_smiles
 import tempfile
 import uuid
 import json
@@ -18,10 +15,36 @@ import os
 # Utility functions
 ################################################################################
 
+SMILES_TOKEN_PATTERN = re.compile(
+    r"(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\|\/|:|~|@|\?|>>?|\*|\$|\%[0-9]{2}|[0-9])"
+)
+
+
+def tokenize_smiles_string(smiles: str) -> str:
+    """Tokenize SMILES into a space-delimited token sequence."""
+    return " ".join(SMILES_TOKEN_PATTERN.findall(smiles))
+
 def split_data(data: pd.DataFrame, seed: int, val_size: float = 0.002) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Split data into train/test/val sets."""
-    train, test = train_test_split(data, test_size=0.001, random_state=seed, shuffle=True)
-    train, val = train_test_split(train, test_size=val_size, random_state=seed, shuffle=True)
+    if len(data) < 3:
+        raise ValueError("Need at least 3 samples to split into train/val/test.")
+
+    rng = np.random.default_rng(seed)
+    idx = np.arange(len(data))
+    rng.shuffle(idx)
+
+    n_test = max(1, int(round(0.001 * len(data))))
+    n_val = max(1, int(round(val_size * len(data))))
+    n_test = min(n_test, len(data) - 2)
+    n_val = min(n_val, len(data) - n_test - 1)
+
+    test_idx = idx[:n_test]
+    val_idx = idx[n_test:n_test + n_val]
+    train_idx = idx[n_test + n_val:]
+
+    train = data.iloc[train_idx].reset_index(drop=True)
+    test = data.iloc[test_idx].reset_index(drop=True)
+    val = data.iloc[val_idx].reset_index(drop=True)
     return train, test, val
 
 
@@ -75,11 +98,8 @@ def process_ir(
     target_x = np.linspace(original_x[0], original_x[-1], interpolation_points)
 
     try:
-        # Try a linear interpolation
-        f = interp1d(original_x, ir, kind='linear', bounds_error=False, fill_value=0)
-        interp_ir = f(target_x)
+        interp_ir = np.interp(target_x, original_x, ir, left=0.0, right=0.0)
     except Exception:
-        # Fall back if needed
         interp_ir = np.zeros_like(target_x)
 
     if tokenize:
@@ -127,7 +147,8 @@ def process_parquet_file(
     neg_msms: bool,
     formula: bool,
     original_x: np.ndarray,
-    tokenize_ir: bool = False
+    tokenize_ir: bool = False,
+    show_progress: bool = True,
 ) -> pd.DataFrame:
     """
     Process a single parquet file in chunks (row groups),
@@ -149,7 +170,11 @@ def process_parquet_file(
 
     row_group_results = []
 
-    for rg_idx in tqdm(range(parquet_obj.num_row_groups), desc=f"Processing {parquet_file.name}"):
+    row_group_iter = range(parquet_obj.num_row_groups)
+    if show_progress:
+        row_group_iter = tqdm(row_group_iter, desc=f"Processing {parquet_file.name}")
+
+    for rg_idx in row_group_iter:
         table = parquet_obj.read_row_group(rg_idx, columns=columns)
         chunk_df = table.to_pandas()
 
@@ -181,7 +206,7 @@ def process_parquet_file(
                     # We'll store the IR array in a separate column, skip final chunk append
                     chunk_results.append({
                         'source': " ".join(token_parts).strip(),
-                        'target': ' '.join(tokenize_smiles(row.smiles)),
+                        'target': tokenize_smiles_string(row.smiles),
                         'ir_data': ir_data
                     })
                     continue
@@ -205,7 +230,7 @@ def process_parquet_file(
             # If IR was tokenized or IR not included, store text result
             chunk_results.append({
                 'source': " ".join(token_parts).strip(),
-                'target': ' '.join(tokenize_smiles(row.smiles))
+                'target': tokenize_smiles_string(row.smiles)
             })
 
         if chunk_results:

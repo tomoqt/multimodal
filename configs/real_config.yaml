@@ -1,98 +1,56 @@
-# Model Architecture
 model:
-  use_concat: True
-  max_seq_length: 95
-  max_nmr_length: 190
-  max_memory_length: 32
+  max_seq_length: 128
+  max_nmr_length: 256
+  max_memory_length: 128
   embed_dim: 512
-  num_heads: 4
+  num_heads: 8
   num_layers: 8
-  dropout: 0.0
-  resample_size: 1000
-  use_stablemax: False
-  ir_encoder_type: convnext #regular, convnext
-  loop_range: [1, 30]
-  max_loops: 30
-  automatic_loop_exit: False
-  automatic_loop_exit_threshold: 1.0e-2
-  use_loop_concat: True
-  log_normal_poisson: False
-  log_normal_mean: 12.0
-  log_normal_std: 0.5 
-  use_rmsnorm: True
-# Checkpoint Configuration
-checkpoint:
-  load_path: "checkpoints/latest_checkpoint.pt"  # Path to the checkpoint file
-  reset_optimizer: False        
-# Training Parameters
+  dropout: 0.1
+  ir_encoder_type: convnext
+  ir_as_prompt: false
+  use_stablemax: false
+  use_rmsnorm: false
+
 training:
-  precision: "fp16"  # Controls training precision (fp32, fp16, bf16)
-  batch_size: 32
-  test_batch_size: 1
-  num_epochs: 5
-  learning_rate: 8.0e-5  # This will be used for AdamW components
-  min_learning_rate: 1.0e-6
-  weight_decay: 0.1
-  validation_frequency: 1000
-  logging_frequency: 10
-  save_frequency: 10000
-  save_model_frequency: 10000 # How often to save model to wandb (in steps)
-  greedy_decode_frequency: 1000
-  steps_no_grad: 8
-# Optimizer Configuration
-optimizer:
-  type: muon_mix  # Use Muon for matrices and AdamW for vectors/scalars
-  adamw:  # Settings for vector parameters (< 2D)
-    betas: [0.9, 0.999]
-    eps: 1.0e-8
-    weight_decay: 0.1
-    caution: false
-  muon:  # Settings for matrix parameters (≥ 2D)
-    lr: 8.0e-5
-    momentum: 0.95
-    nesterov: true
-    ns_steps: 5
-    orthogonalize: False
-    ortho_eps: 1.0e-30
-    ortho_rescale: true
-
-# Scheduler
-scheduler:
-  type: cosine
-  warmup_steps: 1000
-
+  batch_size: 16
+  test_batch_size: 16
+  num_epochs: 10
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  drop_last: true
+  log_every_steps: 20
+  seed: 1337
+  device: cuda
+  precision: bf16
+  grad_accum_steps: 1
+  grad_clip_norm: 0.0
+  allow_tf32: true
+  cudnn_benchmark: true
+  matmul_precision: high
+  ddp_backend: nccl
+  ddp_timeout_minutes: 30
+  ddp_find_unused_parameters: false
+  ddp_static_graph: true
+  ddp_gradient_as_bucket_view: true
+  compile: false
+  compile_mode: max-autotune
+  compile_dynamic: false
+  compile_fullgraph: false
 
 data:
-  use_parquet: False
-  data_dir: "data_extraction/multimodal_spectroscopic_dataset"
-  binary_dir: "preprocessed_binaries"
-  test_size: 79000
-  val_size: 0.01
-  preprocessed: False
-  ir_as_prompt: False
-  ir_tokenizer_path: "/data/tokenized_baseline/ir_processed/ir_vocab.json"
-  tokenized_dir: "data/reshaped_tokenized_data/data"
+  tokenized_dir: data/tokenized_baseline/data
+  pretokenize: true
+  preload_ir: false
+  use_disk_cache: true
+  write_disk_cache: true
+  cache_dir: data/tokenized_baseline/cache
+  ir_cache_mode: none
+  ir_cache_dtype: float32
 
-# Logging
-wandb:
-  project: "smiles-generation"
-  base_run_name: "muon_mix"  # Changed to reflect the optimizer being used
-  log_examples: true 
-
-
-rl:
-  grpo:
-    group_size: 8
-    micro_group_size: 1
-    batch_size: 1
-    max_iterations: 10000
-    learning_rate: 1.0e-5    # Added default learning rate for GRPO
-    epsilon: 1           # Added default epsilon for GRPO
-    beta: 0.1           # Added default beta for GRPO
-    temperature: 1       # Added default temperature for GRPO
-    log_wandb: True     # Added default for logging wandb
-    exact_match_reward: True
-    tanimoto_reward: True
-    ecfp6_reward: True
-    valid_smiles_reward: True
-    mcs_ratio_reward: True
+checkpoint:
+  output_dir: checkpoints
+  save_every_epoch: true
